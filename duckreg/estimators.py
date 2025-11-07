@@ -18,6 +18,7 @@ class DuckRegression(DuckReg):
         n_bootstraps: int = 100,
         rowid_col: str = "rowid",
         fitter: str = "numpy",
+        round_strata: int = None,  # new argument: number of decimals to round strata columns to
         **kwargs,
     ):
         super().__init__(
@@ -26,11 +27,13 @@ class DuckRegression(DuckReg):
             seed=seed,
             n_bootstraps=n_bootstraps,
             fitter=fitter,
+            round_strata=round_strata,
             **kwargs,
         )
         self.formula = formula
         self.cluster_col = cluster_col
         self.rowid_col = rowid_col
+        self.round_strata = round_strata
         self._parse_formula()
 
     def _parse_formula(self):
@@ -51,10 +54,19 @@ class DuckRegression(DuckReg):
         pass
 
     def compress_data(self):
-        # Pre-compute expressions once to avoid repeated string operations
-        group_by_cols = ", ".join(self.strata_cols)
-        
-        # Build aggregation expressions more efficiently
+        # Build SELECT and GROUP BY clauses for strata, optionally rounding columns
+        if self.round_strata is not None:
+            select_strata = ", ".join(
+                [f"ROUND({col}, {self.round_strata}) AS {col}" for col in self.strata_cols]
+            )
+            group_by_clause = ", ".join(
+                [f"ROUND({col}, {self.round_strata})" for col in self.strata_cols]
+            )
+        else:
+            select_strata = ", ".join(self.strata_cols)
+            group_by_clause = ", ".join(self.strata_cols)
+
+        # Build aggregation expressions
         agg_parts = ["COUNT(*) as count"]
         sum_expressions = []
         sum_sq_expressions = []
@@ -69,12 +81,15 @@ class DuckRegression(DuckReg):
         all_agg_expressions = ", ".join(agg_parts + sum_expressions + sum_sq_expressions)
         
         self.agg_query = f"""
-        SELECT {group_by_cols}, {all_agg_expressions}
+        SELECT {select_strata}, {all_agg_expressions}
         FROM {self.table_name}
-        GROUP BY {group_by_cols}
+        GROUP BY {group_by_clause}
         """
         
         self.df_compressed = self.conn.execute(self.agg_query).fetchdf()
+        
+        # Drops NAs. Unproblematic because NA either in strata or cases when all values per strata are NA
+        self.df_compressed.dropna(inplace=True)
         
         # Pre-compute column lists
         sum_cols = [f"sum_{var}" for var in self.outcome_vars]
@@ -148,6 +163,18 @@ class DuckRegression(DuckReg):
                 )
             )
 
+        # prepare strata SELECT/GROUP BY with optional rounding
+        if self.round_strata is not None:
+            select_strata = ", ".join(
+                [f"ROUND({col}, {self.round_strata}) AS {col}" for col in self.strata_cols]
+            )
+            group_by_clause = ", ".join(
+                [f"ROUND({col}, {self.round_strata})" for col in self.strata_cols]
+            )
+        else:
+            select_strata = ", ".join(self.strata_cols)
+            group_by_clause = ", ".join(self.strata_cols)
+
         if not self.cluster_col:
             # IID bootstrap
             total_rows = self.conn.execute(
@@ -155,9 +182,9 @@ class DuckRegression(DuckReg):
             ).fetchone()[0]
             unique_rows = total_rows
             self.bootstrap_query = f"""
-            SELECT {", ".join(self.strata_cols)}, {", ".join(["COUNT(*) as count"] + [f"SUM({var}) as sum_{var}" for var in self.outcome_vars])}
+            SELECT {select_strata}, {", ".join(["COUNT(*) as count"] + [f"SUM({var}) as sum_{var}" for var in self.outcome_vars])}
             FROM {self.table_name}
-            GROUP BY {", ".join(self.strata_cols)}
+            GROUP BY {group_by_clause}
             """
         else:
             # Cluster bootstrap
@@ -167,10 +194,10 @@ class DuckRegression(DuckReg):
             unique_groups = [group[0] for group in unique_groups]
             unique_rows = len(unique_groups)
             self.bootstrap_query = f"""
-            SELECT {", ".join(self.strata_cols)}, {", ".join(["COUNT(*) as count"] + [f"SUM({var}) as sum_{var}" for var in self.outcome_vars])}
+            SELECT {select_strata}, {", ".join(["COUNT(*) as count"] + [f"SUM({var}) as sum_{var}" for var in self.outcome_vars])}
             FROM {self.table_name}
             WHERE {self.cluster_col} IN (SELECT unnest((?)))
-            GROUP BY {", ".join(self.strata_cols)}
+            GROUP BY {group_by_clause}
             """
 
         for b in tqdm(range(self.n_bootstraps)):

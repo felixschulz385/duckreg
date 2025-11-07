@@ -13,6 +13,7 @@ class DuckReg(ABC):
         n_bootstraps: int = 100,
         fitter="numpy",
         keep_connection_open=False,
+        round_strata: int = None,  # added optional rounding param
     ):
         self.db_name = db_name
         self.table_name = table_name
@@ -22,6 +23,7 @@ class DuckReg(ABC):
         self.rng = np.random.default_rng(seed)
         self.fitter = fitter
         self.keep_connection_open = keep_connection_open
+        self.round_strata = round_strata  # store rounding preference
 
     @abstractmethod
     def prepare_data(self):

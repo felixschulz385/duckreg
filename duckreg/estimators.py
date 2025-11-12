@@ -19,6 +19,7 @@ class DuckRegression(DuckReg):
         rowid_col: str = "rowid",
         fitter: str = "numpy",
         round_strata: int = None,  # new argument: number of decimals to round strata columns to
+        duckdb_kwargs: dict = None,  # renamed parameter
         **kwargs,
     ):
         super().__init__(
@@ -28,6 +29,7 @@ class DuckRegression(DuckReg):
             n_bootstraps=n_bootstraps,
             fitter=fitter,
             round_strata=round_strata,
+            duckdb_kwargs=duckdb_kwargs,  # pass to parent
             **kwargs,
         )
         self.formula = formula
@@ -251,10 +253,10 @@ class DuckMundlak(DuckReg):
         outcome_var: str,
         covariates: list,
         seed: int,
-        unit_col: str,
-        time_col: str = None,
+        fe_cols: list,  # changed from unit_col and time_col to list of FE columns
         n_bootstraps: int = 100,
         cluster_col: str = None,
+        duckdb_kwargs: dict = None,
         **kwargs,
     ):
         super().__init__(
@@ -262,87 +264,116 @@ class DuckMundlak(DuckReg):
             table_name=table_name,
             seed=seed,
             n_bootstraps=n_bootstraps,
+            duckdb_kwargs=duckdb_kwargs,
             **kwargs,
         )
         self.outcome_var = outcome_var
         self.covariates = covariates
-        self.unit_col = unit_col
-        self.time_col = time_col
+        self.fe_cols = fe_cols  # list of FE dimensions (e.g., ['unit_id', 'time'])
         self.cluster_col = cluster_col
 
     def prepare_data(self):
-        # Step 1: Compute unit averages
-        self.unit_avg_query = f"""
-        CREATE TEMP TABLE unit_avgs AS
-        SELECT {self.unit_col},
-               {", ".join([f"AVG({cov}) AS avg_{cov}_unit" for cov in self.covariates])}
-        FROM {self.table_name}
-        GROUP BY {self.unit_col}
-        """
-        self.conn.execute(self.unit_avg_query)
-
-        # Step 2: Compute time averages (only if time_col is provided)
-        if self.time_col is not None:
-            self.time_avg_query = f"""
-            CREATE TEMP TABLE time_avgs AS
-            SELECT {self.time_col},
-                   {", ".join([f"AVG({cov}) AS avg_{cov}_time" for cov in self.covariates])}
+        # Compute averages for each FE dimension and store as temp tables
+        for i, fe_col in enumerate(self.fe_cols):
+            print(f"Computing averages for fixed effect dimension {i+1}/{len(self.fe_cols)}: {fe_col}")
+            avg_table_name = f"fe_{i}_avgs"
+            avg_query = f"""
+            CREATE OR REPLACE TABLE {avg_table_name} AS
+            SELECT {fe_col},
+                   {", ".join([f"AVG({cov}) AS avg_{cov}_fe{i}" for cov in self.covariates])}
             FROM {self.table_name}
-            GROUP BY {self.time_col}
+            GROUP BY {fe_col}
             """
-            self.conn.execute(self.time_avg_query)
+            self.conn.execute(avg_query)
 
-        # Step 3: Create the design matrix
+        # Build list of columns to select
+        fe_cols_select = ", ".join([f"{fe_col}" for fe_col in self.fe_cols])
+        covariates_select = ", ".join([f"{cov}" for cov in self.covariates])
+        
+        # Build nested SELECT with pairwise joins
+        # Start with the base table, selecting only necessary columns
+        nested_query = f"""
+        SELECT {fe_cols_select}, {self.outcome_var}, {covariates_select}, {self.cluster_col}
+        FROM {self.table_name}
+        """
+        
+        # Add each FE average table one at a time using nested SELECTs
+        for i, fe_col in enumerate(self.fe_cols):
+            nested_query = f"""
+            SELECT *
+            FROM ({nested_query})
+            JOIN fe_{i}_avgs fe{i}
+            USING ({fe_col})
+            """
+        
+        # Create the final design matrix
+        print("Creating design matrix with all fixed effect averages")
         self.design_matrix_query = f"""
-        CREATE TEMP TABLE design_matrix AS
-        SELECT
-            t.{self.unit_col},
-            {f"t.{self.time_col}," if self.time_col is not None else ""}
-            t.{self.outcome_var},
-            {", ".join([f"t.{cov}" for cov in self.covariates])},
-            {", ".join([f"u.avg_{cov}_unit" for cov in self.covariates])}
-            {", " + ", ".join([f"tm.avg_{cov}_time" for cov in self.covariates]) if self.time_col is not None else ""}
-        FROM {self.table_name} t
-        JOIN unit_avgs u ON t.{self.unit_col} = u.{self.unit_col}
-        {f"JOIN time_avgs tm ON t.{self.time_col} = tm.{self.time_col}" if self.time_col is not None else ""}
+        CREATE OR REPLACE TABLE design_matrix AS
+        {nested_query}
         """
         self.conn.execute(self.design_matrix_query)
 
     def compress_data(self):
-        # Pre-compute column lists to avoid repeated operations
+        # Pre-compute column lists
         cov_cols = [f"{cov}" for cov in self.covariates]
-        unit_avg_cols = [f"avg_{cov}_unit" for cov in self.covariates]
-        time_avg_cols = [f"avg_{cov}_time" for cov in self.covariates] if self.time_col is not None else []
+        avg_cols = []
+        for i in range(len(self.fe_cols)):
+            avg_cols.extend([f"avg_{cov}_fe{i}" for cov in self.covariates])
+        cluster_cols = [self.cluster_col]
         
-        # Build SELECT and GROUP BY columns once
-        select_cols = cov_cols + unit_avg_cols + time_avg_cols
-        select_clause = ", ".join(select_cols)
-        group_by_clause = ", ".join(select_cols)
+        strata_cols = cov_cols + avg_cols + cluster_cols
         
-        self.compress_query = f"""
+        # Build SELECT and GROUP BY columns
+        # prepare strata SELECT/GROUP BY with optional rounding
+        if self.round_strata is not None:
+            select_clause = ", ".join(
+                [f"ROUND({col}, {self.round_strata}) AS {col}" for col in strata_cols]
+            )
+            group_by_clause = ", ".join(
+                [f"ROUND({col}, {self.round_strata})" for col in strata_cols]
+            )
+        else:
+            select_clause = ", ".join(self.strata_cols)
+            group_by_clause = ", ".join(self.strata_cols)
+        
+        ## Large DF split by clusters
+        
+        # This also drops NAs. Unproblematic because NA either in strata or cases when all values per strata are NA
+        self.compress_query_clusters = f"""
         SELECT
             {select_clause},
             COUNT(*) as count,
             SUM({self.outcome_var}) as sum_{self.outcome_var}
         FROM design_matrix
+        WHERE COLUMNS(*) IS NOT NULL 
         GROUP BY {group_by_clause}
         """
-        self.df_compressed = self.conn.execute(self.compress_query).fetchdf()
+        print("Compressing data by computing group-level statistics")
+        self.df_compressed_clusters = self.conn.execute(self.compress_query_clusters).fetchdf()
+        
+        ## Further compress, dropping cluster info for main regression
+        self.df_compressed = self.df_compressed_clusters.\
+            groupby(cov_cols + avg_cols, as_index=False).\
+                agg(
+                    {
+                        "count": "sum",
+                        f"sum_{self.outcome_var}": "sum"
+                    }
+                    )
 
+        self.df_compressed_clusters[f"mean_{self.outcome_var}"] = (
+            self.df_compressed_clusters[f"sum_{self.outcome_var}"] / self.df_compressed_clusters["count"]
+        )
         self.df_compressed[f"mean_{self.outcome_var}"] = (
             self.df_compressed[f"sum_{self.outcome_var}"] / self.df_compressed["count"]
         )
 
     def collect_data(self, data: pd.DataFrame):
-        rhs = (
-            self.covariates
-            + [f"avg_{cov}_unit" for cov in self.covariates]
-            + (
-                [f"avg_{cov}_time" for cov in self.covariates]
-                if self.time_col is not None
-                else []
-            )
-        )
+        # Build list of RHS variables (covariates + all FE averages)
+        rhs = self.covariates.copy()
+        for i in range(len(self.fe_cols)):
+            rhs.extend([f"avg_{cov}_fe{i}" for cov in self.covariates])
 
         X = data[rhs].values
         X = np.c_[np.ones(X.shape[0]), X]
@@ -359,71 +390,46 @@ class DuckMundlak(DuckReg):
         return wls(X, y, n)
 
     def bootstrap(self):
-        rhs = (
-            self.covariates
-            + [f"avg_{cov}_unit" for cov in self.covariates]
-            + (
-                [f"avg_{cov}_time" for cov in self.covariates]
-                if self.time_col is not None
-                else []
-            )
-        )
+        # Build list of RHS variables
+        rhs = self.covariates.copy()
+        for i in range(len(self.fe_cols)):
+            rhs.extend([f"avg_{cov}_fe{i}" for cov in self.covariates])
+        
         boot_coefs = np.zeros((self.n_bootstraps, len(rhs) + 1))
+        boot_sizes = np.zeros(self.n_bootstraps)
 
+        # Bootstrap in blocks of first FE if cluster_col not given
         if self.cluster_col is None:
-            # IID bootstrap
-            total_units = self.conn.execute(
-                f"SELECT COUNT(DISTINCT {self.unit_col}) FROM {self.table_name}"
-            ).fetchone()[0]
-            self.bootstrap_query = f"""
-            SELECT
-                {", ".join([f"{cov}" for cov in self.covariates])},
-                {", ".join([f"avg_{cov}_unit" for cov in self.covariates])}
-                {", " + ", ".join([f"avg_{cov}_time" for cov in self.covariates]) if self.time_col is not None else ""},
-                COUNT(*) as count,
-                SUM({self.outcome_var}) as sum_{self.outcome_var}
-            FROM design_matrix
-            GROUP BY {", ".join([f"{cov}" for cov in self.covariates])},
-                        {", ".join([f"avg_{cov}_unit" for cov in self.covariates])}
-                        {", " + ", ".join([f"avg_{cov}_time" for cov in self.covariates]) if self.time_col is not None else ""}
-            """
-            total_samples = total_units
-        else:
-            # Cluster bootstrap
-            total_clusters = self.conn.execute(
-                f"SELECT COUNT(DISTINCT {self.cluster_col}) FROM {self.table_name}"
-            ).fetchone()[0]
-            self.bootstrap_query = f"""
-            SELECT
-                {", ".join([f"{cov}" for cov in self.covariates])},
-                {", ".join([f"avg_{cov}_unit" for cov in self.covariates])}
-                {", " + ", ".join([f"avg_{cov}_time" for cov in self.covariates]) if self.time_col is not None else ""},
-                COUNT(*) as count,
-                SUM({self.outcome_var}) as sum_{self.outcome_var}
-            FROM design_matrix
-            WHERE {self.cluster_col} IN (SELECT unnest((?)))
-            GROUP BY {", ".join([f"{cov}" for cov in self.covariates])},
-                        {", ".join([f"avg_{cov}_unit" for cov in self.covariates])}
-                        {", " + ", ".join([f"avg_{cov}_time" for cov in self.covariates]) if self.time_col is not None else ""}
-            """
-            total_samples = total_clusters
+            self.cluster_col = self.fe_cols[0]
+            
+        # Get the unique groups
+        unique_groups = self.df_compressed_clusters[self.cluster_col].unique()
+        group_to_idx = {int(x): i for i, x in enumerate(unique_groups)}
+        n_unique_groups = unique_groups.shape[0]
+        
+        resampled_group_ids = self.rng.choice(
+                n_unique_groups, size=n_unique_groups, replace=True
+        )
+        
+        y, X, n = self.collect_data(data=self.df_compressed_clusters)
+        
+        group_idx = self.df_compressed_clusters[self.cluster_col].map(group_to_idx).to_numpy(dtype=int)
 
-        for b in tqdm(range(self.n_bootstraps)):
-            resampled_samples = self.rng.choice(
-                total_samples, size=total_samples, replace=True
+        print(f"Starting bootstrap with {self.n_bootstraps} iterations")
+        for b in tqdm(range(self.n_bootstraps), desc="Bootstrap iterations"):
+            
+            resampled_group_ids = self.rng.choice(
+                n_unique_groups, size=n_unique_groups, replace=True
             )
-            df_boot = self.conn.execute(
-                self.bootstrap_query, [resampled_samples.tolist()]
-            ).fetchdf()
-            df_boot[f"mean_{self.outcome_var}"] = (
-                df_boot[f"sum_{self.outcome_var}"] / df_boot["count"]
-            )
+            bootstrap_scale = np.bincount(resampled_group_ids, minlength=n_unique_groups)
+            row_scales = bootstrap_scale[group_idx]
+            
+            n_boot = n * row_scales
+            boot_sizes[b] = n_boot.sum()
 
-            y, X, n = self.collect_data(data=df_boot)
-
-            boot_coefs[b, :] = wls(X, y, n).flatten()
-
-        return np.cov(boot_coefs.T)
+            boot_coefs[b, :] = wls(X, y, n_boot).flatten()
+            
+        return np.cov(boot_coefs.T, aweights = boot_sizes.T)
 
 
 ################################################################################
@@ -439,12 +445,14 @@ class DuckMundlakEventStudy(DuckReg):
         cluster_col: str,
         pre_treat_interactions: bool = True,
         n_bootstraps: int = 100,
+        duckdb_kwargs: dict = None,  # renamed parameter
         **kwargs,
     ):
         super().__init__(
             db_name=db_name,
             table_name=table_name,
             n_bootstraps=n_bootstraps,
+            duckdb_kwargs=duckdb_kwargs,  # pass to parent
             **kwargs,
         )
         self.table_name = table_name
@@ -689,11 +697,11 @@ class DuckDoubleDemeaning(DuckReg):
         table_name: str,
         outcome_var: str,
         treatment_var: str,
-        unit_col: str,
-        time_col: str,
+        fe_cols: list,  # changed from unit_col and time_col to list of FE columns
         seed: int,
         n_bootstraps: int = 100,
         cluster_col: str = None,
+        duckdb_kwargs: dict = None,
         **kwargs,
     ):
         super().__init__(
@@ -701,12 +709,12 @@ class DuckDoubleDemeaning(DuckReg):
             table_name=table_name,
             seed=seed,
             n_bootstraps=n_bootstraps,
+            duckdb_kwargs=duckdb_kwargs,
             **kwargs,
         )
         self.outcome_var = outcome_var
         self.treatment_var = treatment_var
-        self.unit_col = unit_col
-        self.time_col = time_col
+        self.fe_cols = fe_cols  # list of FE dimensions (e.g., ['unit_id', 'time'])
         self.cluster_col = cluster_col
 
     def prepare_data(self):
@@ -718,35 +726,38 @@ class DuckDoubleDemeaning(DuckReg):
         """
         self.conn.execute(self.overall_mean_query)
 
-        # Compute unit means
-        self.unit_mean_query = f"""
-        CREATE TEMP TABLE unit_means AS
-        SELECT {self.unit_col}, AVG({self.treatment_var}) AS mean_{self.treatment_var}_unit
-        FROM {self.table_name}
-        GROUP BY {self.unit_col}
-        """
-        self.conn.execute(self.unit_mean_query)
+        # Compute means for each FE dimension
+        for i, fe_col in enumerate(self.fe_cols):
+            mean_table_name = f"fe_{i}_means"
+            mean_query = f"""
+            CREATE TEMP TABLE {mean_table_name} AS
+            SELECT {fe_col}, AVG({self.treatment_var}) AS mean_{self.treatment_var}_fe{i}
+            FROM {self.table_name}
+            GROUP BY {fe_col}
+            """
+            self.conn.execute(mean_query)
 
-        # Compute time means
-        self.time_mean_query = f"""
-        CREATE TEMP TABLE time_means AS
-        SELECT {self.time_col}, AVG({self.treatment_var}) AS mean_{self.treatment_var}_time
-        FROM {self.table_name}
-        GROUP BY {self.time_col}
-        """
-        self.conn.execute(self.time_mean_query)
-
-        # Create double-demeaned variables
+        # Create multi-way demeaned variables
+        join_clauses = []
+        demean_terms = []
+        
+        for i, fe_col in enumerate(self.fe_cols):
+            join_clauses.append(f"JOIN fe_{i}_means fe{i} ON t.{fe_col} = fe{i}.{fe_col}")
+            demean_terms.append(f"fe{i}.mean_{self.treatment_var}_fe{i}")
+        
+        # Formula: X_ddot = X - sum(FE_means) + (k-1) * overall_mean
+        # where k is the number of FE dimensions
+        k = len(self.fe_cols)
+        demean_formula = f"t.{self.treatment_var} - {' - '.join(demean_terms)} + {k-1} * om.mean_{self.treatment_var}"
+        
         self.double_demean_query = f"""
-        CREATE TEMP TABLE double_demeaned AS
+        CREATE TEMP TABLE multi_demeaned AS
         SELECT
-            t.{self.unit_col},
-            t.{self.time_col},
+            {", ".join([f"t.{fe_col}" for fe_col in self.fe_cols])},
             t.{self.outcome_var},
-            t.{self.treatment_var} - um.mean_{self.treatment_var}_unit - tm.mean_{self.treatment_var}_time + om.mean_{self.treatment_var} AS ddot_{self.treatment_var}
+            {demean_formula} AS ddot_{self.treatment_var}
         FROM {self.table_name} t
-        JOIN unit_means um ON t.{self.unit_col} = um.{self.unit_col}
-        JOIN time_means tm ON t.{self.time_col} = tm.{self.time_col}
+        {" ".join(join_clauses)}
         CROSS JOIN overall_mean om
         """
         self.conn.execute(self.double_demean_query)
@@ -757,7 +768,7 @@ class DuckDoubleDemeaning(DuckReg):
             ddot_{self.treatment_var},
             COUNT(*) as count,
             SUM({self.outcome_var}) as sum_{self.outcome_var}
-        FROM double_demeaned
+        FROM multi_demeaned
         GROUP BY ddot_{self.treatment_var}
         """
         self.df_compressed = self.conn.execute(self.compress_query).fetchdf()
@@ -783,19 +794,22 @@ class DuckDoubleDemeaning(DuckReg):
         boot_coefs = np.zeros((self.n_bootstraps, 2))  # Intercept and treatment effect
 
         if self.cluster_col is None:
+            # Bootstrap on first FE dimension
             total_units = self.conn.execute(
-                f"SELECT COUNT(DISTINCT {self.unit_col}) FROM {self.table_name}"
+                f"SELECT COUNT(DISTINCT {self.fe_cols[0]}) FROM {self.table_name}"
             ).fetchone()[0]
             self.bootstrap_query = f"""
             SELECT
                 ddot_{self.treatment_var},
                 COUNT(*) as count,
                 SUM({self.outcome_var}) as sum_{self.outcome_var}
-            FROM double_demeaned
-            WHERE {self.unit_col} IN (SELECT unnest((?)))
+            FROM multi_demeaned
+            WHERE {self.fe_cols[0]} IN (SELECT unnest((?)))
             GROUP BY ddot_{self.treatment_var}
             """
+            total_samples = total_units
         else:
+            # Cluster bootstrap
             total_clusters = self.conn.execute(
                 f"SELECT COUNT(DISTINCT {self.cluster_col}) FROM {self.table_name}"
             ).fetchone()[0]
@@ -804,24 +818,19 @@ class DuckDoubleDemeaning(DuckReg):
                 ddot_{self.treatment_var},
                 COUNT(*) as count,
                 SUM({self.outcome_var}) as sum_{self.outcome_var}
-            FROM double_demeaned
+            FROM multi_demeaned
             WHERE {self.cluster_col} IN (SELECT unnest((?)))
             GROUP BY ddot_{self.treatment_var}
             """
+            total_samples = total_clusters
 
         for b in tqdm(range(self.n_bootstraps)):
-            if self.cluster_col is None:
-                resampled_units = self.rng.choice(
-                    total_units, size=total_units, replace=True
-                )
-            else:
-                resampled_clusters = self.rng.choice(
-                    total_clusters, size=total_clusters, replace=True
-                )
-                resampled_units = resampled_clusters
+            resampled_samples = self.rng.choice(
+                total_samples, size=total_samples, replace=True
+            )
 
             df_boot = self.conn.execute(
-                self.bootstrap_query, [resampled_units.tolist()]
+                self.bootstrap_query, [resampled_samples.tolist()]
             ).fetchdf()
             df_boot[f"mean_{self.outcome_var}"] = (
                 df_boot[f"sum_{self.outcome_var}"] / df_boot["count"]

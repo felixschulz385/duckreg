@@ -13,17 +13,25 @@ class DuckReg(ABC):
         n_bootstraps: int = 100,
         fitter="numpy",
         keep_connection_open=False,
-        round_strata: int = None,  # added optional rounding param
+        round_strata: int = None,
+        duckdb_kwargs: dict = None,  # new parameter for DuckDB settings
     ):
         self.db_name = db_name
         self.table_name = table_name
         self.n_bootstraps = n_bootstraps
         self.seed = seed
         self.conn = duckdb.connect(db_name)
+
+        # Apply DuckDB configuration settings if provided
+        if duckdb_kwargs is not None:
+            for key, value in duckdb_kwargs.items():
+                self.conn.execute(f"SET {key} = '{value}'")
+
         self.rng = np.random.default_rng(seed)
         self.fitter = fitter
         self.keep_connection_open = keep_connection_open
-        self.round_strata = round_strata  # store rounding preference
+        self.round_strata = round_strata
+        self.duckdb_kwargs = duckdb_kwargs  # store for reference
 
     @abstractmethod
     def prepare_data(self):

@@ -11,11 +11,23 @@ class DuckReg(ABC):
         table_name: str,
         seed: int,
         n_bootstraps: int = 100,
-        fitter="numpy",
-        keep_connection_open=False,
+        fitter: str = "numpy",
+        keep_connection_open: bool = False,
         round_strata: int = None,
-        duckdb_kwargs: dict = None,  # new parameter for DuckDB settings
+        duckdb_kwargs: dict = None,
     ):
+        """Base class for DuckDB-based regression estimators
+
+        Args:
+            db_name: Path to DuckDB database file
+            table_name: Name of table containing the data
+            seed: Random seed for reproducibility
+            n_bootstraps: Number of bootstrap iterations (0 to disable)
+            fitter: Fitting method ('numpy' or 'ridge')
+            keep_connection_open: Whether to keep database connection open after fitting
+            round_strata: Number of decimals to round strata columns (None to disable)
+            duckdb_kwargs: Dictionary of DuckDB configuration settings
+        """
         self.db_name = db_name
         self.table_name = table_name
         self.n_bootstraps = n_bootstraps

@@ -12,15 +12,17 @@ class DuckRegression(DuckReg):
         self,
         db_name: str,
         table_name: str,
-        formula: str,
-        cluster_col: str,
+        outcome_vars: list,  # changed from formula to explicit list
+        covariates: list,  # new argument
         seed: int,
+        fe_cols: list = None,  # new argument (optional fixed effects)
         n_bootstraps: int = 100,
+        cluster_col: str = None,  # changed from required to optional
         rowid_col: str = "rowid",
         fitter: str = "numpy",
-        round_strata: int = None,  # new argument: number of decimals to round strata columns to
-        duckdb_kwargs: dict = None,  # renamed parameter
-        subset: str = None,  # new argument: WHERE clause for filtering
+        round_strata: int = None,
+        duckdb_kwargs: dict = None,
+        subset: str = None,
         **kwargs,
     ):
         super().__init__(
@@ -30,28 +32,22 @@ class DuckRegression(DuckReg):
             n_bootstraps=n_bootstraps,
             fitter=fitter,
             round_strata=round_strata,
-            duckdb_kwargs=duckdb_kwargs,  # pass to parent
+            duckdb_kwargs=duckdb_kwargs,
             **kwargs,
         )
-        self.formula = formula
+        self.outcome_vars = outcome_vars if isinstance(outcome_vars, list) else [outcome_vars]
+        self.covariates = covariates if isinstance(covariates, list) else [covariates]
+        self.fe_cols = fe_cols if fe_cols else []
         self.cluster_col = cluster_col
         self.rowid_col = rowid_col
         self.round_strata = round_strata
         self.subset = subset
-        self._parse_formula()
-
-    def _parse_formula(self):
-        lhs, rhs = self.formula.split("~")
-        rhs_deparsed = rhs.split("|")
-        covars, fevars = rhs.split("|") if len(rhs_deparsed) > 1 else (rhs, None)
-
-        self.outcome_vars = [x.strip() for x in lhs.split("+")]
-        self.covars = [x.strip() for x in covars.split("+")]
-        self.fevars = [x.strip() for x in fevars.split("+")] if fevars else []
-        self.strata_cols = self.covars + self.fevars
+        
+        # Build strata columns for grouping
+        self.strata_cols = self.covariates + self.fe_cols
 
         if not self.outcome_vars:
-            raise ValueError("No outcome variables found in the formula")
+            raise ValueError("No outcome variables provided")
 
     def prepare_data(self):
         # No preparation needed for simple regression
@@ -114,17 +110,17 @@ class DuckRegression(DuckReg):
         y = data.filter(
             regex=f"mean_{'(' + '|'.join(self.outcome_vars) + ')'}", axis=1
         ).values
-        X = data[self.covars].values
+        X = data[self.covariates].values
         n = data["count"].values
 
         # y, X, w need to be two-dimensional for the demean function
         y = y.reshape(-1, 1) if y.ndim == 1 else y
         X = X.reshape(-1, 1) if X.ndim == 1 else X
 
-        if self.fevars:
+        if self.fe_cols:
             # fe needs to contain of only integers for
             # the demean function to work
-            fe = _convert_to_int(data[self.fevars])
+            fe = _convert_to_int(data[self.fe_cols])
             fe = fe.reshape(-1, 1) if fe.ndim == 1 else fe
 
             y, _ = demean(x=y, flist=fe, weights=n)
@@ -159,15 +155,15 @@ class DuckRegression(DuckReg):
 
     def bootstrap(self):
         self.se = "bootstrap"
-        if self.fevars:
+        if self.fe_cols:
             boot_coefs = np.zeros(
-                (self.n_bootstraps, len(self.covars) * len(self.outcome_vars))
+                (self.n_bootstraps, len(self.covariates) * len(self.outcome_vars))
             )
         else:
             boot_coefs = np.zeros(
                 (
                     self.n_bootstraps,
-                    (len(self.strata_cols) + 1) * len(self.outcome_vars),
+                    (len(self.covariates) + 1) * len(self.outcome_vars),
                 )
             )
 
@@ -259,14 +255,14 @@ class DuckMundlak(DuckReg):
         self,
         db_name: str,
         table_name: str,
-        outcome_var: str,
+        outcome_vars: list,  # changed to support multiple outcomes
         covariates: list,
         seed: int,
-        fe_cols: list,  # changed from unit_col and time_col to list of FE columns
+        fe_cols: list,
         n_bootstraps: int = 100,
         cluster_col: str = None,
         duckdb_kwargs: dict = None,
-        subset: str = None,  # new argument: WHERE clause for filtering
+        subset: str = None,
         **kwargs,
     ):
         super().__init__(
@@ -277,9 +273,9 @@ class DuckMundlak(DuckReg):
             duckdb_kwargs=duckdb_kwargs,
             **kwargs,
         )
-        self.outcome_var = outcome_var
-        self.covariates = covariates
-        self.fe_cols = fe_cols  # list of FE dimensions (e.g., ['unit_id', 'time'])
+        self.outcome_vars = outcome_vars if isinstance(outcome_vars, list) else [outcome_vars]
+        self.covariates = covariates if isinstance(covariates, list) else [covariates]
+        self.fe_cols = fe_cols if isinstance(fe_cols, list) else [fe_cols]
         self.cluster_col = cluster_col
         self.subset = subset
 
@@ -303,11 +299,12 @@ class DuckMundlak(DuckReg):
         # Build list of columns to select
         fe_cols_select = ", ".join([f"{fe_col}" for fe_col in self.fe_cols])
         covariates_select = ", ".join([f"{cov}" for cov in self.covariates])
+        outcome_vars_select = ", ".join([f"{var}" for var in self.outcome_vars])
         
         # Build nested SELECT with pairwise joins
         # Start with the base table, selecting only necessary columns
         nested_query = f"""
-        SELECT {fe_cols_select}, {self.outcome_var}, {covariates_select}, {self.cluster_col}
+        SELECT {fe_cols_select}, {outcome_vars_select}, {covariates_select}, {self.cluster_col}
         FROM {self.table_name}
         {where_clause}
         """
@@ -353,6 +350,13 @@ class DuckMundlak(DuckReg):
             group_by_clause = ", ".join(strata_cols)
         
         ## Large DF split by clusters
+        
+        # Build aggregation for all outcome variables
+        outcome_aggs = []
+        for var in self.outcome_vars:
+            outcome_aggs.append(f"SUM({var}) as sum_{var}")
+        outcome_aggs_clause = ", ".join(outcome_aggs)
+        
         where_clause = f"AND {self.subset}" if self.subset else ""
         
         # This also drops NAs. Unproblematic because NA either in strata or cases when all values per strata are NA
@@ -360,7 +364,7 @@ class DuckMundlak(DuckReg):
         SELECT
             {select_clause},
             COUNT(*) as count,
-            SUM({self.outcome_var}) as sum_{self.outcome_var}
+            {outcome_aggs_clause}
         FROM design_matrix
         WHERE COLUMNS(*) IS NOT NULL 
         {where_clause}
@@ -370,21 +374,22 @@ class DuckMundlak(DuckReg):
         self.df_compressed_clusters = self.conn.execute(self.compress_query_clusters).fetchdf()
         
         ## Further compress, dropping cluster info for main regression
+        agg_dict = {"count": "sum"}
+        for var in self.outcome_vars:
+            agg_dict[f"sum_{var}"] = "sum"
+        
         self.df_compressed = self.df_compressed_clusters.\
             groupby(cov_cols + avg_cols, as_index=False).\
-                agg(
-                    {
-                        "count": "sum",
-                        f"sum_{self.outcome_var}": "sum"
-                    }
-                    )
+                agg(agg_dict)
 
-        self.df_compressed_clusters[f"mean_{self.outcome_var}"] = (
-            self.df_compressed_clusters[f"sum_{self.outcome_var}"] / self.df_compressed_clusters["count"]
-        )
-        self.df_compressed[f"mean_{self.outcome_var}"] = (
-            self.df_compressed[f"sum_{self.outcome_var}"] / self.df_compressed["count"]
-        )
+        # Create mean columns for all outcome variables
+        for var in self.outcome_vars:
+            self.df_compressed_clusters[f"mean_{var}"] = (
+                self.df_compressed_clusters[f"sum_{var}"] / self.df_compressed_clusters["count"]
+            )
+            self.df_compressed[f"mean_{var}"] = (
+                self.df_compressed[f"sum_{var}"] / self.df_compressed["count"]
+            )
 
     def collect_data(self, data: pd.DataFrame):
         # Build list of RHS variables (covariates + all FE averages)
@@ -394,7 +399,10 @@ class DuckMundlak(DuckReg):
 
         X = data[rhs].values
         X = np.c_[np.ones(X.shape[0]), X]
-        y = data[f"mean_{self.outcome_var}"].values
+        
+        # Collect all outcome variables
+        y_cols = [f"mean_{var}" for var in self.outcome_vars]
+        y = data[y_cols].values
         n = data["count"].values
 
         y = y.reshape(-1, 1) if y.ndim == 1 else y
@@ -412,7 +420,9 @@ class DuckMundlak(DuckReg):
         for i in range(len(self.fe_cols)):
             rhs.extend([f"avg_{cov}_fe{i}" for cov in self.covariates])
         
-        boot_coefs = np.zeros((self.n_bootstraps, len(rhs) + 1))
+        # Adjust for multiple outcomes
+        n_coefs = (len(rhs) + 1) * len(self.outcome_vars)
+        boot_coefs = np.zeros((self.n_bootstraps, n_coefs))
         boot_sizes = np.zeros(self.n_bootstraps)
 
         # Bootstrap in blocks of first FE if cluster_col not given

@@ -1,9 +1,191 @@
 from abc import ABC, abstractmethod
 import duckdb
 import numpy as np
+import os
+from pathlib import Path
+import hashlib
 
 
 ######################################################################
+# High-level API
+######################################################################
+
+def compressed_ols(
+    formula: str,
+    data: str,
+    subset: str = None,
+    n_bootstraps: int = 100,
+    cache_dir: str = None,
+    round_strata: int = None,
+    seed: int = 42,
+    fe_method: str = "auto",  # new parameter to choose FE method
+    duckdb_kwargs: dict = None,
+    **kwargs
+):
+    """High-level API for compressed OLS regression with lfe-style formula
+    
+    Args:
+        formula: Regression formula in format "y ~ x1 + x2 | fe1 + fe2 | iv1 + iv2 | cluster"
+                 Parts separated by |:
+                 - Left of ~: outcome variable(s) (can use + for multiple)
+                 - First part after ~: covariates
+                 - Second part: fixed effects (optional)
+                 - Third part: instrumental variables (not implemented, raises error)
+                 - Fourth part: cluster variable (optional)
+        data: Filepath to data file (.csv, .parquet, or directory of .parquet files)
+        subset: SQL WHERE clause to subset data (e.g., "year > 2000")
+        n_bootstraps: Number of bootstrap iterations (0 to disable)
+        cache_dir: Directory for DuckDB cache files (default: .duckreg/ in data dir)
+        round_strata: Number of decimals to round strata columns
+        seed: Random seed for reproducibility
+        fe_method: Method for handling fixed effects ('mundlak', or 'demean')
+                   - 'mundlak': Always use Mundlak device for FE
+                   - 'demean': Always use demeaning for FE
+        duckdb_kwargs: Dictionary of DuckDB configuration settings
+        **kwargs: Additional arguments passed to estimator
+    
+    Returns:
+        Fitted estimator object with point_estimate and vcov attributes
+    
+    Examples:
+        >>> # Simple regression
+        >>> mod = compressed_ols("y ~ x1 + x2", "data.parquet")
+        
+        >>> # With fixed effects (auto chooses Mundlak)
+        >>> mod = compressed_ols("y ~ x1 + x2 | unit_id + year", "data.parquet")
+        
+        >>> # Force demeaning method
+        >>> mod = compressed_ols("y ~ x1 + x2 | unit_id + year", "data.parquet", fe_method="demean")
+        
+        >>> # Multiple outcomes with clustering
+        >>> mod = compressed_ols("y1 + y2 ~ x1 + x2 | unit_id | country", "data.parquet")
+        
+        >>> # With subsetting
+        >>> mod = compressed_ols("y ~ x", "data.parquet", subset="year >= 2000")
+    """
+    from .estimators import DuckRegression, DuckMundlak
+    
+    # Parse formula
+    if "~" not in formula:
+        raise ValueError("Formula must contain '~' separator")
+    
+    lhs, rhs = formula.split("~", 1)  # Split only on first ~
+    lhs = lhs.strip()
+    rhs = rhs.strip()
+    
+    # Parse left-hand side (outcomes)
+    outcome_vars = [x.strip() for x in lhs.split("+")]
+    
+    # Parse right-hand side parts
+    parts = [p.strip() for p in rhs.split("|")]
+    if len(parts) > 4:
+        raise ValueError("Formula can have at most 4 parts separated by |")
+    
+    # First part: covariates (required)
+    covariates = [x.strip() for x in parts[0].split("+")] if parts[0] else []
+    
+    # Second part: fixed effects (optional)
+    fe_cols = []
+    if len(parts) > 1 and parts[1]:
+        fe_cols = [x.strip() for x in parts[1].split("+")]
+    
+    # Third part: instrumental variables (not implemented)
+    if len(parts) > 2 and parts[2].strip() != "0" :
+        raise NotImplementedError("Instrumental variables not yet implemented")
+    
+    # Fourth part: cluster variable (optional)
+    cluster_col = None
+    if len(parts) > 3 and parts[3]:
+        cluster_parts = [x.strip() for x in parts[3].split("+")]
+        if len(cluster_parts) > 1:
+            raise ValueError("Only one cluster variable allowed")
+        cluster_col = cluster_parts[0]
+    
+    # Choose FE method
+    if fe_method == "mundlak":
+        use_mundlak = True
+    elif fe_method == "demean":
+        use_mundlak = False
+    else:
+        raise ValueError("fe_method must be 'mundlak' or 'demean'")
+    
+    # Setup database
+    data_path = Path(data).resolve()
+    
+    if cache_dir is None:
+        # Create .duckreg directory in same location as data
+        if data_path.is_file():
+            cache_dir = data_path.parent / ".duckreg"
+        else:
+            cache_dir = data_path / ".duckreg"
+    else:
+        cache_dir = Path(cache_dir)
+    
+    cache_dir.mkdir(exist_ok=True, parents=True)
+    
+    # Create database name from data path hash
+    data_hash = hashlib.md5(str(data_path).encode()).hexdigest()[:8]
+    db_name = str(cache_dir / f"duckreg_{data_hash}.db")
+    
+    # Create table reference for DuckDB
+    if data_path.is_file():
+        suffix = data_path.suffix.lower()
+        if suffix == ".csv":
+            table_name = f"read_csv('{data_path}')"
+        elif suffix == ".parquet":
+            table_name = f"read_parquet('{data_path}')"
+        else:
+            raise ValueError(f"Unsupported file format: {suffix}")
+    elif data_path.is_dir():
+        # Assume directory of parquet files
+        table_name = f"read_parquet('{data_path}/**/*.parquet')"
+    else:
+        raise ValueError(f"Data path not found: {data_path}")
+    
+    # Choose estimator
+    if use_mundlak:
+        # Use Mundlak device for FE
+        estimator = DuckMundlak(
+            db_name=db_name,
+            table_name=table_name,
+            outcome_vars=outcome_vars,
+            covariates=covariates,
+            fe_cols=fe_cols,
+            cluster_col=cluster_col,
+            subset=subset,
+            n_bootstraps=n_bootstraps,
+            round_strata=round_strata,
+            seed=seed,
+            duckdb_kwargs=duckdb_kwargs,
+            **kwargs
+        )
+    else:
+        # Use simple regression (possibly with FE demeaning)
+        estimator = DuckRegression(
+            db_name=db_name,
+            table_name=table_name,
+            outcome_vars=outcome_vars,
+            covariates=covariates,
+            fe_cols=fe_cols,
+            cluster_col=cluster_col,
+            subset=subset,
+            n_bootstraps=n_bootstraps,
+            round_strata=round_strata,
+            seed=seed,
+            duckdb_kwargs=duckdb_kwargs,
+            **kwargs
+        )
+    
+    # Fit the model
+    estimator.fit()
+    
+    return estimator
+
+
+######################################################################
+# Base class
+######################################################################
+
 class DuckReg(ABC):
     def __init__(
         self,

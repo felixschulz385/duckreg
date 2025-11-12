@@ -20,6 +20,7 @@ class DuckRegression(DuckReg):
         fitter: str = "numpy",
         round_strata: int = None,  # new argument: number of decimals to round strata columns to
         duckdb_kwargs: dict = None,  # renamed parameter
+        subset: str = None,  # new argument: WHERE clause for filtering
         **kwargs,
     ):
         super().__init__(
@@ -36,6 +37,7 @@ class DuckRegression(DuckReg):
         self.cluster_col = cluster_col
         self.rowid_col = rowid_col
         self.round_strata = round_strata
+        self.subset = subset
         self._parse_formula()
 
     def _parse_formula(self):
@@ -82,9 +84,13 @@ class DuckRegression(DuckReg):
         # Single join operation instead of multiple concatenations
         all_agg_expressions = ", ".join(agg_parts + sum_expressions + sum_sq_expressions)
         
+        # Add WHERE clause if subset is provided
+        where_clause = f"WHERE {self.subset}" if self.subset else ""
+        
         self.agg_query = f"""
         SELECT {select_strata}, {all_agg_expressions}
         FROM {self.table_name}
+        {where_clause}
         GROUP BY {group_by_clause}
         """
         
@@ -183,9 +189,11 @@ class DuckRegression(DuckReg):
                 f"SELECT COUNT(DISTINCT {self.rowid_col}) FROM {self.table_name}"
             ).fetchone()[0]
             unique_rows = total_rows
+            where_clause = f"WHERE {self.subset}" if self.subset else ""
             self.bootstrap_query = f"""
             SELECT {select_strata}, {", ".join(["COUNT(*) as count"] + [f"SUM({var}) as sum_{var}" for var in self.outcome_vars])}
             FROM {self.table_name}
+            {where_clause}
             GROUP BY {group_by_clause}
             """
         else:
@@ -195,10 +203,11 @@ class DuckRegression(DuckReg):
             ).fetchall()
             unique_groups = [group[0] for group in unique_groups]
             unique_rows = len(unique_groups)
+            where_clause = f"AND {self.subset}" if self.subset else ""
             self.bootstrap_query = f"""
             SELECT {select_strata}, {", ".join(["COUNT(*) as count"] + [f"SUM({var}) as sum_{var}" for var in self.outcome_vars])}
             FROM {self.table_name}
-            WHERE {self.cluster_col} IN (SELECT unnest((?)))
+            WHERE {self.cluster_col} IN (SELECT unnest((?))) {where_clause}
             GROUP BY {group_by_clause}
             """
 
@@ -257,6 +266,7 @@ class DuckMundlak(DuckReg):
         n_bootstraps: int = 100,
         cluster_col: str = None,
         duckdb_kwargs: dict = None,
+        subset: str = None,  # new argument: WHERE clause for filtering
         **kwargs,
     ):
         super().__init__(
@@ -271,9 +281,12 @@ class DuckMundlak(DuckReg):
         self.covariates = covariates
         self.fe_cols = fe_cols  # list of FE dimensions (e.g., ['unit_id', 'time'])
         self.cluster_col = cluster_col
+        self.subset = subset
 
     def prepare_data(self):
         # Compute averages for each FE dimension and store as temp tables
+        where_clause = f"WHERE {self.subset}" if self.subset else ""
+        
         for i, fe_col in enumerate(self.fe_cols):
             print(f"Computing averages for fixed effect dimension {i+1}/{len(self.fe_cols)}: {fe_col}")
             avg_table_name = f"fe_{i}_avgs"
@@ -282,6 +295,7 @@ class DuckMundlak(DuckReg):
             SELECT {fe_col},
                    {", ".join([f"AVG({cov}) AS avg_{cov}_fe{i}" for cov in self.covariates])}
             FROM {self.table_name}
+            {where_clause}
             GROUP BY {fe_col}
             """
             self.conn.execute(avg_query)
@@ -295,6 +309,7 @@ class DuckMundlak(DuckReg):
         nested_query = f"""
         SELECT {fe_cols_select}, {self.outcome_var}, {covariates_select}, {self.cluster_col}
         FROM {self.table_name}
+        {where_clause}
         """
         
         # Add each FE average table one at a time using nested SELECTs
@@ -334,10 +349,11 @@ class DuckMundlak(DuckReg):
                 [f"ROUND({col}, {self.round_strata})" for col in strata_cols]
             )
         else:
-            select_clause = ", ".join(self.strata_cols)
-            group_by_clause = ", ".join(self.strata_cols)
+            select_clause = ", ".join(strata_cols)
+            group_by_clause = ", ".join(strata_cols)
         
         ## Large DF split by clusters
+        where_clause = f"AND {self.subset}" if self.subset else ""
         
         # This also drops NAs. Unproblematic because NA either in strata or cases when all values per strata are NA
         self.compress_query_clusters = f"""
@@ -347,6 +363,7 @@ class DuckMundlak(DuckReg):
             SUM({self.outcome_var}) as sum_{self.outcome_var}
         FROM design_matrix
         WHERE COLUMNS(*) IS NOT NULL 
+        {where_clause}
         GROUP BY {group_by_clause}
         """
         print("Compressing data by computing group-level statistics")

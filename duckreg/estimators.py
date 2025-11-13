@@ -80,8 +80,11 @@ class DuckRegression(DuckReg):
         # Single join operation instead of multiple concatenations
         all_agg_expressions = ", ".join(agg_parts + sum_expressions + sum_sq_expressions)
         
+        na_filter_cols = self.strata_cols + self.outcome_vars
+        
         # Add WHERE clause if subset is provided
-        where_clause = f"WHERE {self.subset}" if self.subset else ""
+        where_clause = f"WHERE COLUMNS({na_filter_cols}) IS NOT NULL"
+        where_clause += f" AND {self.subset}" if self.subset else ""
         
         self.agg_query = f"""
         SELECT {select_strata}, {all_agg_expressions}
@@ -166,73 +169,96 @@ class DuckRegression(DuckReg):
                     (len(self.covariates) + 1) * len(self.outcome_vars),
                 )
             )
-
-        # prepare strata SELECT/GROUP BY with optional rounding
-        if self.round_strata is not None:
-            select_strata = ", ".join(
-                [f"ROUND({col}, {self.round_strata}) AS {col}" for col in self.strata_cols]
-            )
-            group_by_clause = ", ".join(
-                [f"ROUND({col}, {self.round_strata})" for col in self.strata_cols]
-            )
-        else:
-            select_strata = ", ".join(self.strata_cols)
-            group_by_clause = ", ".join(self.strata_cols)
+        
+        boot_sizes = np.zeros(self.n_bootstraps)
 
         if not self.cluster_col:
-            # IID bootstrap
-            total_rows = self.conn.execute(
-                f"SELECT COUNT(DISTINCT {self.rowid_col}) FROM {self.table_name}"
-            ).fetchone()[0]
-            unique_rows = total_rows
-            where_clause = f"WHERE {self.subset}" if self.subset else ""
-            self.bootstrap_query = f"""
-            SELECT {select_strata}, {", ".join(["COUNT(*) as count"] + [f"SUM({var}) as sum_{var}" for var in self.outcome_vars])}
-            FROM {self.table_name}
-            {where_clause}
-            GROUP BY {group_by_clause}
-            """
+            # IID bootstrap - resample compressed dataframe by integer index
+            # Pre-compute y, X for all rows of compressed data
+            y, X, n = self.collect_data(data=self.df_compressed)
+            n_rows = len(self.df_compressed)
+            
+            print(f"Starting bootstrap with {self.n_bootstraps} iterations")
+            for b in tqdm(range(self.n_bootstraps)):
+                # Resample row indices with replacement
+                resampled_indices = self.rng.choice(n_rows, size=n_rows, replace=True)
+                
+                # Count how many times each row was sampled
+                row_counts = np.bincount(resampled_indices, minlength=n_rows)
+                
+                # Scale the weights for each row based on resampling
+                n_boot = n * row_counts
+                boot_sizes[b] = n_boot.sum()
+
+                boot_coefs[b, :] = wls(X, y, n_boot).flatten()
         else:
             # Cluster bootstrap
-            unique_groups = self.conn.execute(
-                f"SELECT DISTINCT {self.cluster_col} FROM {self.table_name}"
-            ).fetchall()
-            unique_groups = [group[0] for group in unique_groups]
-            unique_rows = len(unique_groups)
-            where_clause = f"AND {self.subset}" if self.subset else ""
-            self.bootstrap_query = f"""
-            SELECT {select_strata}, {", ".join(["COUNT(*) as count"] + [f"SUM({var}) as sum_{var}" for var in self.outcome_vars])}
-            FROM {self.table_name}
-            WHERE {self.cluster_col} IN (SELECT unnest((?))) {where_clause}
-            GROUP BY {group_by_clause}
-            """
+            # prepare strata SELECT/GROUP BY with optional rounding
+            if self.round_strata is not None:
+                select_strata = ", ".join(
+                    [f"ROUND({col}, {self.round_strata}) AS {col}" for col in self.strata_cols]
+                )
+                group_by_clause = ", ".join(
+                    [f"ROUND({col}, {self.round_strata})" for col in self.strata_cols]
+                )
+            else:
+                select_strata = ", ".join(self.strata_cols)
+                group_by_clause = ", ".join(self.strata_cols)
 
-        for b in tqdm(range(self.n_bootstraps)):
-            resampled_rows = self.rng.choice(
-                unique_rows, size=unique_rows, replace=True
-            )
-            df_boot = pd.DataFrame(
-                self.conn.execute(
-                    self.bootstrap_query, [resampled_rows.tolist()]
-                ).fetchall()
-            )
-            df_boot.columns = (
+            where_clause = f" AND {self.subset}" if self.subset else ""
+            self.bootstrap_query = f"""
+            SELECT {select_strata}, {self.cluster_col}, {", ".join(["COUNT(*) as count"] + [f"SUM({var}) as sum_{var}" for var in self.outcome_vars])}
+            FROM {self.table_name}
+            WHERE 1=1 {where_clause}
+            GROUP BY {group_by_clause}, {self.cluster_col}
+            """
+            
+            # Fetch data once with cluster information
+            df_clusters = self.conn.execute(self.bootstrap_query).fetchdf()
+            df_clusters.columns = (
                 self.strata_cols
+                + [self.cluster_col]
                 + ["count"]
                 + [f"sum_{var}" for var in self.outcome_vars]
             )
+            
+            # Create mean columns
             create_means = "\n".join(
                 [f"mean_{var} = sum_{var}/count" for var in self.outcome_vars]
             )
-            df_boot.eval(create_means, inplace=True)
+            df_clusters.eval(create_means, inplace=True)
+            
+            # Get unique clusters and create mapping
+            unique_groups = df_clusters[self.cluster_col].unique()
+            group_to_idx = {int(x): i for i, x in enumerate(unique_groups)}
+            n_unique_groups = unique_groups.shape[0]
+            
+            # Pre-compute y, X for all rows
+            y, X, n = self.collect_data(data=df_clusters)
+            
+            # Create group index array
+            group_idx = df_clusters[self.cluster_col].map(group_to_idx).to_numpy(dtype=int)
 
-            y, X, n = self.collect_data(data=df_boot)
+            print(f"Starting bootstrap with {self.n_bootstraps} iterations")
+            for b in tqdm(range(self.n_bootstraps)):
+                # Resample cluster IDs
+                resampled_group_ids = self.rng.choice(
+                    n_unique_groups, size=n_unique_groups, replace=True
+                )
+                
+                # Count how many times each cluster was sampled
+                bootstrap_scale = np.bincount(resampled_group_ids, minlength=n_unique_groups)
+                
+                # Scale the weights for each row based on cluster resampling
+                row_scales = bootstrap_scale[group_idx]
+                n_boot = n * row_scales
+                boot_sizes[b] = n_boot.sum()
 
-            boot_coefs[b, :] = wls(X, y, n).flatten()
+                boot_coefs[b, :] = wls(X, y, n_boot).flatten()
 
-            # else np.diag() fails if input is not at least 1-dim
-            vcov = np.cov(boot_coefs.T)
-            vcov = np.expand_dims(vcov, axis=0) if vcov.ndim == 0 else vcov
+        # else np.diag() fails if input is not at least 1-dim
+        vcov = np.cov(boot_coefs.T, aweights=boot_sizes.T)
+        vcov = np.expand_dims(vcov, axis=0) if vcov.ndim == 0 else vcov
 
         return vcov
 
@@ -334,20 +360,21 @@ class DuckMundlak(DuckReg):
             avg_cols.extend([f"avg_{cov}_fe{i}" for cov in self.covariates])
         cluster_cols = [self.cluster_col]
         
-        strata_cols = cov_cols + avg_cols + cluster_cols
+        # Use consistent naming: strata_cols
+        self.strata_cols = cov_cols + avg_cols + cluster_cols
         
         # Build SELECT and GROUP BY columns
         # prepare strata SELECT/GROUP BY with optional rounding
         if self.round_strata is not None:
             select_clause = ", ".join(
-                [f"ROUND({col}, {self.round_strata}) AS {col}" for col in strata_cols]
+                [f"ROUND({col}, {self.round_strata}) AS {col}" for col in self.strata_cols]
             )
             group_by_clause = ", ".join(
-                [f"ROUND({col}, {self.round_strata})" for col in strata_cols]
+                [f"ROUND({col}, {self.round_strata})" for col in self.strata_cols]
             )
         else:
-            select_clause = ", ".join(strata_cols)
-            group_by_clause = ", ".join(strata_cols)
+            select_clause = ", ".join(self.strata_cols)
+            group_by_clause = ", ".join(self.strata_cols)
         
         ## Large DF split by clusters
         
@@ -357,21 +384,22 @@ class DuckMundlak(DuckReg):
             outcome_aggs.append(f"SUM({var}) as sum_{var}")
         outcome_aggs_clause = ", ".join(outcome_aggs)
         
-        where_clause = f"AND {self.subset}" if self.subset else ""
+        na_filter_cols = self.strata_cols + self.outcome_vars
+        where_clause = f"WHERE COLUMNS({', '.join(na_filter_cols)}) IS NOT NULL"
+        where_clause += f" AND {self.subset}" if self.subset else ""
         
-        # This also drops NAs. Unproblematic because NA either in strata or cases when all values per strata are NA
-        self.compress_query_clusters = f"""
+        # Use consistent naming: agg_query
+        self.agg_query = f"""
         SELECT
             {select_clause},
             COUNT(*) as count,
             {outcome_aggs_clause}
         FROM design_matrix
-        WHERE COLUMNS(*) IS NOT NULL 
         {where_clause}
         GROUP BY {group_by_clause}
         """
         print("Compressing data by computing group-level statistics")
-        self.df_compressed_clusters = self.conn.execute(self.compress_query_clusters).fetchdf()
+        self.df_compressed_clusters = self.conn.execute(self.agg_query).fetchdf()
         
         ## Further compress, dropping cluster info for main regression
         agg_dict = {"count": "sum"}
@@ -393,11 +421,11 @@ class DuckMundlak(DuckReg):
 
     def collect_data(self, data: pd.DataFrame):
         # Build list of RHS variables (covariates + all FE averages)
-        rhs = self.covariates.copy()
+        self.rhs = self.covariates.copy()
         for i in range(len(self.fe_cols)):
-            rhs.extend([f"avg_{cov}_fe{i}" for cov in self.covariates])
+            self.rhs.extend([f"avg_{cov}_fe{i}" for cov in self.covariates])
 
-        X = data[rhs].values
+        X = data[self.rhs].values
         X = np.c_[np.ones(X.shape[0]), X]
         
         # Collect all outcome variables
@@ -741,7 +769,7 @@ class DuckDoubleDemeaning(DuckReg):
         )
         self.outcome_var = outcome_var
         self.treatment_var = treatment_var
-        self.fe_cols = fe_cols  # list of FE dimensions (e.g., ['unit_id', 'time'])
+        self.fe_cols = fe_cols  # list of FE dimensions (e.g., ['unit_id', 'time_col'])
         self.cluster_col = cluster_col
 
     def prepare_data(self):

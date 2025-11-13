@@ -86,7 +86,7 @@ def compressed_ols(
     
     # Second part: fixed effects (optional)
     fe_cols = []
-    if len(parts) > 1 and parts[1]:
+    if len(parts) > 1 and parts[1].strip() != "0":
         fe_cols = [x.strip() for x in parts[1].split("+")]
     
     # Third part: instrumental variables (not implemented)
@@ -95,17 +95,19 @@ def compressed_ols(
     
     # Fourth part: cluster variable (optional)
     cluster_col = None
-    if len(parts) > 3 and parts[3]:
+    if len(parts) > 3 and parts[3].strip() != "0":
         cluster_parts = [x.strip() for x in parts[3].split("+")]
         if len(cluster_parts) > 1:
             raise ValueError("Only one cluster variable allowed")
         cluster_col = cluster_parts[0]
     
     # Choose FE method
-    if fe_method == "mundlak":
-        use_mundlak = True
+    if not fe_cols:
+        strategy = "regular"
+    elif fe_method == "mundlak":
+        strategy = "mundlak"
     elif fe_method == "demean":
-        use_mundlak = False
+        strategy = "regular"
     else:
         raise ValueError("fe_method must be 'mundlak' or 'demean'")
     
@@ -143,7 +145,7 @@ def compressed_ols(
         raise ValueError(f"Data path not found: {data_path}")
     
     # Choose estimator
-    if use_mundlak:
+    if strategy == "mundlak":
         # Use Mundlak device for FE
         estimator = DuckMundlak(
             db_name=db_name,

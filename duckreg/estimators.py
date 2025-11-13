@@ -306,8 +306,11 @@ class DuckMundlak(DuckReg):
         self.subset = subset
 
     def prepare_data(self):
-        # Compute averages for each FE dimension and store as temp tables
-        where_clause = f"WHERE {self.subset}" if self.subset else ""
+
+        # Filter out rows with NA values in strata or outcome variables
+        na_filter_cols = self.fe_cols + self.covariates + self.outcome_vars + [self.cluster_col]
+        where_clause = f"WHERE COLUMNS({na_filter_cols}) IS NOT NULL"
+        where_clause += f" AND {self.subset}" if self.subset else ""
         
         for i, fe_col in enumerate(self.fe_cols):
             print(f"Computing averages for fixed effect dimension {i+1}/{len(self.fe_cols)}: {fe_col}")
@@ -360,18 +363,19 @@ class DuckMundlak(DuckReg):
             avg_cols.extend([f"avg_{cov}_fe{i}" for cov in self.covariates])
         cluster_cols = [self.cluster_col]
         
-        # Use consistent naming: strata_cols
-        self.strata_cols = cov_cols + avg_cols + cluster_cols
+        # Use consistent naming: strata_cols (excluding cluster for rounding purposes)
+        strata_cols_to_round = cov_cols + avg_cols
+        self.strata_cols = strata_cols_to_round + cluster_cols
         
         # Build SELECT and GROUP BY columns
-        # prepare strata SELECT/GROUP BY with optional rounding
+        # prepare strata SELECT/GROUP BY with optional rounding (but not cluster cols)
         if self.round_strata is not None:
             select_clause = ", ".join(
-                [f"ROUND({col}, {self.round_strata}) AS {col}" for col in self.strata_cols]
-            )
+                [f"ROUND({col}, {self.round_strata}) AS {col}" for col in strata_cols_to_round]
+            ) + ", " + ", ".join(cluster_cols)
             group_by_clause = ", ".join(
-                [f"ROUND({col}, {self.round_strata})" for col in self.strata_cols]
-            )
+                [f"ROUND({col}, {self.round_strata})" for col in strata_cols_to_round]
+            ) + ", " + ", ".join(cluster_cols)
         else:
             select_clause = ", ".join(self.strata_cols)
             group_by_clause = ", ".join(self.strata_cols)
@@ -384,10 +388,6 @@ class DuckMundlak(DuckReg):
             outcome_aggs.append(f"SUM({var}) as sum_{var}")
         outcome_aggs_clause = ", ".join(outcome_aggs)
         
-        na_filter_cols = self.strata_cols + self.outcome_vars
-        where_clause = f"WHERE COLUMNS({', '.join(na_filter_cols)}) IS NOT NULL"
-        where_clause += f" AND {self.subset}" if self.subset else ""
-        
         # Use consistent naming: agg_query
         self.agg_query = f"""
         SELECT
@@ -395,7 +395,6 @@ class DuckMundlak(DuckReg):
             COUNT(*) as count,
             {outcome_aggs_clause}
         FROM design_matrix
-        {where_clause}
         GROUP BY {group_by_clause}
         """
         print("Compressing data by computing group-level statistics")
@@ -872,7 +871,7 @@ class DuckDoubleDemeaning(DuckReg):
             SELECT
                 ddot_{self.treatment_var},
                 COUNT(*) as count,
-                SUM({self.outcome_var}) as sum_{self.outcome_var}
+                SUM({self.outcome_var}) AS sum_{self.outcome_var}
             FROM multi_demeaned
             WHERE {self.cluster_col} IN (SELECT unnest((?)))
             GROUP BY ddot_{self.treatment_var}

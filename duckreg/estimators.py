@@ -1,435 +1,565 @@
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+import logging
+import sys
+from typing import Tuple, Optional, List, Dict, Any
+
 from .demean import demean, _convert_to_int
 from .duckreg import DuckReg, wls
 
-################################################################################
+# Configure logging
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logger.addHandler(logging.StreamHandler(sys.stdout))
+    logger.setLevel(logging.DEBUG)
 
 
-class DuckRegression(DuckReg):
+# ============================================================================
+# Bootstrap iteration functions (module-level for parallel execution)
+# ============================================================================
+
+def _bootstrap_iteration_iid(args: Tuple) -> Tuple[np.ndarray, float]:
+    """Single bootstrap iteration for IID bootstrap (parallelizable)"""
+    b, X, y, n, n_rows, seed = args
+    rng = np.random.default_rng(seed)
+    
+    resampled_indices = rng.choice(n_rows, size=n_rows, replace=True)
+    row_counts = np.bincount(resampled_indices, minlength=n_rows)
+    n_boot = n * row_counts
+    
+    return wls(X, y, n_boot).flatten(), n_boot.sum()
+
+
+def _bootstrap_iteration_cluster(args: Tuple) -> Tuple[np.ndarray, float]:
+    """Single bootstrap iteration for cluster bootstrap (parallelizable)"""
+    b, X, y, n, group_idx, n_unique_groups, seed = args
+    rng = np.random.default_rng(seed)
+    
+    resampled_group_ids = rng.choice(n_unique_groups, size=n_unique_groups, replace=True)
+    bootstrap_scale = np.bincount(resampled_group_ids, minlength=n_unique_groups)
+    n_boot = n * bootstrap_scale[group_idx]
+    
+    return wls(X, y, n_boot).flatten(), n_boot.sum()
+
+
+# ============================================================================
+# Bootstrap executor helper
+# ============================================================================
+
+class BootstrapExecutor:
+    """Encapsulates bootstrap execution logic (sequential or parallel)"""
+    
+    def __init__(self, n_bootstraps: int, n_jobs: int, rng: np.random.Generator):
+        self.n_bootstraps = n_bootstraps
+        self.n_jobs = n_jobs
+        self.seeds = rng.integers(0, 2**31, size=n_bootstraps)
+    
+    def execute(self, iteration_func, base_args: Tuple, 
+                args_builder=None) -> Tuple[np.ndarray, np.ndarray]:
+        """Execute bootstrap iterations and return (coefficients, sizes)"""
+        if args_builder is None:
+            args_builder = lambda b, seed: base_args + (seed,)
+        
+        args_list = [(b,) + args_builder(b, self.seeds[b]) for b in range(self.n_bootstraps)]
+        
+        if self.n_jobs == 1:
+            return self._run_sequential(iteration_func, args_list)
+        return self._run_parallel(iteration_func, args_list)
+    
+    def _run_sequential(self, iteration_func, args_list) -> Tuple[np.ndarray, np.ndarray]:
+        """Run bootstrap sequentially with progress bar"""
+        print(f"Starting bootstrap with {self.n_bootstraps} iterations (sequential)")
+        results = [iteration_func(args) for args in tqdm(args_list)]
+        return np.array([r[0] for r in results]), np.array([r[1] for r in results])
+    
+    def _run_parallel(self, iteration_func, args_list) -> Tuple[np.ndarray, np.ndarray]:
+        """Run bootstrap in parallel using joblib"""
+        from joblib import Parallel, delayed
+        
+        print(f"Starting bootstrap with {self.n_bootstraps} iterations ({self.n_jobs} jobs)")
+        results = Parallel(n_jobs=self.n_jobs, verbose=10)(
+            delayed(iteration_func)(args) for args in args_list
+        )
+        return np.array([r[0] for r in results]), np.array([r[1] for r in results])
+
+
+# ============================================================================
+# Shared base class for DuckRegression and DuckMundlak
+# ============================================================================
+
+class DuckLinearModel(DuckReg):
+    """Base class for linear models with shared estimation, bootstrap, and vcov logic"""
+    
     def __init__(
         self,
         db_name: str,
         table_name: str,
-        outcome_vars: list,  # changed from formula to explicit list
-        covariates: list,  # new argument
         seed: int,
-        fe_cols: list = None,  # new argument (optional fixed effects)
+        formula=None,
         n_bootstraps: int = 100,
-        cluster_col: str = None,  # changed from required to optional
-        rowid_col: str = "rowid",
-        fitter: str = "numpy",
         round_strata: int = None,
         duckdb_kwargs: dict = None,
         subset: str = None,
+        n_jobs: int = 1,
         **kwargs,
     ):
+        if formula is None:
+            raise ValueError("Formula object is required")
+        
         super().__init__(
             db_name=db_name,
             table_name=table_name,
             seed=seed,
             n_bootstraps=n_bootstraps,
-            fitter=fitter,
             round_strata=round_strata,
             duckdb_kwargs=duckdb_kwargs,
+            variable_casts=None,
             **kwargs,
         )
-        self.outcome_vars = outcome_vars if isinstance(outcome_vars, list) else [outcome_vars]
-        self.covariates = covariates if isinstance(covariates, list) else [covariates]
-        self.fe_cols = fe_cols if fe_cols else []
-        self.cluster_col = cluster_col
-        self.rowid_col = rowid_col
-        self.round_strata = round_strata
-        self.subset = subset
         
-        # Build strata columns for grouping
-        self.strata_cols = self.covariates + self.fe_cols
-
+        self.formula = formula
+        self.n_jobs = n_jobs
+        self.subset = subset
+        self.strata_cols: List[str] = []
+        self._boolean_cols: Optional[set] = None
+        
+        # Extract from formula
+        self.outcome_vars = formula.get_outcome_names()
+        self.covariates = formula.get_covariate_names()
+        self.fe_cols = formula.get_fe_names()
+        self.cluster_col = formula.cluster.name if formula.cluster else None
+        
         if not self.outcome_vars:
             raise ValueError("No outcome variables provided")
+        
+        logger.debug(f"{self.__class__.__name__}: outcomes={self.outcome_vars}, "
+                    f"covariates={self.covariates}, fe={self.fe_cols}, cluster={self.cluster_col}")
+
+    # -------------------------------------------------------------------------
+    # Abstract methods (must be implemented by subclasses)
+    # -------------------------------------------------------------------------
+    
+    def _get_n_coefs(self) -> int:
+        """Get number of coefficients based on model structure"""
+        raise NotImplementedError
+    
+    def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, Optional[str]]:
+        """Get cluster-level data for bootstrap. Returns (df, cluster_col_name)"""
+        raise NotImplementedError
+
+    # -------------------------------------------------------------------------
+    # Shared utility methods
+    # -------------------------------------------------------------------------
+
+    def _get_boolean_columns(self) -> set:
+        """Detect BOOLEAN columns in source table (cached)"""
+        if self._boolean_cols is not None:
+            return self._boolean_cols
+        
+        all_columns = set(self.formula.get_source_columns_for_null_check())
+        cols_sql = ', '.join(f"'{col}'" for col in all_columns)
+        
+        query = f"""
+        SELECT column_name FROM (DESCRIBE SELECT * FROM {self.table_name})
+        WHERE column_name IN ({cols_sql}) AND column_type = 'BOOLEAN'
+        """
+        self._boolean_cols = set(self.conn.execute(query).fetchdf()['column_name'].tolist())
+        return self._boolean_cols
+
+    def _get_cluster_col_for_vcov(self) -> Optional[str]:
+        """Get the cluster column name for analytical vcov"""
+        return self.cluster_col
+
+    def _build_where_clause(self, user_subset: Optional[str] = None) -> str:
+        """Build WHERE clause using formula's method"""
+        return self.formula.get_where_clause_sql(user_subset)
+
+    def _get_unit_col(self) -> Optional[str]:
+        """Get the first FE column as unit column for SQL expressions"""
+        return self.fe_cols[0] if self.fe_cols else None
+
+    # -------------------------------------------------------------------------
+    # Estimation
+    # -------------------------------------------------------------------------
+
+    def estimate(self) -> np.ndarray:
+        """Estimate coefficients using WLS"""
+        y, X, n = self.collect_data(data=self.df_compressed)
+        betahat = wls(X, y, n)
+        
+        # Expand coefficient names for multiple outcomes
+        if len(self.outcome_vars) > 1:
+            self.coef_names_ = [f"{name}:{outcome}" 
+                               for outcome in self.outcome_vars 
+                               for name in self.coef_names_]
+        
+        return betahat.flatten()
+
+    # -------------------------------------------------------------------------
+    # Variance-covariance estimation
+    # -------------------------------------------------------------------------
+
+    def fit_vcov(self):
+        """Compute variance-covariance matrix (cluster-robust or HC1)"""
+        y, X, n = self.collect_data(data=self.df_compressed)
+        betahat = wls(X, y, n).flatten()
+        self.n_bootstraps = 0
+        
+        # Compute bread: (X'WX)^{-1}
+        w = n.reshape(-1, 1)
+        bread = np.linalg.inv(X.T @ (X * w))
+        
+        cluster_col = self._get_cluster_col_for_vcov()
+        
+        if cluster_col and cluster_col in self.df_compressed.columns:
+            self._compute_cluster_vcov(X, n, betahat, bread, cluster_col)
+        else:
+            self._compute_hc1_vcov(X, n, betahat, bread)
+
+    def _compute_cluster_vcov(self, X: np.ndarray, n: np.ndarray, 
+                              betahat: np.ndarray, bread: np.ndarray, 
+                              cluster_col: str):
+        """Compute cluster-robust standard errors (CR0)"""
+        self.se = "cluster"
+        
+        yhat = (X @ betahat).reshape(-1, 1)
+        yprime = self.df_compressed[f"sum_{self.outcome_vars[0]}"].values.reshape(-1, 1)
+        residuals = yprime - n.reshape(-1, 1) * yhat
+        
+        clusters = self.df_compressed[cluster_col].values
+        unique_clusters = np.unique(clusters)
+        
+        # Compute meat matrix via cluster scores
+        meat = np.zeros((X.shape[1], X.shape[1]))
+        for cluster in unique_clusters:
+            mask = clusters == cluster
+            score_g = (X[mask] * residuals[mask]).sum(axis=0, keepdims=True).T
+            meat += score_g @ score_g.T
+        
+        # Small sample adjustment
+        N, K, G = n.sum(), X.shape[1], len(unique_clusters)
+        adjustment = (G / (G - 1)) * ((N - 1) / (N - K))
+        self.vcov = adjustment * bread @ meat @ bread
+
+    def _compute_hc1_vcov(self, X: np.ndarray, n: np.ndarray, 
+                          betahat: np.ndarray, bread: np.ndarray):
+        """Compute heteroskedasticity-robust standard errors (HC1)"""
+        self.se = "hc1"
+        
+        yhat = (X @ betahat).reshape(-1, 1)
+        sum_sq_col = f"sum_{self.outcome_vars[0]}_sq"
+        
+        if sum_sq_col in self.df_compressed.columns:
+            yprime = self.df_compressed[f"sum_{self.outcome_vars[0]}"].values.reshape(-1, 1)
+            yprimeprime = self.df_compressed[sum_sq_col].values.reshape(-1, 1)
+            w_rss = yprimeprime - 2 * yhat * yprime + n.reshape(-1, 1) * (yhat**2)
+        else:
+            logger.warning("sum_sq column not available, using simple variance estimate")
+            y_mean = self.df_compressed[f"mean_{self.outcome_vars[0]}"].values.reshape(-1, 1)
+            w_rss = ((y_mean - yhat) ** 2) * n.reshape(-1, 1)
+        
+        meat = X.T @ (X * w_rss)
+        n_nk = n.sum() / (n.sum() - X.shape[1])
+        self.vcov = n_nk * (bread @ meat @ bread)
+
+    # -------------------------------------------------------------------------
+    # Bootstrap methods
+    # -------------------------------------------------------------------------
+
+    def bootstrap(self) -> np.ndarray:
+        """Run bootstrap to estimate variance-covariance matrix"""
+        self.se = "bootstrap"
+        executor = BootstrapExecutor(self.n_bootstraps, self.n_jobs, self.rng)
+        
+        if self.cluster_col:
+            boot_coefs, boot_sizes = self._run_cluster_bootstrap(executor)
+        else:
+            boot_coefs, boot_sizes = self._run_iid_bootstrap(executor)
+        
+        vcov = np.cov(boot_coefs.T, aweights=boot_sizes)
+        return np.expand_dims(vcov, axis=0) if vcov.ndim == 0 else vcov
+
+    def _run_iid_bootstrap(self, executor: BootstrapExecutor) -> Tuple[np.ndarray, np.ndarray]:
+        """IID bootstrap - resample compressed dataframe"""
+        y, X, n = self.collect_data(data=self.df_compressed)
+        n_rows = len(self.df_compressed)
+        
+        return executor.execute(
+            _bootstrap_iteration_iid,
+            (X, y, n, n_rows),
+            args_builder=lambda b, seed: (X, y, n, n_rows, seed)
+        )
+
+    def _run_cluster_bootstrap(self, executor: BootstrapExecutor) -> Tuple[np.ndarray, np.ndarray]:
+        """Cluster bootstrap"""
+        df_clusters, cluster_col_name = self._get_cluster_data_for_bootstrap()
+        df_clusters = df_clusters.dropna(subset=[cluster_col_name])
+        
+        unique_groups = df_clusters[cluster_col_name].unique()
+        group_to_idx = {x: i for i, x in enumerate(unique_groups)}
+        group_idx = df_clusters[cluster_col_name].map(group_to_idx).to_numpy(dtype=int)
+        
+        y, X, n = self.collect_data(data=df_clusters)
+        n_unique_groups = len(unique_groups)
+        
+        return executor.execute(
+            _bootstrap_iteration_cluster,
+            (X, y, n, group_idx, n_unique_groups),
+            args_builder=lambda b, seed: (X, y, n, group_idx, n_unique_groups, seed)
+        )
+
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+
+    def summary(self) -> Dict[str, Any]:
+        """Provide comprehensive results summary"""
+        result = {
+            "point_estimate": self.point_estimate,
+            "coef_names": getattr(self, 'coef_names_', None),
+            "n_obs": getattr(self, 'n_obs', None),
+            "n_obs_compressed": len(self.df_compressed) if hasattr(self, 'df_compressed') else None,
+            "estimator_type": self.__class__.__name__,
+            "fe_method": "demean" if isinstance(self, DuckRegression) else "mundlak" if self.fe_cols else None,
+            "outcome_vars": self.outcome_vars,
+            "covariates": self.covariates,
+            "fe_cols": self.fe_cols,
+            "cluster_col": self.cluster_col
+        }
+        
+        if hasattr(self, 'vcov'):
+            result.update({
+                "standard_error": np.sqrt(np.diag(self.vcov)),
+                "vcov": self.vcov,
+                "se_type": getattr(self, "se", "unknown")
+            })
+        
+        return result
+
+
+# ============================================================================
+# DuckRegression (demeaning approach)
+# ============================================================================
+
+class DuckRegression(DuckLinearModel):
+    """OLS with fixed effects via demeaning"""
+    
+    def __init__(self, rowid_col: str = "rowid", fitter: str = "numpy", **kwargs):
+        super().__init__(**kwargs)
+        self.rowid_col = rowid_col
+        self.strata_cols = self.covariates + self.fe_cols
+
+    def _get_n_coefs(self) -> int:
+        n_covs = len(self.covariates) if self.fe_cols else len(self.covariates) + 1
+        return n_covs * len(self.outcome_vars)
+
+    def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, Optional[str]]:
+        return self.df_compressed, self.cluster_col
 
     def prepare_data(self):
-        # No preparation needed for simple regression
-        pass
+        pass  # No preparation needed
 
     def compress_data(self):
-        # Build SELECT and GROUP BY clauses for strata, optionally rounding columns
-        if self.round_strata is not None:
-            select_strata = ", ".join(
-                [f"ROUND({col}, {self.round_strata}) AS {col}" for col in self.strata_cols]
-            )
-            group_by_clause = ", ".join(
-                [f"ROUND({col}, {self.round_strata})" for col in self.strata_cols]
-            )
-        else:
-            select_strata = ", ".join(self.strata_cols)
-            group_by_clause = ", ".join(self.strata_cols)
-
-        # Build aggregation expressions
-        agg_parts = ["COUNT(*) as count"]
-        sum_expressions = []
-        sum_sq_expressions = []
+        """Compress data by grouping on strata columns"""
+        boolean_cols = self._get_boolean_columns()
+        unit_col = self._get_unit_col()
         
-        for var in self.outcome_vars:
-            sum_expr = f"SUM({var}) as sum_{var}"
-            sum_sq_expr = f"SUM(POW({var}, 2)) as sum_{var}_sq"
-            sum_expressions.append(sum_expr)
-            sum_sq_expressions.append(sum_sq_expr)
+        # Build SELECT and GROUP BY
+        select_parts, group_by_parts = self._build_strata_select_sql(boolean_cols, unit_col)
         
-        # Single join operation instead of multiple concatenations
-        all_agg_expressions = ", ".join(agg_parts + sum_expressions + sum_sq_expressions)
+        # Add cluster if present
+        if self.cluster_col:
+            cluster_expr = f"CAST({self.cluster_col} AS SMALLINT)" if self.cluster_col in boolean_cols else self.cluster_col
+            select_parts.append(f"{cluster_expr} AS {self.cluster_col}")
+            group_by_parts.append(cluster_expr)
         
-        na_filter_cols = self.strata_cols + self.outcome_vars
-        
-        # Add WHERE clause if subset is provided
-        where_clause = f"WHERE COLUMNS({na_filter_cols}) IS NOT NULL"
-        where_clause += f" AND {self.subset}" if self.subset else ""
+        # Build aggregations
+        agg_parts = self._build_outcome_agg_sql(boolean_cols, unit_col)
         
         self.agg_query = f"""
-        SELECT {select_strata}, {all_agg_expressions}
+        SELECT {', '.join(select_parts)}, {', '.join(agg_parts)}
         FROM {self.table_name}
-        {where_clause}
+        {self._build_where_clause(self.subset)}
+        GROUP BY {', '.join(group_by_parts)}
+        """
+        
+        self.df_compressed = self.conn.execute(self.agg_query).fetchdf().dropna()
+        
+        # Set column names
+        expected_cols = self.strata_cols.copy()
+        if self.cluster_col:
+            expected_cols.append(self.cluster_col)
+        expected_cols.extend(["count"] + [f"sum_{v}" for v in self.outcome_vars] + 
+                           [f"sum_{v}_sq" for v in self.outcome_vars])
+        self.df_compressed.columns = expected_cols
+        
+        self.n_obs = int(self.df_compressed['count'].sum())
+        
+        # Compute means
+        for var in self.outcome_vars:
+            self.df_compressed[f"mean_{var}"] = self.df_compressed[f"sum_{var}"] / self.df_compressed["count"]
+
+    def _build_strata_select_sql(self, boolean_cols: set, unit_col: Optional[str]) -> Tuple[List[str], List[str]]:
+        """Build SELECT and GROUP BY parts for strata columns"""
+        select_parts, group_by_parts = [], []
+        
+        for col in self.strata_cols:
+            col_expr = self.formula.get_covariate_expression(col, unit_col, 'year', boolean_cols)
+            if col_expr == col:
+                col_expr = self.formula.get_fe_expression(col, boolean_cols)
+            
+            if self.round_strata is not None:
+                select_parts.append(f"ROUND({col_expr}, {self.round_strata}) AS {col}")
+                group_by_parts.append(f"ROUND({col_expr}, {self.round_strata})")
+            else:
+                select_parts.append(f"{col_expr} AS {col}")
+                group_by_parts.append(col_expr)
+        
+        return select_parts, group_by_parts
+
+    def _build_outcome_agg_sql(self, boolean_cols: set, unit_col: Optional[str]) -> List[str]:
+        """Build aggregation SQL for outcomes"""
+        agg_parts = ["COUNT(*) as count"]
+        for var in self.formula.outcomes:
+            expr = var.get_sql_expression(unit_col)
+            if var.name in boolean_cols:
+                expr = f"CAST({expr} AS SMALLINT)"
+            agg_parts.append(f"SUM({expr}) as sum_{var.name}")
+            agg_parts.append(f"SUM(POW({expr}, 2)) as sum_{var.name}_sq")
+        return agg_parts
+
+    def collect_data(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Collect and demean data"""
+        y = data.filter(regex=f"mean_({'|'.join(self.outcome_vars)})", axis=1).values
+        X = data[self.covariates].values
+        n = data["count"].values
+
+        y = y.reshape(-1, 1) if y.ndim == 1 else y
+        X = X.reshape(-1, 1) if X.ndim == 1 else X
+
+        if self.fe_cols:
+            fe = _convert_to_int(data[self.fe_cols])
+            fe = fe.reshape(-1, 1) if fe.ndim == 1 else fe
+            y, _ = demean(x=y, flist=fe, weights=n)
+            X, _ = demean(x=X, flist=fe, weights=n)
+            self.coef_names_ = self.covariates.copy()
+        else:
+            X = np.c_[np.ones(X.shape[0]), X]
+            self.coef_names_ = ['Intercept'] + self.covariates.copy()
+
+        return y, X, n
+
+
+# ============================================================================
+# DuckMundlak (Mundlak device approach)
+# ============================================================================
+
+class DuckMundlak(DuckLinearModel):
+    """OLS with fixed effects via Mundlak device"""
+    
+    _CLUSTER_ALIAS = "__cluster__"
+    
+    def _get_n_coefs(self) -> int:
+        simple_covs = len(self.formula.get_simple_covariate_names())
+        rhs_count = 1 + len(self.covariates) + len(self.fe_cols) * simple_covs
+        return rhs_count * len(self.outcome_vars)
+
+    def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, str]:
+        return self.df_compressed, self._CLUSTER_ALIAS
+
+    def _get_cluster_col_for_vcov(self) -> str:
+        return self._CLUSTER_ALIAS
+
+    def prepare_data(self):
+        """Create design matrix with Mundlak averages"""
+        boolean_cols = self._get_boolean_columns()
+        unit_col = self._get_unit_col()
+        
+        # Build SELECT parts using formula's SQL generators
+        select_parts = [
+            self.formula.get_fe_select_sql(boolean_cols),
+            self.formula.get_outcomes_select_sql(unit_col, 'year', boolean_cols),
+            self.formula.get_covariates_select_sql(unit_col, 'year', boolean_cols, include_interactions=True),
+        ]
+        
+        cluster_sql = self.formula.get_cluster_select_sql(boolean_cols, self._CLUSTER_ALIAS, unit_col)
+        if cluster_sql:
+            select_parts.append(cluster_sql)
+        
+        # Create design matrix
+        self.conn.execute(f"""
+        CREATE OR REPLACE TABLE design_matrix AS
+        SELECT {', '.join(p for p in select_parts if p)}
+        FROM {self.table_name}
+        {self._build_where_clause(self.subset)}
+        """)
+        
+        # Add FE averages for Mundlak device
+        self._add_fe_averages()
+
+    def _add_fe_averages(self):
+        """Add FE-level averages for Mundlak device"""
+        simple_cov_names = self.formula.get_simple_covariate_names()
+        
+        for i, fe_col in enumerate(self.fe_cols):
+            avg_cols = ", ".join([f"AVG({cov}) AS avg_{cov}_fe{i}" for cov in simple_cov_names])
+            avg_col_list = ", ".join([f"fe{i}.avg_{cov}_fe{i}" for cov in simple_cov_names])
+            
+            self.conn.execute(f"""
+            CREATE OR REPLACE TABLE design_matrix AS
+            SELECT dm.*, {avg_col_list}
+            FROM design_matrix dm
+            JOIN (SELECT {fe_col}, {avg_cols} FROM design_matrix GROUP BY {fe_col}) fe{i} 
+            ON dm.{fe_col} = fe{i}.{fe_col}
+            """)
+
+    def compress_data(self):
+        """Compress design matrix"""
+        simple_cov_names = self.formula.get_simple_covariate_names()
+        cov_cols = list(self.covariates)
+        avg_cols = [f"avg_{cov}_fe{i}" for i in range(len(self.fe_cols)) for cov in simple_cov_names]
+        
+        strata_cols_to_round = cov_cols + avg_cols
+        self.strata_cols = strata_cols_to_round + [self._CLUSTER_ALIAS]
+        
+        # Build SELECT and GROUP BY with optional rounding
+        if self.round_strata is not None:
+            select_clause = ", ".join([f"ROUND({col}, {self.round_strata}) AS {col}" for col in strata_cols_to_round])
+            group_by_clause = ", ".join([f"ROUND({col}, {self.round_strata})" for col in strata_cols_to_round])
+        else:
+            select_clause = ", ".join(strata_cols_to_round)
+            group_by_clause = ", ".join(strata_cols_to_round)
+        
+        select_clause += f", {self._CLUSTER_ALIAS}"
+        group_by_clause += f", {self._CLUSTER_ALIAS}"
+        
+        outcome_aggs = ", ".join([f"SUM({var}) as sum_{var}" for var in self.outcome_vars])
+        
+        self.agg_query = f"""
+        SELECT {select_clause}, COUNT(*) as count, {outcome_aggs}
+        FROM design_matrix
         GROUP BY {group_by_clause}
         """
         
         self.df_compressed = self.conn.execute(self.agg_query).fetchdf()
+        self.n_obs = int(self.df_compressed['count'].sum())
         
-        # Drops NAs. Unproblematic because NA either in strata or cases when all values per strata are NA
-        self.df_compressed.dropna(inplace=True)
-        
-        # Pre-compute column lists
-        sum_cols = [f"sum_{var}" for var in self.outcome_vars]
-        sum_sq_cols = [f"sum_{var}_sq" for var in self.outcome_vars]
-        
-        self.df_compressed.columns = self.strata_cols + ["count"] + sum_cols + sum_sq_cols
-        
-        # Single eval operation for all means
-        mean_expressions = [f"mean_{var} = sum_{var}/count" for var in self.outcome_vars]
-        if mean_expressions:
-            self.df_compressed.eval("\n".join(mean_expressions), inplace=True)
-
-    def collect_data(self, data: pd.DataFrame) -> pd.DataFrame:
-        y = data.filter(
-            regex=f"mean_{'(' + '|'.join(self.outcome_vars) + ')'}", axis=1
-        ).values
-        X = data[self.covariates].values
-        n = data["count"].values
-
-        # y, X, w need to be two-dimensional for the demean function
-        y = y.reshape(-1, 1) if y.ndim == 1 else y
-        X = X.reshape(-1, 1) if X.ndim == 1 else X
-
-        if self.fe_cols:
-            # fe needs to contain of only integers for
-            # the demean function to work
-            fe = _convert_to_int(data[self.fe_cols])
-            fe = fe.reshape(-1, 1) if fe.ndim == 1 else fe
-
-            y, _ = demean(x=y, flist=fe, weights=n)
-            X, _ = demean(x=X, flist=fe, weights=n)
-        else:
-            X = np.c_[np.ones(X.shape[0]), X]
-
-        return y, X, n
-
-    def estimate(self):
-        y, X, n = self.collect_data(data=self.df_compressed)
-        betahat = wls(X, y, n).flatten()
-        return betahat
-
-    def fit_vcov(self):
-        """compressed estimation of the heteroskedasticity-robust variance covariance matrix"""
-        self.se = "hc1"
-        y, X, n = self.collect_data(data=self.df_compressed)
-        betahat = wls(X, y, n).flatten()
-        # only works for single outcome for now
-        self.n_bootstraps = 0  # disable bootstrap
-        yprime = self.df_compressed[f"sum_{self.outcome_vars[0]}"].values.reshape(-1, 1)
-        yprimeprime = self.df_compressed[
-            f"sum_{self.outcome_vars[0]}_sq"
-        ].values.reshape(-1, 1)
-        yhat = (X @ betahat).reshape(-1, 1)
-        rss_g = (yhat**2) * n.reshape(-1, 1) - 2 * yhat * yprime + yprimeprime
-        bread = np.linalg.inv(X.T @ np.diag(n.flatten()) @ X)
-        meat = X.T @ np.diag(rss_g.flatten()) @ X
-        n_nk = n.sum() / (n.sum() - X.shape[1])
-        self.vcov = n_nk * (bread @ meat @ bread)
-
-    def bootstrap(self):
-        self.se = "bootstrap"
-        if self.fe_cols:
-            boot_coefs = np.zeros(
-                (self.n_bootstraps, len(self.covariates) * len(self.outcome_vars))
-            )
-        else:
-            boot_coefs = np.zeros(
-                (
-                    self.n_bootstraps,
-                    (len(self.covariates) + 1) * len(self.outcome_vars),
-                )
-            )
-        
-        boot_sizes = np.zeros(self.n_bootstraps)
-
-        if not self.cluster_col:
-            # IID bootstrap - resample compressed dataframe by integer index
-            # Pre-compute y, X for all rows of compressed data
-            y, X, n = self.collect_data(data=self.df_compressed)
-            n_rows = len(self.df_compressed)
-            
-            print(f"Starting bootstrap with {self.n_bootstraps} iterations")
-            for b in tqdm(range(self.n_bootstraps)):
-                # Resample row indices with replacement
-                resampled_indices = self.rng.choice(n_rows, size=n_rows, replace=True)
-                
-                # Count how many times each row was sampled
-                row_counts = np.bincount(resampled_indices, minlength=n_rows)
-                
-                # Scale the weights for each row based on resampling
-                n_boot = n * row_counts
-                boot_sizes[b] = n_boot.sum()
-
-                boot_coefs[b, :] = wls(X, y, n_boot).flatten()
-        else:
-            # Cluster bootstrap
-            # prepare strata SELECT/GROUP BY with optional rounding
-            if self.round_strata is not None:
-                select_strata = ", ".join(
-                    [f"ROUND({col}, {self.round_strata}) AS {col}" for col in self.strata_cols]
-                )
-                group_by_clause = ", ".join(
-                    [f"ROUND({col}, {self.round_strata})" for col in self.strata_cols]
-                )
-            else:
-                select_strata = ", ".join(self.strata_cols)
-                group_by_clause = ", ".join(self.strata_cols)
-
-            where_clause = f" AND {self.subset}" if self.subset else ""
-            self.bootstrap_query = f"""
-            SELECT {select_strata}, {self.cluster_col}, {", ".join(["COUNT(*) as count"] + [f"SUM({var}) as sum_{var}" for var in self.outcome_vars])}
-            FROM {self.table_name}
-            WHERE 1=1 {where_clause}
-            GROUP BY {group_by_clause}, {self.cluster_col}
-            """
-            
-            # Fetch data once with cluster information
-            df_clusters = self.conn.execute(self.bootstrap_query).fetchdf()
-            df_clusters.columns = (
-                self.strata_cols
-                + [self.cluster_col]
-                + ["count"]
-                + [f"sum_{var}" for var in self.outcome_vars]
-            )
-            
-            # Create mean columns
-            create_means = "\n".join(
-                [f"mean_{var} = sum_{var}/count" for var in self.outcome_vars]
-            )
-            df_clusters.eval(create_means, inplace=True)
-            
-            # Get unique clusters and create mapping
-            unique_groups = df_clusters[self.cluster_col].unique()
-            group_to_idx = {int(x): i for i, x in enumerate(unique_groups)}
-            n_unique_groups = unique_groups.shape[0]
-            
-            # Pre-compute y, X for all rows
-            y, X, n = self.collect_data(data=df_clusters)
-            
-            # Create group index array
-            group_idx = df_clusters[self.cluster_col].map(group_to_idx).to_numpy(dtype=int)
-
-            print(f"Starting bootstrap with {self.n_bootstraps} iterations")
-            for b in tqdm(range(self.n_bootstraps)):
-                # Resample cluster IDs
-                resampled_group_ids = self.rng.choice(
-                    n_unique_groups, size=n_unique_groups, replace=True
-                )
-                
-                # Count how many times each cluster was sampled
-                bootstrap_scale = np.bincount(resampled_group_ids, minlength=n_unique_groups)
-                
-                # Scale the weights for each row based on cluster resampling
-                row_scales = bootstrap_scale[group_idx]
-                n_boot = n * row_scales
-                boot_sizes[b] = n_boot.sum()
-
-                boot_coefs[b, :] = wls(X, y, n_boot).flatten()
-
-        # else np.diag() fails if input is not at least 1-dim
-        vcov = np.cov(boot_coefs.T, aweights=boot_sizes.T)
-        vcov = np.expand_dims(vcov, axis=0) if vcov.ndim == 0 else vcov
-
-        return vcov
-
-    def summary(
-        self,
-    ):  # ovveride the summary method to include the heteroskedasticity-robust variance covariance matrix when available
-        if self.n_bootstraps > 0 or (hasattr(self, "se") and self.se == "hc1"):
-            return {
-                "point_estimate": self.point_estimate,
-                "standard_error": np.sqrt(np.diag(self.vcov)),
-            }
-        return {"point_estimate": self.point_estimate}
-
-
-################################################################################
-
-
-class DuckMundlak(DuckReg):
-    def __init__(
-        self,
-        db_name: str,
-        table_name: str,
-        outcome_vars: list,  # changed to support multiple outcomes
-        covariates: list,
-        seed: int,
-        fe_cols: list,
-        n_bootstraps: int = 100,
-        cluster_col: str = None,
-        duckdb_kwargs: dict = None,
-        subset: str = None,
-        **kwargs,
-    ):
-        super().__init__(
-            db_name=db_name,
-            table_name=table_name,
-            seed=seed,
-            n_bootstraps=n_bootstraps,
-            duckdb_kwargs=duckdb_kwargs,
-            **kwargs,
-        )
-        self.outcome_vars = outcome_vars if isinstance(outcome_vars, list) else [outcome_vars]
-        self.covariates = covariates if isinstance(covariates, list) else [covariates]
-        self.fe_cols = fe_cols if isinstance(fe_cols, list) else [fe_cols]
-        self.cluster_col = cluster_col
-        self.subset = subset
-
-    def prepare_data(self):
-
-        # Filter out rows with NA values in strata or outcome variables
-        na_filter_cols = self.fe_cols + self.covariates + self.outcome_vars + [self.cluster_col]
-        where_clause = f"WHERE COLUMNS({na_filter_cols}) IS NOT NULL"
-        where_clause += f" AND {self.subset}" if self.subset else ""
-        
-        for i, fe_col in enumerate(self.fe_cols):
-            print(f"Computing averages for fixed effect dimension {i+1}/{len(self.fe_cols)}: {fe_col}")
-            avg_table_name = f"fe_{i}_avgs"
-            avg_query = f"""
-            CREATE OR REPLACE TABLE {avg_table_name} AS
-            SELECT {fe_col},
-                   {", ".join([f"AVG({cov}) AS avg_{cov}_fe{i}" for cov in self.covariates])}
-            FROM {self.table_name}
-            {where_clause}
-            GROUP BY {fe_col}
-            """
-            self.conn.execute(avg_query)
-
-        # Build list of columns to select
-        fe_cols_select = ", ".join([f"{fe_col}" for fe_col in self.fe_cols])
-        covariates_select = ", ".join([f"{cov}" for cov in self.covariates])
-        outcome_vars_select = ", ".join([f"{var}" for var in self.outcome_vars])
-        
-        # Build nested SELECT with pairwise joins
-        # Start with the base table, selecting only necessary columns
-        nested_query = f"""
-        SELECT {fe_cols_select}, {outcome_vars_select}, {covariates_select}, {self.cluster_col}
-        FROM {self.table_name}
-        {where_clause}
-        """
-        
-        # Add each FE average table one at a time using nested SELECTs
-        for i, fe_col in enumerate(self.fe_cols):
-            nested_query = f"""
-            SELECT *
-            FROM ({nested_query})
-            JOIN fe_{i}_avgs fe{i}
-            USING ({fe_col})
-            """
-        
-        # Create the final design matrix
-        print("Creating design matrix with all fixed effect averages")
-        self.design_matrix_query = f"""
-        CREATE OR REPLACE TABLE design_matrix AS
-        {nested_query}
-        """
-        self.conn.execute(self.design_matrix_query)
-
-    def compress_data(self):
-        # Pre-compute column lists
-        cov_cols = [f"{cov}" for cov in self.covariates]
-        avg_cols = []
-        for i in range(len(self.fe_cols)):
-            avg_cols.extend([f"avg_{cov}_fe{i}" for cov in self.covariates])
-        cluster_cols = [self.cluster_col]
-        
-        # Use consistent naming: strata_cols (excluding cluster for rounding purposes)
-        strata_cols_to_round = cov_cols + avg_cols
-        self.strata_cols = strata_cols_to_round + cluster_cols
-        
-        # Build SELECT and GROUP BY columns
-        # prepare strata SELECT/GROUP BY with optional rounding (but not cluster cols)
-        if self.round_strata is not None:
-            select_clause = ", ".join(
-                [f"ROUND({col}, {self.round_strata}) AS {col}" for col in strata_cols_to_round]
-            ) + ", " + ", ".join(cluster_cols)
-            group_by_clause = ", ".join(
-                [f"ROUND({col}, {self.round_strata})" for col in strata_cols_to_round]
-            ) + ", " + ", ".join(cluster_cols)
-        else:
-            select_clause = ", ".join(self.strata_cols)
-            group_by_clause = ", ".join(self.strata_cols)
-        
-        ## Large DF split by clusters
-        
-        # Build aggregation for all outcome variables
-        outcome_aggs = []
+        # Compute means
         for var in self.outcome_vars:
-            outcome_aggs.append(f"SUM({var}) as sum_{var}")
-        outcome_aggs_clause = ", ".join(outcome_aggs)
-        
-        # Use consistent naming: agg_query
-        self.agg_query = f"""
-        SELECT
-            {select_clause},
-            COUNT(*) as count,
-            {outcome_aggs_clause}
-        FROM design_matrix
-        GROUP BY {group_by_clause}
-        """
-        print("Compressing data by computing group-level statistics")
-        self.df_compressed_clusters = self.conn.execute(self.agg_query).fetchdf()
-        
-        ## Further compress, dropping cluster info for main regression
-        agg_dict = {"count": "sum"}
-        for var in self.outcome_vars:
-            agg_dict[f"sum_{var}"] = "sum"
-        
-        self.df_compressed = self.df_compressed_clusters.\
-            groupby(cov_cols + avg_cols, as_index=False).\
-                agg(agg_dict)
+            self.df_compressed[f"mean_{var}"] = self.df_compressed[f"sum_{var}"] / self.df_compressed["count"]
 
-        # Create mean columns for all outcome variables
-        for var in self.outcome_vars:
-            self.df_compressed_clusters[f"mean_{var}"] = (
-                self.df_compressed_clusters[f"sum_{var}"] / self.df_compressed_clusters["count"]
-            )
-            self.df_compressed[f"mean_{var}"] = (
-                self.df_compressed[f"sum_{var}"] / self.df_compressed["count"]
-            )
-
-    def collect_data(self, data: pd.DataFrame):
-        # Build list of RHS variables (covariates + all FE averages)
-        self.rhs = self.covariates.copy()
-        for i in range(len(self.fe_cols)):
-            self.rhs.extend([f"avg_{cov}_fe{i}" for cov in self.covariates])
-
-        X = data[self.rhs].values
-        X = np.c_[np.ones(X.shape[0]), X]
+    def collect_data(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Collect data with Mundlak averages as additional regressors"""
+        simple_cov_names = self.formula.get_simple_covariate_names()
+        avg_cols = [f"avg_{cov}_fe{i}" for i in range(len(self.fe_cols)) for cov in simple_cov_names]
         
-        # Collect all outcome variables
-        y_cols = [f"mean_{var}" for var in self.outcome_vars]
-        y = data[y_cols].values
+        self.rhs = list(self.covariates) + avg_cols
+        
+        X = np.c_[np.ones(len(data)), data[self.rhs].values]
+        self.coef_names_ = ['Intercept'] + self.rhs.copy()
+        
+        y = data[[f"mean_{var}" for var in self.outcome_vars]].values
         n = data["count"].values
 
         y = y.reshape(-1, 1) if y.ndim == 1 else y
@@ -437,57 +567,13 @@ class DuckMundlak(DuckReg):
 
         return y, X, n
 
-    def estimate(self):
-        y, X, n = self.collect_data(data=self.df_compressed)
-        return wls(X, y, n)
 
-    def bootstrap(self):
-        # Build list of RHS variables
-        rhs = self.covariates.copy()
-        for i in range(len(self.fe_cols)):
-            rhs.extend([f"avg_{cov}_fe{i}" for cov in self.covariates])
-        
-        # Adjust for multiple outcomes
-        n_coefs = (len(rhs) + 1) * len(self.outcome_vars)
-        boot_coefs = np.zeros((self.n_bootstraps, n_coefs))
-        boot_sizes = np.zeros(self.n_bootstraps)
+# ============================================================================
+# Legacy estimators (kept for backward compatibility)
+# ============================================================================
 
-        # Bootstrap in blocks of first FE if cluster_col not given
-        if self.cluster_col is None:
-            self.cluster_col = self.fe_cols[0]
-            
-        # Get the unique groups
-        unique_groups = self.df_compressed_clusters[self.cluster_col].unique()
-        group_to_idx = {int(x): i for i, x in enumerate(unique_groups)}
-        n_unique_groups = unique_groups.shape[0]
-        
-        resampled_group_ids = self.rng.choice(
-                n_unique_groups, size=n_unique_groups, replace=True
-        )
-        
-        y, X, n = self.collect_data(data=self.df_compressed_clusters)
-        
-        group_idx = self.df_compressed_clusters[self.cluster_col].map(group_to_idx).to_numpy(dtype=int)
-
-        print(f"Starting bootstrap with {self.n_bootstraps} iterations")
-        for b in tqdm(range(self.n_bootstraps), desc="Bootstrap iterations"):
-            
-            resampled_group_ids = self.rng.choice(
-                n_unique_groups, size=n_unique_groups, replace=True
-            )
-            bootstrap_scale = np.bincount(resampled_group_ids, minlength=n_unique_groups)
-            row_scales = bootstrap_scale[group_idx]
-            
-            n_boot = n * row_scales
-            boot_sizes[b] = n_boot.sum()
-
-            boot_coefs[b, :] = wls(X, y, n_boot).flatten()
-            
-        return np.cov(boot_coefs.T, aweights = boot_sizes.T)
-
-
-################################################################################
 class DuckMundlakEventStudy(DuckReg):
+    """Event study estimator using Mundlak device"""
     def __init__(
         self,
         db_name: str,
@@ -499,14 +585,16 @@ class DuckMundlakEventStudy(DuckReg):
         cluster_col: str,
         pre_treat_interactions: bool = True,
         n_bootstraps: int = 100,
-        duckdb_kwargs: dict = None,  # renamed parameter
+        duckdb_kwargs: dict = None,
+        variable_casts: dict = None,
         **kwargs,
     ):
         super().__init__(
             db_name=db_name,
             table_name=table_name,
             n_bootstraps=n_bootstraps,
-            duckdb_kwargs=duckdb_kwargs,  # pass to parent
+            duckdb_kwargs=duckdb_kwargs,
+            variable_casts=variable_casts,
             **kwargs,
         )
         self.table_name = table_name
@@ -532,7 +620,7 @@ class DuckMundlakEventStudy(DuckReg):
                    CASE WHEN cohort_min IS NOT NULL AND cohort_min != 2147483647 THEN 1 ELSE 0 END as ever_treated
             FROM (
                 SELECT *,
-                       (SELECT MIN({self.time_col})
+                       (SELECT MIN({self._cast_col(self.time_col)})
                         FROM {self.table_name} AS p2
                         WHERE p2.{self.unit_col} = p1.{self.unit_col} AND p2.{self.treatment_col} = 1
                        ) as cohort_min
@@ -540,7 +628,7 @@ class DuckMundlakEventStudy(DuckReg):
             )
         )
         """
-        #  retrieve_num_periods_and_cohorts using CTE
+        #  retrieve_num_periods_and_cohorts using CTE instead of temp table
         self.num_periods = self.conn.execute(
             f"{self.cohort_cte} SELECT MAX({self.time_col}) FROM cohort_data"
         ).fetchone()[0]
@@ -700,10 +788,9 @@ class DuckMundlakEventStudy(DuckReg):
             )
 
             y, X, n = self.collect_data(data=df_boot)
-            coef = wls(X, y, n)
             res = pd.DataFrame(
                 {
-                    "est": coef.squeeze(),
+                    "est": wls(X, y, n).squeeze(),
                 },
                 index=self._rhs_list,
             )
@@ -751,11 +838,12 @@ class DuckDoubleDemeaning(DuckReg):
         table_name: str,
         outcome_var: str,
         treatment_var: str,
-        fe_cols: list,  # changed from unit_col and time_col to list of FE columns
+        fe_cols: list,
         seed: int,
         n_bootstraps: int = 100,
         cluster_col: str = None,
         duckdb_kwargs: dict = None,
+        variable_casts: dict = None,
         **kwargs,
     ):
         super().__init__(
@@ -764,80 +852,53 @@ class DuckDoubleDemeaning(DuckReg):
             seed=seed,
             n_bootstraps=n_bootstraps,
             duckdb_kwargs=duckdb_kwargs,
+            variable_casts=variable_casts,
             **kwargs,
         )
         self.outcome_var = outcome_var
         self.treatment_var = treatment_var
-        self.fe_cols = fe_cols  # list of FE dimensions (e.g., ['unit_id', 'time_col'])
+        self.fe_cols = fe_cols
         self.cluster_col = cluster_col
 
     def prepare_data(self):
-        # Compute overall mean
-        self.overall_mean_query = f"""
+        self.conn.execute(f"""
         CREATE TEMP TABLE overall_mean AS
-        SELECT AVG({self.treatment_var}) AS mean_{self.treatment_var}
+        SELECT AVG({self._cast_col(self.treatment_var)}) AS mean_{self.treatment_var}
         FROM {self.table_name}
-        """
-        self.conn.execute(self.overall_mean_query)
+        """)
 
-        # Compute means for each FE dimension
         for i, fe_col in enumerate(self.fe_cols):
-            mean_table_name = f"fe_{i}_means"
-            mean_query = f"""
-            CREATE TEMP TABLE {mean_table_name} AS
-            SELECT {fe_col}, AVG({self.treatment_var}) AS mean_{self.treatment_var}_fe{i}
+            self.conn.execute(f"""
+            CREATE TEMP TABLE fe_{i}_means AS
+            SELECT {self._cast_col(fe_col)} AS {fe_col}, AVG({self._cast_col(self.treatment_var)}) AS mean_{self.treatment_var}_fe{i}
             FROM {self.table_name}
-            GROUP BY {fe_col}
-            """
-            self.conn.execute(mean_query)
+            GROUP BY {self._cast_col(fe_col)}
+            """)
 
-        # Create multi-way demeaned variables
-        join_clauses = []
-        demean_terms = []
+        join_clauses = [f"JOIN fe_{i}_means fe{i} ON t.{fe_col} = fe{i}.{fe_col}" for i, fe_col in enumerate(self.fe_cols)]
+        demean_terms = [f"fe{i}.mean_{self.treatment_var}_fe{i}" for i in range(len(self.fe_cols))]
+        demean_formula = f"t.{self._cast_col(self.treatment_var)} - {' - '.join(demean_terms)} + {len(self.fe_cols)-1} * om.mean_{self.treatment_var}"
         
-        for i, fe_col in enumerate(self.fe_cols):
-            join_clauses.append(f"JOIN fe_{i}_means fe{i} ON t.{fe_col} = fe{i}.{fe_col}")
-            demean_terms.append(f"fe{i}.mean_{self.treatment_var}_fe{i}")
-        
-        # Formula: X_ddot = X - sum(FE_means) + (k-1) * overall_mean
-        # where k is the number of FE dimensions
-        k = len(self.fe_cols)
-        demean_formula = f"t.{self.treatment_var} - {' - '.join(demean_terms)} + {k-1} * om.mean_{self.treatment_var}"
-        
-        self.double_demean_query = f"""
+        self.conn.execute(f"""
         CREATE TEMP TABLE multi_demeaned AS
-        SELECT
-            {", ".join([f"t.{fe_col}" for fe_col in self.fe_cols])},
-            t.{self.outcome_var},
-            {demean_formula} AS ddot_{self.treatment_var}
-        FROM {self.table_name} t
-        {" ".join(join_clauses)}
-        CROSS JOIN overall_mean om
-        """
-        self.conn.execute(self.double_demean_query)
+        SELECT {", ".join([f"t.{fe_col}" for fe_col in self.fe_cols])}, t.{self.outcome_var}, {demean_formula} AS ddot_{self.treatment_var}
+        FROM {self.table_name} t {" ".join(join_clauses)} CROSS JOIN overall_mean om
+        """)
 
     def compress_data(self):
-        self.compress_query = f"""
-        SELECT
-            ddot_{self.treatment_var},
-            COUNT(*) as count,
-            SUM({self.outcome_var}) as sum_{self.outcome_var}
-        FROM multi_demeaned
-        GROUP BY ddot_{self.treatment_var}
-        """
-        self.df_compressed = self.conn.execute(self.compress_query).fetchdf()
-        self.df_compressed[f"mean_{self.outcome_var}"] = (
-            self.df_compressed[f"sum_{self.outcome_var}"] / self.df_compressed["count"]
-        )
+        self.df_compressed = self.conn.execute(f"""
+        SELECT ddot_{self.treatment_var}, COUNT(*) as count, SUM({self.outcome_var}) as sum_{self.outcome_var}
+        FROM multi_demeaned GROUP BY ddot_{self.treatment_var}
+        """).fetchdf()
+        
+        self.n_obs = int(self.df_compressed['count'].sum())
+        self.df_compressed[f"mean_{self.outcome_var}"] = self.df_compressed[f"sum_{self.outcome_var}"] / self.df_compressed["count"]
 
     def collect_data(self, data: pd.DataFrame):
-        X = data[f"ddot_{self.treatment_var}"].values
-        X = np.c_[np.ones(X.shape[0]), X]
-        y = data[f"mean_{self.outcome_var}"].values
+        X = np.c_[np.ones(len(data)), data[f"ddot_{self.treatment_var}"].values]
+        y = data[f"mean_{self.outcome_var}"].values.reshape(-1, 1)
         n = data["count"].values
-        y = y.reshape(-1, 1) if y.ndim == 1 else y
-        X = X.reshape(-1, 1) if X.ndim == 1 else X
-
+        self.coef_names_ = ['Intercept', f'ddot_{self.treatment_var}']
         return y, X, n
 
     def estimate(self):
@@ -845,56 +906,50 @@ class DuckDoubleDemeaning(DuckReg):
         return wls(X, y, n)
 
     def bootstrap(self):
-        boot_coefs = np.zeros((self.n_bootstraps, 2))  # Intercept and treatment effect
+        boot_coefs = np.zeros((self.n_bootstraps, 2))
 
         if self.cluster_col is None:
-            # Bootstrap on first FE dimension
-            total_units = self.conn.execute(
-                f"SELECT COUNT(DISTINCT {self.fe_cols[0]}) FROM {self.table_name}"
-            ).fetchone()[0]
+            total_samples = self.conn.execute(f"SELECT COUNT(DISTINCT {self.fe_cols[0]}) FROM {self.table_name}").fetchone()[0]
             self.bootstrap_query = f"""
-            SELECT
-                ddot_{self.treatment_var},
-                COUNT(*) as count,
-                SUM({self.outcome_var}) as sum_{self.outcome_var}
-            FROM multi_demeaned
-            WHERE {self.fe_cols[0]} IN (SELECT unnest((?)))
-            GROUP BY ddot_{self.treatment_var}
+            SELECT ddot_{self.treatment_var}, COUNT(*) as count, SUM({self.outcome_var}) as sum_{self.outcome_var}
+            FROM multi_demeaned WHERE {self.fe_cols[0]} IN (SELECT unnest((?))) GROUP BY ddot_{self.treatment_var}
             """
-            total_samples = total_units
         else:
-            # Cluster bootstrap
-            total_clusters = self.conn.execute(
-                f"SELECT COUNT(DISTINCT {self.cluster_col}) FROM {self.table_name}"
-            ).fetchone()[0]
+            total_samples = self.conn.execute(f"SELECT COUNT(DISTINCT {self.cluster_col}) FROM {self.table_name}").fetchone()[0]
             self.bootstrap_query = f"""
-            SELECT
-                ddot_{self.treatment_var},
-                COUNT(*) as count,
-                SUM({self.outcome_var}) AS sum_{self.outcome_var}
-            FROM multi_demeaned
-            WHERE {self.cluster_col} IN (SELECT unnest((?)))
-            GROUP BY ddot_{self.treatment_var}
+            SELECT ddot_{self.treatment_var}, COUNT(*) as count, SUM({self.outcome_var}) AS sum_{self.outcome_var}
+            FROM multi_demeaned WHERE {self.cluster_col} IN (SELECT unnest((?))) GROUP BY ddot_{self.treatment_var}
             """
-            total_samples = total_clusters
 
         for b in tqdm(range(self.n_bootstraps)):
-            resampled_samples = self.rng.choice(
-                total_samples, size=total_samples, replace=True
-            )
-
-            df_boot = self.conn.execute(
-                self.bootstrap_query, [resampled_samples.tolist()]
-            ).fetchdf()
-            df_boot[f"mean_{self.outcome_var}"] = (
-                df_boot[f"sum_{self.outcome_var}"] / df_boot["count"]
-            )
-
+            resampled_samples = self.rng.choice(total_samples, size=total_samples, replace=True)
+            df_boot = self.conn.execute(self.bootstrap_query, [resampled_samples.tolist()]).fetchdf()
+            df_boot[f"mean_{self.outcome_var}"] = df_boot[f"sum_{self.outcome_var}"] / df_boot["count"]
             y, X, n = self.collect_data(data=df_boot)
-
             boot_coefs[b, :] = wls(X, y, n).flatten()
 
         return np.cov(boot_coefs.T)
 
-
-################################################################################
+    def summary(self) -> dict:
+        """Summary of double-demeaning regression"""
+        result = {
+            "point_estimate": self.point_estimate,
+            "coef_names": getattr(self, 'coef_names_', None),
+            "n_obs": getattr(self, 'n_obs', None),
+            "n_obs_compressed": len(self.df_compressed) if hasattr(self, 'df_compressed') else None,
+            "estimator_type": "DuckDoubleDemeaning",
+            "fe_method": "double_demean",
+            "outcome_var": self.outcome_var,
+            "treatment_var": self.treatment_var,
+            "fe_cols": self.fe_cols,
+            "cluster_col": self.cluster_col
+        }
+        
+        if self.n_bootstraps > 0:
+            result.update({
+                "standard_error": np.sqrt(np.diag(self.vcov)),
+                "vcov": self.vcov,
+                "se_type": "bootstrap",
+            })
+        
+        return result

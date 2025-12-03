@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Constants
+# Constants (centralized for all modules)
 # ============================================================================
 
 class SEMethod:
@@ -43,18 +43,19 @@ class FEMethod:
 # Data Source Utilities
 # ============================================================================
 
+_FILE_READERS = {".csv": "read_csv", ".parquet": "read_parquet"}
+
+
 def _resolve_table_name(data_path: Path) -> str:
     """Create DuckDB table reference from data path"""
     if data_path.is_file():
         suffix = data_path.suffix.lower()
-        readers = {".csv": "read_csv", ".parquet": "read_parquet"}
-        if suffix not in readers:
-            raise ValueError(f"Unsupported file format: {suffix}")
-        return f"{readers[suffix]}('{data_path}')"
+        if suffix not in _FILE_READERS:
+            raise ValueError(f"Unsupported file format: {suffix}. Supported: {list(_FILE_READERS.keys())}")
+        return f"{_FILE_READERS[suffix]}('{data_path}')"
     elif data_path.is_dir():
         return f"read_parquet('{data_path}/**/*.parquet')"
-    else:
-        raise ValueError(f"Data path not found: {data_path}")
+    raise ValueError(f"Data path not found: {data_path}")
 
 
 def _resolve_db_path(data: str, cache_dir: Optional[str], db_name: Optional[str]) -> str:
@@ -65,11 +66,9 @@ def _resolve_db_path(data: str, cache_dir: Optional[str], db_name: Optional[str]
         return str(db_path)
     
     data_path = Path(data).resolve()
-    
-    if cache_dir is None:
-        cache_dir = (data_path.parent if data_path.is_file() else data_path) / ".duckreg"
-    else:
-        cache_dir = Path(cache_dir)
+    cache_dir = Path(cache_dir) if cache_dir else (
+        data_path.parent if data_path.is_file() else data_path
+    ) / ".duckreg"
     
     cache_dir.mkdir(exist_ok=True, parents=True)
     data_hash = hashlib.md5(str(data_path).encode()).hexdigest()[:8]
@@ -93,6 +92,7 @@ def compressed_ols(
     db_name: str = None,
     n_jobs: int = 1,
     se_method: str = SEMethod.ANALYTICAL,
+    fitter: str = "numpy",
     **kwargs
 ) -> "DuckReg":
     """High-level API for compressed OLS regression with lfe-style formula
@@ -110,6 +110,7 @@ def compressed_ols(
         db_name: Full path to DuckDB database file
         n_jobs: Number of parallel jobs for bootstrap
         se_method: Method for computing standard errors ('analytical', 'bootstrap', or 'none')
+        fitter: Estimation method ('numpy' for in-memory, 'duckdb' for out-of-core)
         **kwargs: Additional arguments passed to estimator
     
     Returns:
@@ -120,49 +121,37 @@ def compressed_ols(
     from .estimators import DuckRegression, DuckMundlak
     from .formula_parser import FormulaParser
     
-    # Parse formula
     parsed_formula = FormulaParser().parse(formula)
     fe_cols = parsed_formula.get_fe_names()
     
     logger.debug(f"Parsed: outcomes={parsed_formula.get_outcome_names()}, "
                  f"covariates={parsed_formula.get_covariate_names()}, "
-                 f"fe={fe_cols}, cluster={parsed_formula.cluster}")
+                 f"fe={fe_cols}, cluster={parsed_formula.cluster}, fitter={fitter}")
     
     # Determine strategy
-    if not fe_cols:
-        use_mundlak = False
-    elif fe_method == FEMethod.MUNDLAK:
-        use_mundlak = True
-    elif fe_method == FEMethod.DEMEAN:
-        use_mundlak = False
-    else:
+    use_mundlak = bool(fe_cols) and fe_method == FEMethod.MUNDLAK
+    if fe_cols and fe_method not in (FEMethod.MUNDLAK, FEMethod.DEMEAN):
         raise ValueError(f"fe_method must be '{FEMethod.MUNDLAK}' or '{FEMethod.DEMEAN}'")
     
     # Setup paths
     resolved_db = _resolve_db_path(data, cache_dir, db_name)
-    data_path = Path(data).resolve()
-    table_name = _resolve_table_name(data_path)
+    table_name = _resolve_table_name(Path(data).resolve())
     
-    # Determine bootstrap count
-    actual_n_bootstraps = n_bootstraps if se_method == SEMethod.BOOTSTRAP else 0
-    
-    # Common kwargs
-    common_kwargs = dict(
+    # Create and fit estimator
+    estimator_class = DuckMundlak if use_mundlak else DuckRegression
+    estimator = estimator_class(
         db_name=resolved_db,
         table_name=table_name,
         formula=parsed_formula,
         subset=subset,
-        n_bootstraps=actual_n_bootstraps,
+        n_bootstraps=n_bootstraps if se_method == SEMethod.BOOTSTRAP else 0,
         round_strata=round_strata,
         seed=seed,
         duckdb_kwargs=duckdb_kwargs,
         n_jobs=n_jobs,
+        fitter=fitter,
         **kwargs
     )
-    
-    # Create and fit estimator
-    estimator_class = DuckMundlak if use_mundlak else DuckRegression
-    estimator = estimator_class(**common_kwargs)
     estimator.fit(se_method=se_method)
     
     logger.debug(f"=== compressed_ols END ===")
@@ -212,9 +201,7 @@ class DuckReg(ABC):
 
     def _cast_col(self, col: str) -> str:
         """Apply casting to column if specified"""
-        if col in self.variable_casts:
-            return f"CAST({col} AS {self.variable_casts[col]})"
-        return col
+        return f"CAST({col} AS {self.variable_casts[col]})" if col in self.variable_casts else col
 
     def fit(self, se_method: str = SEMethod.ANALYTICAL):
         """Fit the model: prepare data, compress, estimate, and compute standard errors"""
@@ -223,7 +210,6 @@ class DuckReg(ABC):
         self.prepare_data()
         self.compress_data()
         self.point_estimate = self.estimate()
-        
         self._compute_standard_errors(se_method)
         
         if not self.keep_connection_open:
@@ -233,19 +219,28 @@ class DuckReg(ABC):
 
     def _compute_standard_errors(self, se_method: str):
         """Compute standard errors based on method"""
-        if se_method == SEMethod.BOOTSTRAP and self.n_bootstraps > 0:
-            logger.debug("Computing bootstrap standard errors")
-            self.vcov = self.bootstrap()
-        elif se_method == SEMethod.ANALYTICAL:
-            logger.debug("Computing analytical standard errors")
-            if hasattr(self, 'fit_vcov'):
-                self.fit_vcov()
-            else:
-                logger.warning(f"{self.__class__.__name__} does not support analytical SEs")
-        elif se_method == SEMethod.NONE:
-            logger.debug("Skipping standard error computation")
+        handlers = {
+            SEMethod.BOOTSTRAP: self._compute_bootstrap_se,
+            SEMethod.ANALYTICAL: self._compute_analytical_se,
+            SEMethod.NONE: lambda: logger.debug("Skipping standard error computation"),
+        }
+        handler = handlers.get(se_method)
+        if handler:
+            handler()
         else:
             logger.warning(f"Unknown se_method '{se_method}'")
+
+    def _compute_bootstrap_se(self):
+        if self.n_bootstraps > 0:
+            logger.debug("Computing bootstrap standard errors")
+            self.vcov = self.bootstrap()
+
+    def _compute_analytical_se(self):
+        logger.debug("Computing analytical standard errors")
+        if hasattr(self, 'fit_vcov'):
+            self.fit_vcov()
+        else:
+            logger.warning(f"{self.__class__.__name__} does not support analytical SEs")
 
     @abstractmethod
     def prepare_data(self):
@@ -277,38 +272,3 @@ class DuckReg(ABC):
     def queries(self) -> dict:
         """Collect all query methods in the class"""
         return {name: getattr(self, name) for name in dir(self) if "query" in name}
-
-
-# ============================================================================
-# Linear algebra utilities
-# ============================================================================
-
-def wls(X: np.ndarray, y: np.ndarray, n: np.ndarray) -> np.ndarray:
-    """Weighted least squares with frequency weights"""
-    N = np.sqrt(n).reshape(-1, 1)
-    return np.linalg.lstsq(X * N, y * N, rcond=None)[0]
-
-
-def ridge_closed_form(X: np.ndarray, y: np.ndarray, n: np.ndarray, lam: float) -> np.ndarray:
-    """Ridge regression with data augmented representation"""
-    k = X.shape[1]
-    N = np.sqrt(n).reshape(-1, 1)
-    Xtilde = np.vstack([X * N, np.sqrt(lam) * np.eye(k)])
-    ytilde = np.vstack([y * N, np.zeros((k, 1))])
-    return np.linalg.lstsq(Xtilde, ytilde, rcond=None)[0]
-
-
-def ridge_closed_form_batch(X: np.ndarray, y: np.ndarray, n: np.ndarray, lambda_grid: np.ndarray) -> np.ndarray:
-    """Optimized ridge regression for multiple lambda values"""
-    k = X.shape[1]
-    N = np.sqrt(n).reshape(-1, 1)
-    Xn, yn = X * N, y * N
-    I_k, zeros_k = np.eye(k), np.zeros((k, 1))
-    
-    coefs = np.zeros((len(lambda_grid), k))
-    for i, lam in enumerate(lambda_grid):
-        Xtilde = np.vstack([Xn, np.sqrt(lam) * I_k])
-        ytilde = np.vstack([yn, zeros_k])
-        coefs[i, :] = np.linalg.lstsq(Xtilde, ytilde, rcond=None)[0].flatten()
-    
-    return coefs

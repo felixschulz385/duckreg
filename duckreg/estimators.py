@@ -6,7 +6,8 @@ import sys
 from typing import Tuple, Optional, List, Dict, Any
 
 from .demean import demean, _convert_to_int
-from .duckreg import DuckReg, wls
+from .duckreg import DuckReg
+from .fitters import wls, NumpyFitter, DuckDBFitter, FitterResult
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -63,15 +64,14 @@ class BootstrapExecutor:
         
         args_list = [(b,) + args_builder(b, self.seeds[b]) for b in range(self.n_bootstraps)]
         
-        if self.n_jobs == 1:
-            return self._run_sequential(iteration_func, args_list)
-        return self._run_parallel(iteration_func, args_list)
+        runner = self._run_sequential if self.n_jobs == 1 else self._run_parallel
+        return runner(iteration_func, args_list)
     
     def _run_sequential(self, iteration_func, args_list) -> Tuple[np.ndarray, np.ndarray]:
         """Run bootstrap sequentially with progress bar"""
         print(f"Starting bootstrap with {self.n_bootstraps} iterations (sequential)")
         results = [iteration_func(args) for args in tqdm(args_list)]
-        return np.array([r[0] for r in results]), np.array([r[1] for r in results])
+        return self._parse_results(results)
     
     def _run_parallel(self, iteration_func, args_list) -> Tuple[np.ndarray, np.ndarray]:
         """Run bootstrap in parallel using joblib"""
@@ -81,15 +81,50 @@ class BootstrapExecutor:
         results = Parallel(n_jobs=self.n_jobs, verbose=10)(
             delayed(iteration_func)(args) for args in args_list
         )
+        return self._parse_results(results)
+    
+    @staticmethod
+    def _parse_results(results) -> Tuple[np.ndarray, np.ndarray]:
         return np.array([r[0] for r in results]), np.array([r[1] for r in results])
+
+
+# ============================================================================
+# SQL Builder Mixin
+# ============================================================================
+
+class SQLBuilderMixin:
+    """Mixin providing common SQL building utilities"""
+    
+    def _build_round_expr(self, col_expr: str, col_name: str) -> Tuple[str, str]:
+        """Build rounded expression for SELECT and GROUP BY"""
+        if self.round_strata is not None:
+            rounded = f"ROUND({col_expr}, {self.round_strata})"
+            return f"{rounded} AS {col_name}", rounded
+        return f"{col_expr} AS {col_name}", col_expr
+    
+    def _build_agg_columns(self, vars: List, boolean_cols: set, unit_col: Optional[str],
+                           include_sq: bool = True) -> List[str]:
+        """Build aggregation SQL for outcome variables"""
+        agg_parts = ["COUNT(*) as count"]
+        for var in vars:
+            expr = var.get_sql_expression(unit_col) if hasattr(var, 'get_sql_expression') else var
+            var_name = var.name if hasattr(var, 'name') else var
+            if var_name in boolean_cols:
+                expr = f"CAST({expr} AS SMALLINT)"
+            agg_parts.append(f"SUM({expr}) as sum_{var_name}")
+            if include_sq:
+                agg_parts.append(f"SUM(POW({expr}, 2)) as sum_{var_name}_sq")
+        return agg_parts
 
 
 # ============================================================================
 # Shared base class for DuckRegression and DuckMundlak
 # ============================================================================
 
-class DuckLinearModel(DuckReg):
+class DuckLinearModel(DuckReg, SQLBuilderMixin):
     """Base class for linear models with shared estimation, bootstrap, and vcov logic"""
+    
+    _COMPRESSED_VIEW = "_compressed_view"
     
     def __init__(
         self,
@@ -102,6 +137,7 @@ class DuckLinearModel(DuckReg):
         duckdb_kwargs: dict = None,
         subset: str = None,
         n_jobs: int = 1,
+        fitter: str = "numpy",
         **kwargs,
     ):
         if formula is None:
@@ -115,6 +151,7 @@ class DuckLinearModel(DuckReg):
             round_strata=round_strata,
             duckdb_kwargs=duckdb_kwargs,
             variable_casts=None,
+            fitter=fitter,
             **kwargs,
         )
         
@@ -123,6 +160,11 @@ class DuckLinearModel(DuckReg):
         self.subset = subset
         self.strata_cols: List[str] = []
         self._boolean_cols: Optional[set] = None
+        self._fitter_result: Optional[FitterResult] = None
+        self._data_fetched: bool = False
+        self.df_compressed: Optional[pd.DataFrame] = None
+        self.agg_query: Optional[str] = None
+        self.n_compressed_rows: Optional[int] = None  # Track compressed dataset size
         
         # Extract from formula
         self.outcome_vars = formula.get_outcome_names()
@@ -134,18 +176,17 @@ class DuckLinearModel(DuckReg):
             raise ValueError("No outcome variables provided")
         
         logger.debug(f"{self.__class__.__name__}: outcomes={self.outcome_vars}, "
-                    f"covariates={self.covariates}, fe={self.fe_cols}, cluster={self.cluster_col}")
+                    f"covariates={self.covariates}, fe={self.fe_cols}, cluster={self.cluster_col}, "
+                    f"fitter={fitter}")
 
     # -------------------------------------------------------------------------
     # Abstract methods (must be implemented by subclasses)
     # -------------------------------------------------------------------------
     
     def _get_n_coefs(self) -> int:
-        """Get number of coefficients based on model structure"""
         raise NotImplementedError
     
     def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, Optional[str]]:
-        """Get cluster-level data for bootstrap. Returns (df, cluster_col_name)"""
         raise NotImplementedError
 
     # -------------------------------------------------------------------------
@@ -168,33 +209,128 @@ class DuckLinearModel(DuckReg):
         return self._boolean_cols
 
     def _get_cluster_col_for_vcov(self) -> Optional[str]:
-        """Get the cluster column name for analytical vcov"""
         return self.cluster_col
 
     def _build_where_clause(self, user_subset: Optional[str] = None) -> str:
-        """Build WHERE clause using formula's method"""
         return self.formula.get_where_clause_sql(user_subset)
 
     def _get_unit_col(self) -> Optional[str]:
-        """Get the first FE column as unit column for SQL expressions"""
         return self.fe_cols[0] if self.fe_cols else None
+
+    def _ensure_data_fetched(self):
+        """Fetch compressed data to memory if not already done"""
+        if self._data_fetched:
+            return
+        
+        if self.agg_query is None:
+            raise ValueError("compress_data must be called before fetching data")
+        
+        self.df_compressed = self.conn.execute(
+            f"SELECT * FROM {self._COMPRESSED_VIEW}"
+        ).fetchdf()
+        self._data_fetched = True
+        self._compute_means()
+
+    def _compute_means(self):
+        """Compute mean columns from sum columns"""
+        for var in self.outcome_vars:
+            mean_col = f"mean_{var}"
+            if mean_col not in self.df_compressed.columns:
+                self.df_compressed[mean_col] = (
+                    self.df_compressed[f"sum_{var}"] / self.df_compressed["count"]
+                )
+
+    def _create_compressed_view(self):
+        """Create a view for compressed data without fetching"""
+        if self.agg_query is None:
+            raise ValueError("agg_query must be set before creating view")
+        
+        self.conn.execute(f"CREATE OR REPLACE VIEW {self._COMPRESSED_VIEW} AS {self.agg_query}")
+        
+        # Get both total observations and compressed row count
+        result = self.conn.execute(f"""
+            SELECT SUM(count) as n_obs, COUNT(*) as n_compressed 
+            FROM {self._COMPRESSED_VIEW}
+        """).fetchone()
+        self.n_obs = int(result[0]) if result[0] else 0
+        self.n_compressed_rows = int(result[1]) if result[1] else 0
+
+    def _get_view_columns(self) -> List[str]:
+        """Get column names from compressed view"""
+        return self.conn.execute(
+            f"SELECT column_name FROM (DESCRIBE SELECT * FROM {self._COMPRESSED_VIEW})"
+        ).fetchdf()['column_name'].tolist()
 
     # -------------------------------------------------------------------------
     # Estimation
     # -------------------------------------------------------------------------
 
     def estimate(self) -> np.ndarray:
-        """Estimate coefficients using WLS"""
-        y, X, n = self.collect_data(data=self.df_compressed)
-        betahat = wls(X, y, n)
+        """Estimate coefficients using WLS (numpy or duckdb)"""
+        estimator = self._estimate_duckdb if self.fitter == "duckdb" else self._estimate_numpy
+        return estimator()
+    
+    def _estimate_numpy(self) -> np.ndarray:
+        """Estimate using in-memory numpy WLS via NumpyFitter"""
+        self._ensure_data_fetched()
         
-        # Expand coefficient names for multiple outcomes
+        y, X, n = self.collect_data(data=self.df_compressed)
+        cluster_ids = self._get_cluster_ids_from_df()
+        
+        numpy_fitter = NumpyFitter(alpha=1e-8, se_type="stata")
+        self._fitter_result = numpy_fitter.fit(
+            X=X, y=y, weights=n,
+            coef_names=getattr(self, 'coef_names_', None),
+            cluster_ids=cluster_ids,
+            compute_vcov=False
+        )
+        
+        self._update_coef_names()
+        return self._fitter_result.coefficients
+    
+    def _estimate_duckdb(self) -> np.ndarray:
+        """Estimate using DuckDB sufficient statistics (out-of-core)"""
+        x_cols = self._get_x_cols_for_duckdb()
+        y_col = f"sum_{self.outcome_vars[0]}"
+        cluster_col = self._get_cluster_col_for_vcov()
+        view_cols = self._get_view_columns()
+        
+        duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type="stata")
+        self._fitter_result = duckdb_fitter.fit(
+            table_name=self._COMPRESSED_VIEW,
+            x_cols=x_cols,
+            y_col=y_col,
+            weight_col="count",
+            add_intercept=self._needs_intercept_for_duckdb(),
+            cluster_col=cluster_col if cluster_col in view_cols else None,
+            compute_vcov=True
+        )
+        
+        self._update_coef_names()
+        return self._fitter_result.coefficients
+
+    def _get_cluster_ids_from_df(self) -> Optional[np.ndarray]:
+        """Get cluster IDs from compressed dataframe"""
+        cluster_col = self._get_cluster_col_for_vcov()
+        if cluster_col and cluster_col in self.df_compressed.columns:
+            return self.df_compressed[cluster_col].values
+        return None
+
+    def _update_coef_names(self):
+        """Update coefficient names, handling multiple outcomes"""
+        if not hasattr(self, 'coef_names_') or self.coef_names_ is None:
+            self.coef_names_ = self._fitter_result.coef_names
+        
         if len(self.outcome_vars) > 1:
             self.coef_names_ = [f"{name}:{outcome}" 
                                for outcome in self.outcome_vars 
                                for name in self.coef_names_]
-        
-        return betahat.flatten()
+
+    def _get_x_cols_for_duckdb(self) -> List[str]:
+        return self.covariates
+    
+    def _needs_intercept_for_duckdb(self) -> bool:
+        return not self.fe_cols
 
     # -------------------------------------------------------------------------
     # Variance-covariance estimation
@@ -202,66 +338,27 @@ class DuckLinearModel(DuckReg):
 
     def fit_vcov(self):
         """Compute variance-covariance matrix (cluster-robust or HC1)"""
+        if self.fitter == "duckdb" and self._fitter_result is not None and self._fitter_result.vcov is not None:
+            self.vcov = self._fitter_result.vcov
+            self.se = self._fitter_result.se_type
+            return
+        
+        self._ensure_data_fetched()
+        
         y, X, n = self.collect_data(data=self.df_compressed)
-        betahat = wls(X, y, n).flatten()
+        cluster_ids = self._get_cluster_ids_from_df()
+        
+        numpy_fitter = NumpyFitter(alpha=1e-8, se_type="stata")
+        result = numpy_fitter.fit(
+            X=X, y=y, weights=n,
+            coef_names=self.coef_names_,
+            cluster_ids=cluster_ids,
+            compute_vcov=True
+        )
+        
+        self.vcov = result.vcov
+        self.se = result.se_type
         self.n_bootstraps = 0
-        
-        # Compute bread: (X'WX)^{-1}
-        w = n.reshape(-1, 1)
-        bread = np.linalg.inv(X.T @ (X * w))
-        
-        cluster_col = self._get_cluster_col_for_vcov()
-        
-        if cluster_col and cluster_col in self.df_compressed.columns:
-            self._compute_cluster_vcov(X, n, betahat, bread, cluster_col)
-        else:
-            self._compute_hc1_vcov(X, n, betahat, bread)
-
-    def _compute_cluster_vcov(self, X: np.ndarray, n: np.ndarray, 
-                              betahat: np.ndarray, bread: np.ndarray, 
-                              cluster_col: str):
-        """Compute cluster-robust standard errors (CR0)"""
-        self.se = "cluster"
-        
-        yhat = (X @ betahat).reshape(-1, 1)
-        yprime = self.df_compressed[f"sum_{self.outcome_vars[0]}"].values.reshape(-1, 1)
-        residuals = yprime - n.reshape(-1, 1) * yhat
-        
-        clusters = self.df_compressed[cluster_col].values
-        unique_clusters = np.unique(clusters)
-        
-        # Compute meat matrix via cluster scores
-        meat = np.zeros((X.shape[1], X.shape[1]))
-        for cluster in unique_clusters:
-            mask = clusters == cluster
-            score_g = (X[mask] * residuals[mask]).sum(axis=0, keepdims=True).T
-            meat += score_g @ score_g.T
-        
-        # Small sample adjustment
-        N, K, G = n.sum(), X.shape[1], len(unique_clusters)
-        adjustment = (G / (G - 1)) * ((N - 1) / (N - K))
-        self.vcov = adjustment * bread @ meat @ bread
-
-    def _compute_hc1_vcov(self, X: np.ndarray, n: np.ndarray, 
-                          betahat: np.ndarray, bread: np.ndarray):
-        """Compute heteroskedasticity-robust standard errors (HC1)"""
-        self.se = "hc1"
-        
-        yhat = (X @ betahat).reshape(-1, 1)
-        sum_sq_col = f"sum_{self.outcome_vars[0]}_sq"
-        
-        if sum_sq_col in self.df_compressed.columns:
-            yprime = self.df_compressed[f"sum_{self.outcome_vars[0]}"].values.reshape(-1, 1)
-            yprimeprime = self.df_compressed[sum_sq_col].values.reshape(-1, 1)
-            w_rss = yprimeprime - 2 * yhat * yprime + n.reshape(-1, 1) * (yhat**2)
-        else:
-            logger.warning("sum_sq column not available, using simple variance estimate")
-            y_mean = self.df_compressed[f"mean_{self.outcome_vars[0]}"].values.reshape(-1, 1)
-            w_rss = ((y_mean - yhat) ** 2) * n.reshape(-1, 1)
-        
-        meat = X.T @ (X * w_rss)
-        n_nk = n.sum() / (n.sum() - X.shape[1])
-        self.vcov = n_nk * (bread @ meat @ bread)
 
     # -------------------------------------------------------------------------
     # Bootstrap methods
@@ -269,30 +366,26 @@ class DuckLinearModel(DuckReg):
 
     def bootstrap(self) -> np.ndarray:
         """Run bootstrap to estimate variance-covariance matrix"""
+        self._ensure_data_fetched()
         self.se = "bootstrap"
         executor = BootstrapExecutor(self.n_bootstraps, self.n_jobs, self.rng)
         
-        if self.cluster_col:
-            boot_coefs, boot_sizes = self._run_cluster_bootstrap(executor)
-        else:
-            boot_coefs, boot_sizes = self._run_iid_bootstrap(executor)
+        runner = self._run_cluster_bootstrap if self.cluster_col else self._run_iid_bootstrap
+        boot_coefs, boot_sizes = runner(executor)
         
         vcov = np.cov(boot_coefs.T, aweights=boot_sizes)
         return np.expand_dims(vcov, axis=0) if vcov.ndim == 0 else vcov
 
     def _run_iid_bootstrap(self, executor: BootstrapExecutor) -> Tuple[np.ndarray, np.ndarray]:
-        """IID bootstrap - resample compressed dataframe"""
         y, X, n = self.collect_data(data=self.df_compressed)
         n_rows = len(self.df_compressed)
         
         return executor.execute(
-            _bootstrap_iteration_iid,
-            (X, y, n, n_rows),
+            _bootstrap_iteration_iid, (X, y, n, n_rows),
             args_builder=lambda b, seed: (X, y, n, n_rows, seed)
         )
 
     def _run_cluster_bootstrap(self, executor: BootstrapExecutor) -> Tuple[np.ndarray, np.ndarray]:
-        """Cluster bootstrap"""
         df_clusters, cluster_col_name = self._get_cluster_data_for_bootstrap()
         df_clusters = df_clusters.dropna(subset=[cluster_col_name])
         
@@ -304,8 +397,7 @@ class DuckLinearModel(DuckReg):
         n_unique_groups = len(unique_groups)
         
         return executor.execute(
-            _bootstrap_iteration_cluster,
-            (X, y, n, group_idx, n_unique_groups),
+            _bootstrap_iteration_cluster, (X, y, n, group_idx, n_unique_groups),
             args_builder=lambda b, seed: (X, y, n, group_idx, n_unique_groups, seed)
         )
 
@@ -315,11 +407,21 @@ class DuckLinearModel(DuckReg):
 
     def summary(self) -> Dict[str, Any]:
         """Provide comprehensive results summary"""
+        # Get compressed row count - prefer stored value, fallback to query
+        if self.n_compressed_rows is not None:
+            n_obs_compressed = self.n_compressed_rows
+        elif self._data_fetched and self.df_compressed is not None:
+            n_obs_compressed = len(self.df_compressed)
+        else:
+            n_obs_compressed = self.conn.execute(
+                f"SELECT COUNT(*) FROM {self._COMPRESSED_VIEW}"
+            ).fetchone()[0]
+        
         result = {
             "point_estimate": self.point_estimate,
             "coef_names": getattr(self, 'coef_names_', None),
             "n_obs": getattr(self, 'n_obs', None),
-            "n_obs_compressed": len(self.df_compressed) if hasattr(self, 'df_compressed') else None,
+            "n_obs_compressed": int(n_obs_compressed) if n_obs_compressed else None,
             "estimator_type": self.__class__.__name__,
             "fe_method": "demean" if isinstance(self, DuckRegression) else "mundlak" if self.fe_cols else None,
             "outcome_vars": self.outcome_vars,
@@ -345,7 +447,7 @@ class DuckLinearModel(DuckReg):
 class DuckRegression(DuckLinearModel):
     """OLS with fixed effects via demeaning"""
     
-    def __init__(self, rowid_col: str = "rowid", fitter: str = "numpy", **kwargs):
+    def __init__(self, rowid_col: str = "rowid", **kwargs):
         super().__init__(**kwargs)
         self.rowid_col = rowid_col
         self.strata_cols = self.covariates + self.fe_cols
@@ -355,50 +457,59 @@ class DuckRegression(DuckLinearModel):
         return n_covs * len(self.outcome_vars)
 
     def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, Optional[str]]:
+        self._ensure_data_fetched()
         return self.df_compressed, self.cluster_col
 
     def prepare_data(self):
-        pass  # No preparation needed
+        pass
 
     def compress_data(self):
-        """Compress data by grouping on strata columns"""
+        """Compress data by grouping on strata columns - creates view, doesn't fetch"""
         boolean_cols = self._get_boolean_columns()
         unit_col = self._get_unit_col()
         
-        # Build SELECT and GROUP BY
         select_parts, group_by_parts = self._build_strata_select_sql(boolean_cols, unit_col)
         
-        # Add cluster if present
         if self.cluster_col:
             cluster_expr = f"CAST({self.cluster_col} AS SMALLINT)" if self.cluster_col in boolean_cols else self.cluster_col
             select_parts.append(f"{cluster_expr} AS {self.cluster_col}")
             group_by_parts.append(cluster_expr)
         
-        # Build aggregations
-        agg_parts = self._build_outcome_agg_sql(boolean_cols, unit_col)
+        agg_parts = self._build_agg_columns(self.formula.outcomes, boolean_cols, unit_col)
         
         self.agg_query = f"""
         SELECT {', '.join(select_parts)}, {', '.join(agg_parts)}
         FROM {self.table_name}
         {self._build_where_clause(self.subset)}
         GROUP BY {', '.join(group_by_parts)}
+        HAVING {agg_parts[0].split(' AS ')[0]} IS NOT NULL
         """
         
-        self.df_compressed = self.conn.execute(self.agg_query).fetchdf().dropna()
+        self._create_compressed_view()
         
-        # Set column names
-        expected_cols = self.strata_cols.copy()
-        if self.cluster_col:
-            expected_cols.append(self.cluster_col)
-        expected_cols.extend(["count"] + [f"sum_{v}" for v in self.outcome_vars] + 
-                           [f"sum_{v}_sq" for v in self.outcome_vars])
-        self.df_compressed.columns = expected_cols
+        # Set expected column names for later use
+        self._expected_cols = (
+            self.strata_cols.copy() + 
+            ([self.cluster_col] if self.cluster_col else []) +
+            ["count"] + 
+            [f"sum_{v}" for v in self.outcome_vars] + 
+            [f"sum_{v}_sq" for v in self.outcome_vars]
+        )
+
+    def _ensure_data_fetched(self):
+        """Override to handle column renaming after fetch"""
+        if self._data_fetched:
+            return
         
-        self.n_obs = int(self.df_compressed['count'].sum())
+        self.df_compressed = self.conn.execute(
+            f"SELECT * FROM {self._COMPRESSED_VIEW}"
+        ).fetchdf().dropna()
         
-        # Compute means
-        for var in self.outcome_vars:
-            self.df_compressed[f"mean_{var}"] = self.df_compressed[f"sum_{var}"] / self.df_compressed["count"]
+        if hasattr(self, '_expected_cols'):
+            self.df_compressed.columns = self._expected_cols
+        
+        self._data_fetched = True
+        self._compute_means()
 
     def _build_strata_select_sql(self, boolean_cols: set, unit_col: Optional[str]) -> Tuple[List[str], List[str]]:
         """Build SELECT and GROUP BY parts for strata columns"""
@@ -409,25 +520,11 @@ class DuckRegression(DuckLinearModel):
             if col_expr == col:
                 col_expr = self.formula.get_fe_expression(col, boolean_cols)
             
-            if self.round_strata is not None:
-                select_parts.append(f"ROUND({col_expr}, {self.round_strata}) AS {col}")
-                group_by_parts.append(f"ROUND({col_expr}, {self.round_strata})")
-            else:
-                select_parts.append(f"{col_expr} AS {col}")
-                group_by_parts.append(col_expr)
+            select_expr, group_expr = self._build_round_expr(col_expr, col)
+            select_parts.append(select_expr)
+            group_by_parts.append(group_expr)
         
         return select_parts, group_by_parts
-
-    def _build_outcome_agg_sql(self, boolean_cols: set, unit_col: Optional[str]) -> List[str]:
-        """Build aggregation SQL for outcomes"""
-        agg_parts = ["COUNT(*) as count"]
-        for var in self.formula.outcomes:
-            expr = var.get_sql_expression(unit_col)
-            if var.name in boolean_cols:
-                expr = f"CAST({expr} AS SMALLINT)"
-            agg_parts.append(f"SUM({expr}) as sum_{var.name}")
-            agg_parts.append(f"SUM(POW({expr}, 2)) as sum_{var.name}_sq")
-        return agg_parts
 
     def collect_data(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Collect and demean data"""
@@ -459,13 +556,15 @@ class DuckMundlak(DuckLinearModel):
     """OLS with fixed effects via Mundlak device"""
     
     _CLUSTER_ALIAS = "__cluster__"
-    
+    _DESIGN_MATRIX_TABLE = "design_matrix"
+
     def _get_n_coefs(self) -> int:
         simple_covs = len(self.formula.get_simple_covariate_names())
         rhs_count = 1 + len(self.covariates) + len(self.fe_cols) * simple_covs
         return rhs_count * len(self.outcome_vars)
 
     def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, str]:
+        self._ensure_data_fetched()
         return self.df_compressed, self._CLUSTER_ALIAS
 
     def _get_cluster_col_for_vcov(self) -> str:
@@ -476,7 +575,6 @@ class DuckMundlak(DuckLinearModel):
         boolean_cols = self._get_boolean_columns()
         unit_col = self._get_unit_col()
         
-        # Build SELECT parts using formula's SQL generators
         select_parts = [
             self.formula.get_fe_select_sql(boolean_cols),
             self.formula.get_outcomes_select_sql(unit_col, 'year', boolean_cols),
@@ -487,15 +585,13 @@ class DuckMundlak(DuckLinearModel):
         if cluster_sql:
             select_parts.append(cluster_sql)
         
-        # Create design matrix
         self.conn.execute(f"""
-        CREATE OR REPLACE TABLE design_matrix AS
+        CREATE OR REPLACE TABLE {self._DESIGN_MATRIX_TABLE} AS
         SELECT {', '.join(p for p in select_parts if p)}
         FROM {self.table_name}
         {self._build_where_clause(self.subset)}
         """)
         
-        # Add FE averages for Mundlak device
         self._add_fe_averages()
 
     def _add_fe_averages(self):
@@ -507,15 +603,15 @@ class DuckMundlak(DuckLinearModel):
             avg_col_list = ", ".join([f"fe{i}.avg_{cov}_fe{i}" for cov in simple_cov_names])
             
             self.conn.execute(f"""
-            CREATE OR REPLACE TABLE design_matrix AS
+            CREATE OR REPLACE TABLE {self._DESIGN_MATRIX_TABLE} AS
             SELECT dm.*, {avg_col_list}
-            FROM design_matrix dm
-            JOIN (SELECT {fe_col}, {avg_cols} FROM design_matrix GROUP BY {fe_col}) fe{i} 
+            FROM {self._DESIGN_MATRIX_TABLE} dm
+            JOIN (SELECT {fe_col}, {avg_cols} FROM {self._DESIGN_MATRIX_TABLE} GROUP BY {fe_col}) fe{i} 
             ON dm.{fe_col} = fe{i}.{fe_col}
             """)
 
     def compress_data(self):
-        """Compress design matrix"""
+        """Compress design matrix - creates view, doesn't fetch for duckdb fitter"""
         simple_cov_names = self.formula.get_simple_covariate_names()
         cov_cols = list(self.covariates)
         avg_cols = [f"avg_{cov}_fe{i}" for i in range(len(self.fe_cols)) for cov in simple_cov_names]
@@ -523,31 +619,34 @@ class DuckMundlak(DuckLinearModel):
         strata_cols_to_round = cov_cols + avg_cols
         self.strata_cols = strata_cols_to_round + [self._CLUSTER_ALIAS]
         
-        # Build SELECT and GROUP BY with optional rounding
-        if self.round_strata is not None:
-            select_clause = ", ".join([f"ROUND({col}, {self.round_strata}) AS {col}" for col in strata_cols_to_round])
-            group_by_clause = ", ".join([f"ROUND({col}, {self.round_strata})" for col in strata_cols_to_round])
-        else:
-            select_clause = ", ".join(strata_cols_to_round)
-            group_by_clause = ", ".join(strata_cols_to_round)
+        # Build select/group clauses
+        select_parts, group_parts = [], []
+        for col in strata_cols_to_round:
+            sel, grp = self._build_round_expr(col, col)
+            select_parts.append(sel)
+            group_parts.append(grp)
         
-        select_clause += f", {self._CLUSTER_ALIAS}"
-        group_by_clause += f", {self._CLUSTER_ALIAS}"
+        select_clause = ", ".join(select_parts) + f", {self._CLUSTER_ALIAS}"
+        group_by_clause = ", ".join(group_parts) + f", {self._CLUSTER_ALIAS}"
         
         outcome_aggs = ", ".join([f"SUM({var}) as sum_{var}" for var in self.outcome_vars])
         
         self.agg_query = f"""
         SELECT {select_clause}, COUNT(*) as count, {outcome_aggs}
-        FROM design_matrix
+        FROM {self._DESIGN_MATRIX_TABLE}
         GROUP BY {group_by_clause}
         """
         
-        self.df_compressed = self.conn.execute(self.agg_query).fetchdf()
-        self.n_obs = int(self.df_compressed['count'].sum())
-        
-        # Compute means
-        for var in self.outcome_vars:
-            self.df_compressed[f"mean_{var}"] = self.df_compressed[f"sum_{var}"] / self.df_compressed["count"]
+        self._create_compressed_view()
+        self._rhs_cols = cov_cols + avg_cols
+
+    def _get_x_cols_for_duckdb(self) -> List[str]:
+        simple_cov_names = self.formula.get_simple_covariate_names()
+        avg_cols = [f"avg_{cov}_fe{i}" for i in range(len(self.fe_cols)) for cov in simple_cov_names]
+        return list(self.covariates) + avg_cols
+
+    def _needs_intercept_for_duckdb(self) -> bool:
+        return True
 
     def collect_data(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Collect data with Mundlak averages as additional regressors"""
@@ -622,7 +721,7 @@ class DuckMundlakEventStudy(DuckReg):
                 SELECT *,
                        (SELECT MIN({self._cast_col(self.time_col)})
                         FROM {self.table_name} AS p2
-                        WHERE p2.{self.unit_col} = p1.{self.unit_col} AND p2.{self.treatment_col} = 1
+                        WHERE p2.{self.treatment_col} = 1 AND p2.{self.unit_col} = p1.{self.unit_col}
                        ) as cohort_min
                 FROM {self.table_name} p1
             )

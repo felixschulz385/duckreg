@@ -98,7 +98,7 @@ def compressed_ols(
     """High-level API for compressed OLS regression with lfe-style formula
     
     Args:
-        formula: Regression formula in format "y ~ x1 + x2 | fe1 + fe2 | iv1 + iv2 | cluster"
+        formula: Regression formula in format "y ~ x1 + x2 | fe1 + fe2 | endog (inst1 + inst2) | cluster"
         data: Filepath to data file (.csv, .parquet, or directory of .parquet files)
         subset: SQL WHERE clause to subset data
         n_bootstraps: Number of bootstrap iterations (only used if se_method="bootstrap")
@@ -118,40 +118,65 @@ def compressed_ols(
     """
     logger.debug(f"=== compressed_ols START ===")
     
-    from .estimators import DuckRegression, DuckMundlak
+    from .estimators import DuckRegression, DuckMundlak, Duck2SLS
     from .formula_parser import FormulaParser
     
     parsed_formula = FormulaParser().parse(formula)
     fe_cols = parsed_formula.get_fe_names()
+    has_iv = parsed_formula.has_instruments()
     
     logger.debug(f"Parsed: outcomes={parsed_formula.get_outcome_names()}, "
                  f"covariates={parsed_formula.get_covariate_names()}, "
-                 f"fe={fe_cols}, cluster={parsed_formula.cluster}, fitter={fitter}")
-    
-    # Determine strategy
-    use_mundlak = bool(fe_cols) and fe_method == FEMethod.MUNDLAK
-    if fe_cols and fe_method not in (FEMethod.MUNDLAK, FEMethod.DEMEAN):
-        raise ValueError(f"fe_method must be '{FEMethod.MUNDLAK}' or '{FEMethod.DEMEAN}'")
+                 f"fe={fe_cols}, cluster={parsed_formula.cluster}, "
+                 f"has_iv={has_iv}, fitter={fitter}")
     
     # Setup paths
     resolved_db = _resolve_db_path(data, cache_dir, db_name)
     table_name = _resolve_table_name(Path(data).resolve())
     
-    # Create and fit estimator
-    estimator_class = DuckMundlak if use_mundlak else DuckRegression
-    estimator = estimator_class(
-        db_name=resolved_db,
-        table_name=table_name,
-        formula=parsed_formula,
-        subset=subset,
-        n_bootstraps=n_bootstraps if se_method == SEMethod.BOOTSTRAP else 0,
-        round_strata=round_strata,
-        seed=seed,
-        duckdb_kwargs=duckdb_kwargs,
-        n_jobs=n_jobs,
-        fitter=fitter,
-        **kwargs
-    )
+    # Resolve fe_method for 2SLS
+    resolved_fe_method = fe_method
+    if fe_method == FEMethod.AUTO:
+        resolved_fe_method = FEMethod.DEMEAN
+    
+    # Determine estimator class
+    if has_iv:
+        # 2SLS estimation
+        estimator = Duck2SLS(
+            db_name=resolved_db,
+            table_name=table_name,
+            formula=parsed_formula,
+            subset=subset,
+            n_bootstraps=n_bootstraps if se_method == SEMethod.BOOTSTRAP else 0,
+            round_strata=round_strata,
+            seed=seed,
+            duckdb_kwargs=duckdb_kwargs,
+            n_jobs=n_jobs,
+            fitter=fitter,
+            fe_method=resolved_fe_method,
+            **kwargs
+        )
+    else:
+        # OLS estimation
+        use_mundlak = bool(fe_cols) and fe_method == FEMethod.MUNDLAK
+        if fe_cols and fe_method not in (FEMethod.MUNDLAK, FEMethod.DEMEAN, FEMethod.AUTO):
+            raise ValueError(f"fe_method must be '{FEMethod.MUNDLAK}' or '{FEMethod.DEMEAN}'")
+        
+        estimator_class = DuckMundlak if use_mundlak else DuckRegression
+        estimator = estimator_class(
+            db_name=resolved_db,
+            table_name=table_name,
+            formula=parsed_formula,
+            subset=subset,
+            n_bootstraps=n_bootstraps if se_method == SEMethod.BOOTSTRAP else 0,
+            round_strata=round_strata,
+            seed=seed,
+            duckdb_kwargs=duckdb_kwargs,
+            n_jobs=n_jobs,
+            fitter=fitter,
+            **kwargs
+        )
+    
     estimator.fit(se_method=se_method)
     
     logger.debug(f"=== compressed_ols END ===")

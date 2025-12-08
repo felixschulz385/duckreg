@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from ..demean import demean, _convert_to_int
 from ..duckreg import DuckReg
 from ..fitters import wls, NumpyFitter, DuckDBFitter, FitterResult
-from ..formula_parser import cast_if_boolean, needs_quoting, quote_identifier
+from ..formula_parser import cast_if_boolean, needs_quoting, quote_identifier, _make_sql_safe_name
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -274,23 +274,25 @@ class BootstrapExecutor:
 class SQLBuilderMixin:
     """Mixin providing common SQL building utilities"""
     
-    def _build_round_expr(self, col_name: str, col_name_for_alias: str) -> Tuple[str, str]:
+    def _build_round_expr(self, col_expr: str, alias: str) -> Tuple[str, str]:
         """Build rounded expression for SELECT and GROUP BY
         
         Args:
-            col_name: The SQL-safe column name to use in expressions
-            col_name_for_alias: The SQL-safe name to use as alias (usually same as col_name)
+            col_expr: The full SQL expression (e.g., "LN(ntl_harm + 0.01)")
+            alias: The SQL-safe alias name to use (e.g., "log_ntl_harm_0_01")
         
         Returns:
             Tuple of (select_clause, group_by_clause)
-            - select_clause includes alias (e.g., 'ROUND(expr) AS alias')
-            - group_by_clause is just the expression (e.g., 'ROUND(expr)' or 'expr')
+            - select_clause includes alias (e.g., 'ROUND(expr, 5) AS alias')
+            - group_by_clause references the alias directly (e.g., 'alias')
         """
         if self.round_strata is not None:
-            rounded = f"ROUND({col_name}, {self.round_strata})"
-            return f"{rounded} AS {col_name_for_alias}", rounded
-        return f"{col_name} AS {col_name_for_alias}", col_name
-    
+            rounded_expr = f"ROUND({col_expr}, {self.round_strata})"
+            # In GROUP BY, reference the alias (not the full expression)
+            return f"{rounded_expr} AS {alias}", alias
+        # No rounding: use expression AS alias, and reference alias in GROUP BY
+        return f"{col_expr} AS {alias}", alias
+
     def _build_agg_columns(self, vars: List, boolean_cols: set, unit_col: Optional[str],
                            include_sq: bool = True) -> List[str]:
         """Build aggregation SQL for outcome variables"""
@@ -362,7 +364,7 @@ class DuckLinearModel(DuckReg, SQLBuilderMixin):
         self.n_compressed_rows: Optional[int] = None
         self._results: Optional[RegressionResults] = None
         
-        # Extract from formula
+        # Extract from formula - use raw names for internal logic
         self.outcome_vars = formula.get_outcome_names()
         self.covariates = formula.get_covariate_names()
         self.fe_cols = formula.get_fe_names()
@@ -532,20 +534,23 @@ class DuckLinearModel(DuckReg, SQLBuilderMixin):
         return self._fitter_result.coefficients
     
     def _get_y_col_for_duckdb(self) -> str:
-        """Get the y column name for DuckDB fitter, properly formatted"""
-        outcome = self.outcome_vars[0]
-        col_name = f"sum_{outcome}"
-        return quote_identifier(col_name)
+        """Get the y column name for DuckDB fitter, using SQL-safe name"""
+        # Use sql_name for the outcome
+        outcome_sql_name = self.formula.get_outcome_sql_names()[0]
+        col_name = f"sum_{outcome_sql_name}"
+        # Quote if needed (though sql_name should already be safe)
+        return quote_identifier(col_name) if needs_quoting(col_name) else col_name
 
     def _get_x_cols_for_duckdb(self) -> List[str]:
-        """Get x column names for DuckDB fitter, with proper quoting"""
-        simple_cov_names = self._get_non_intercept_covariate_names()
-        avg_cols = [f"avg_{cov}_fe{i}" for i in range(len(self.fe_cols)) for cov in simple_cov_names]
-        # Exclude intercept from x_cols - DuckDBFitter will add it via add_intercept
-        non_intercept_covs = [name for name in self.covariates if name != '_intercept']
+        """Get x column names for DuckDB fitter, using SQL-safe names"""
+        simple_cov_sql_names = [var.sql_name for var in self.formula.covariates if not var.is_intercept()]
+        avg_cols = [f"avg_{cov}_fe{i}" for i in range(len(self.fe_cols)) for cov in simple_cov_sql_names]
+        # Use sql_names for covariates
+        non_intercept_sql_names = [var.sql_name for var in self.formula.covariates if not var.is_intercept()]
         
         # Quote column names that need it
-        return [quote_identifier(col) for col in non_intercept_covs + avg_cols]
+        all_cols = non_intercept_sql_names + avg_cols
+        return [quote_identifier(col) if needs_quoting(col) else col for col in all_cols]
     
     def _get_non_intercept_covariate_names(self) -> List[str]:
         """Get simple covariate names excluding intercept"""

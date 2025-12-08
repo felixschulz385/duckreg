@@ -348,42 +348,87 @@ class Formula:
         return next((item for item in items if item.name == name), None)
     
     # -------------------------------------------------------------------------
-    # Basic name getters
+    # Basic name getters - return raw names for internal use
     # -------------------------------------------------------------------------
     
     def get_outcome_names(self) -> List[str]:
+        """Get raw outcome variable names for internal logic"""
+        return [var.name for var in self.outcomes]
+    
+    def get_outcome_display_names(self) -> List[str]:
+        """Get display names for outcome variables (for user-facing output)"""
         return [var.display_name for var in self.outcomes]
     
+    def get_outcome_sql_names(self) -> List[str]:
+        """Get SQL-safe names for outcome variables (for SQL aliases)"""
+        return [var.sql_name for var in self.outcomes]
+    
     def get_covariate_names(self) -> List[str]:
-        """Get all covariate names including interactions"""
+        """Get all covariate names (raw) including interactions"""
+        return [var.name for var in self.covariates] + [i.name for i in self.interactions]
+    
+    def get_covariate_display_names(self) -> List[str]:
+        """Get all covariate display names including interactions"""
         return [var.display_name for var in self.covariates] + [i.name for i in self.interactions]
     
+    def get_covariate_sql_names(self) -> List[str]:
+        """Get all covariate SQL-safe names including interactions"""
+        return [var.sql_name for var in self.covariates] + [i.sql_name for i in self.interactions]
+    
     def get_simple_covariate_names(self) -> List[str]:
-        """Get only simple covariate names (no interactions)"""
+        """Get only simple covariate names (raw, no interactions)"""
+        return [var.name for var in self.covariates]
+    
+    def get_simple_covariate_display_names(self) -> List[str]:
+        """Get only simple covariate display names (no interactions)"""
         return [var.display_name for var in self.covariates]
     
+    def get_simple_covariate_sql_names(self) -> List[str]:
+        """Get only simple covariate SQL-safe names (no interactions)"""
+        return [var.sql_name for var in self.covariates]
+    
     def get_non_intercept_simple_covariate_names(self) -> List[str]:
-        """Get simple covariate names excluding intercept"""
-        return [var.display_name for var in self.covariates if not var.is_intercept()]
+        """Get simple covariate names (raw) excluding intercept"""
+        return [var.name for var in self.covariates if not var.is_intercept()]
     
     def get_fe_names(self) -> List[str]:
-        """Get all FE names including merged FEs"""
+        """Get all FE names (raw) including merged FEs"""
+        return [var.name for var in self.fixed_effects] + [mfe.name for mfe in self.merged_fes]
+    
+    def get_fe_display_names(self) -> List[str]:
+        """Get all FE display names including merged FEs"""
         return [var.display_name for var in self.fixed_effects] + [mfe.name for mfe in self.merged_fes]
     
+    def get_fe_sql_names(self) -> List[str]:
+        """Get all FE SQL-safe names including merged FEs"""
+        return [var.sql_name for var in self.fixed_effects] + [mfe.sql_name for mfe in self.merged_fes]
+    
     def get_simple_fe_names(self) -> List[str]:
-        """Get only simple FE names (no merged FEs)"""
+        """Get only simple FE names (raw, no merged FEs)"""
+        return [var.name for var in self.fixed_effects]
+    
+    def get_simple_fe_display_names(self) -> List[str]:
+        """Get only simple FE display names (no merged FEs)"""
         return [var.display_name for var in self.fixed_effects]
     
     def get_endogenous_names(self) -> List[str]:
-        """Get names of endogenous variables"""
+        """Get names (raw) of endogenous variables"""
+        return [var.name for var in self.endogenous]
+    
+    def get_endogenous_display_names(self) -> List[str]:
+        """Get display names of endogenous variables"""
         return [var.display_name for var in self.endogenous]
     
     def get_instrument_names(self) -> List[str]:
-        """Get names of instrumental variables"""
+        """Get names (raw) of instrumental variables"""
+        return [var.name for var in self.instruments]
+    
+    def get_instrument_display_names(self) -> List[str]:
+        """Get display names of instrumental variables"""
         return [var.display_name for var in self.instruments]
     
     def get_exogenous_covariate_names(self) -> List[str]:
-        """Get covariate names excluding endogenous variables"""
+        """Get covariate names (raw) excluding endogenous variables"""
         endogenous_names = set(self.get_endogenous_names())
         return [name for name in self.get_covariate_names() if name not in endogenous_names]
     

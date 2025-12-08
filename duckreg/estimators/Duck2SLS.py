@@ -169,16 +169,14 @@ class Duck2SLS(DuckLinearModel):
         self.fe_method = fe_method
         self._formula_builder = StageFormulaBuilder(self.formula)
         
-        # Extract IV-specific info from formula - use display names
-        self.endogenous_vars = self.formula.get_endogenous_names()
-        self.instrument_vars = self.formula.get_instrument_names()
-        self.exogenous_vars = self.formula.get_exogenous_covariate_names()
+        # Extract IV-specific info from formula
+        # Use display names for user-facing info and coefficient matching
+        self.endogenous_vars = self.formula.get_endogenous_display_names()
+        self.instrument_vars = self.formula.get_instrument_display_names()
+        self.exogenous_vars = [var.display_name for var in self.formula.covariates 
+                               if not var.is_intercept() and var.name not in self.formula.get_endogenous_names()]
         
-        # Also store the raw names for SQL queries
-        self._endogenous_raw_names = [var.name for var in self.formula.endogenous]
-        self._instrument_raw_names = [var.name for var in self.formula.instruments]
-        
-        # Map from display name to Variable object for endogenous/instruments
+        # Map from display name to Variable object for SQL generation
         self._endogenous_vars_map = {var.display_name: var for var in self.formula.endogenous}
         self._instrument_vars_map = {var.display_name: var for var in self.formula.instruments}
         
@@ -253,19 +251,24 @@ class Duck2SLS(DuckLinearModel):
         """
         select_parts = []
         
-        # Outcomes
+        # Outcomes - use their select_sql which uses sql_name
         outcomes_sql = self.formula.get_outcomes_select_sql(unit_col, 'year', boolean_cols)
         if outcomes_sql:
             select_parts.append(outcomes_sql)
         
-        # Exogenous covariates (including intercept - don't skip it here)
+        # Exogenous covariates - use display names for user-facing columns
+        endogenous_display_names = set(self.endogenous_vars)
         for var in self.formula.covariates:
-            if var.display_name not in self.endogenous_vars:
+            if var.display_name not in endogenous_display_names:
                 if var.is_intercept():
                     # Add intercept constant
                     select_parts.append("1 AS _intercept")
                 else:
-                    select_parts.append(var.get_select_sql(unit_col, 'year', boolean_cols))
+                    # Store under display name for clarity
+                    expr = var.get_sql_expression(unit_col, 'year')
+                    expr = cast_if_boolean(expr, var.name, boolean_cols)
+                    alias = quote_identifier(var.display_name)
+                    select_parts.append(f"{expr} AS {alias}")
         
         # Endogenous variables - apply transformation and store under display name
         for var in self.formula.endogenous:
@@ -281,12 +284,12 @@ class Duck2SLS(DuckLinearModel):
             alias = quote_identifier(var.display_name)
             select_parts.append(f"{expr} AS {alias}")
         
-        # Fixed effects
+        # Fixed effects - use sql_names
         fe_sql = self.formula.get_fe_select_sql(boolean_cols)
         if fe_sql:
             select_parts.append(fe_sql)
         
-        # Cluster
+        # Cluster - use raw name
         if self.cluster_col:
             cluster_quoted = quote_identifier(self.cluster_col)
             cluster_expr = (f"CAST({cluster_quoted} AS SMALLINT)" 
@@ -698,13 +701,13 @@ class Duck2SLS(DuckLinearModel):
             if name == 'Intercept':
                 pred_terms.append(f"({coef})")
             else:
-                # Check if this is a fitted endogenous variable
+                # Check if this is a fitted endogenous variable (uses display name)
                 col_name = name
                 if name.startswith(self._FITTED_COL_PREFIX):
-                    endog_name = name[len(self._FITTED_COL_PREFIX):]
-                    if endog_name in self.endogenous_vars:
-                        # Use actual endogenous value
-                        col_name = endog_name
+                    endog_display_name = name[len(self._FITTED_COL_PREFIX):]
+                    if endog_display_name in self.endogenous_vars:
+                        # Use actual endogenous value (stored under display name)
+                        col_name = endog_display_name
                 
                 col_quoted = quote_identifier(col_name)
                 pred_terms.append(f"({coef} * {col_quoted})")
@@ -737,11 +740,12 @@ class Duck2SLS(DuckLinearModel):
             return
         
         # Build subqueries for actual endogenous means per cluster
+        # Use display names since that's how they're stored in first_stage_table
         endog_subqueries = []
         endog_col_refs = {}
         
-        for idx, endog_var in enumerate(self.endogenous_vars):
-            endog_quoted = quote_identifier(endog_var)
+        for idx, endog_display_name in enumerate(self.endogenous_vars):
+            endog_quoted = quote_identifier(endog_display_name)
             fs_cluster_quoted = quote_identifier(fs_cluster)
             actual_col = f"_actual_{idx}"
             table_alias = f"_endog_{idx}"
@@ -753,7 +757,7 @@ class Duck2SLS(DuckLinearModel):
              GROUP BY {fs_cluster_quoted}) {table_alias}
             """
             endog_subqueries.append((table_alias, f"_join_key_{idx}", subquery))
-            endog_col_refs[endog_var] = f"{table_alias}.{actual_col}"
+            endog_col_refs[endog_display_name] = f"{table_alias}.{actual_col}"
         
         # Build linear prediction with actual endogenous
         pred_terms = []
@@ -763,10 +767,10 @@ class Duck2SLS(DuckLinearModel):
             else:
                 # Check if this is a fitted endogenous variable
                 if name.startswith(self._FITTED_COL_PREFIX):
-                    endog_name = name[len(self._FITTED_COL_PREFIX):]
-                    if endog_name in endog_col_refs:
+                    endog_display_name = name[len(self._FITTED_COL_PREFIX):]
+                    if endog_display_name in endog_col_refs:
                         # Use actual endogenous from joined table
-                        col_ref = endog_col_refs[endog_name]
+                        col_ref = endog_col_refs[endog_display_name]
                         pred_terms.append(f"({coef} * COALESCE({col_ref}, base.{quote_identifier(name)}))")
                         continue
                 

@@ -22,7 +22,7 @@ class DuckMundlak(DuckLinearModel):
         return rhs_count * len(self.outcome_vars)
 
     def _get_non_intercept_covariate_names(self) -> List[str]:
-        """Get simple covariate names excluding intercept"""
+        """Get simple covariate names (raw) excluding intercept"""
         return [var.name for var in self.formula.covariates if not var.is_intercept()]
 
     def _has_intercept_in_covariates(self) -> bool:
@@ -77,7 +77,7 @@ class DuckMundlak(DuckLinearModel):
         if not simple_covs:
             return
         
-        for i, fe_col in enumerate(self.fe_cols):
+        for i, fe_col_name in enumerate(self.fe_cols):
             # Build AVG expressions using SQL-safe names
             avg_parts = []
             avg_col_parts = []
@@ -89,10 +89,10 @@ class DuckMundlak(DuckLinearModel):
             avg_cols = ", ".join(avg_parts)
             avg_col_list = ", ".join(avg_col_parts)
             
-            # Find FE column's SQL name
-            fe_var = self.formula.get_fe_by_name(fe_col)
-            mfe = self.formula.get_merged_fe_by_name(fe_col)
-            fe_sql_name = fe_var.sql_name if fe_var else (mfe.sql_name if mfe else fe_col)
+            # Find FE column's SQL name (fe_col_name is raw name)
+            fe_var = self.formula.get_fe_by_name(fe_col_name)
+            mfe = self.formula.get_merged_fe_by_name(fe_col_name)
+            fe_sql_name = fe_var.sql_name if fe_var else (mfe.sql_name if mfe else fe_col_name)
             
             self.conn.execute(f"""
             CREATE OR REPLACE TABLE {self._DESIGN_MATRIX_TABLE} AS

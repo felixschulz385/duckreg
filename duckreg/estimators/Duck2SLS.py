@@ -437,7 +437,7 @@ class Duck2SLS(DuckLinearModel):
             seed=self.seed,
             n_bootstraps=n_bootstraps,
             round_strata=self.round_strata,
-            duckdb_kwargs=self.duckdb_kwargs,
+            duckdb_kwargs=None,  # avoid resetting DuckDB settings (e.g., temp_directory) on reused connection
             subset=None,
             n_jobs=self.n_jobs if n_bootstraps > 0 else 1,
             fitter=self.fitter,

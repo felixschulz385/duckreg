@@ -3,21 +3,13 @@ import sys
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import hashlib
 
 import duckdb
 import numpy as np
+import pandas as pd
 
-# Configure logging for debug output
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('/tmp/duckreg_debug.log', mode='a')
-    ]
-)
 logger = logging.getLogger(__name__)
 
 
@@ -94,7 +86,7 @@ def compressed_ols(
     se_method: str = SEMethod.ANALYTICAL,
     fitter: str = "numpy",
     **kwargs
-) -> "DuckReg":
+) -> "DuckEstimator":
     """High-level API for compressed OLS regression with lfe-style formula
     
     Args:
@@ -141,7 +133,6 @@ def compressed_ols(
     
     # Determine estimator class
     if has_iv:
-        # 2SLS estimation
         estimator = Duck2SLS(
             db_name=resolved_db,
             table_name=table_name,
@@ -157,7 +148,6 @@ def compressed_ols(
             **kwargs
         )
     else:
-        # OLS estimation
         use_mundlak = bool(fe_cols) and fe_method == FEMethod.MUNDLAK
         if fe_cols and fe_method not in (FEMethod.MUNDLAK, FEMethod.DEMEAN, FEMethod.AUTO):
             raise ValueError(f"fe_method must be '{FEMethod.MUNDLAK}' or '{FEMethod.DEMEAN}'")
@@ -184,25 +174,28 @@ def compressed_ols(
 
 
 # ============================================================================
-# Base class
+# Base Estimator Class
 # ============================================================================
 
-class DuckReg(ABC):
-    """Base class for DuckDB-based regression estimators"""
+class DuckEstimator(ABC):
+    """Abstract base class for all DuckDB-based estimators.
+    
+    This provides the minimal interface that all estimators must implement,
+    plus shared DuckDB connection management.
+    """
     
     def __init__(
         self,
         db_name: str,
         table_name: str,
         seed: int,
-        n_bootstraps: int = 100,
+        n_bootstraps: int = 0,
         fitter: str = "numpy",
         keep_connection_open: bool = False,
         round_strata: int = None,
         duckdb_kwargs: dict = None,
-        variable_casts: dict = None,
     ):
-        logger.debug(f"DuckReg.__init__: db={db_name}, table={table_name}")
+        logger.debug(f"DuckEstimator.__init__: db={db_name}, table={table_name}")
         
         self.db_name = db_name
         self.table_name = table_name
@@ -212,11 +205,23 @@ class DuckReg(ABC):
         self.keep_connection_open = keep_connection_open
         self.round_strata = round_strata
         self.duckdb_kwargs = duckdb_kwargs
-        self.variable_casts = variable_casts or {}
         
-        self.conn = duckdb.connect(db_name)
-        self._apply_duckdb_config(duckdb_kwargs)
-        self.rng = np.random.default_rng(seed)
+        # State
+        self.conn: Optional[duckdb.DuckDBPyConnection] = None
+        self.rng: Optional[np.random.Generator] = None
+        self.point_estimate: Optional[np.ndarray] = None
+        self.vcov: Optional[np.ndarray] = None
+        self.se: Optional[str] = None
+        self.coef_names_: Optional[List[str]] = None
+        self.n_obs: Optional[int] = None
+        
+        self._init_connection()
+
+    def _init_connection(self):
+        """Initialize DuckDB connection and RNG"""
+        self.conn = duckdb.connect(self.db_name)
+        self._apply_duckdb_config(self.duckdb_kwargs)
+        self.rng = np.random.default_rng(self.seed)
 
     def _apply_duckdb_config(self, config: Optional[Dict[str, Any]]):
         """Apply DuckDB configuration settings"""
@@ -224,76 +229,122 @@ class DuckReg(ABC):
             for key, value in config.items():
                 self.conn.execute(f"SET {key} = '{value}'")
 
-    def _cast_col(self, col: str) -> str:
-        """Apply casting to column if specified"""
-        return f"CAST({col} AS {self.variable_casts[col]})" if col in self.variable_casts else col
-
     def fit(self, se_method: str = SEMethod.ANALYTICAL):
-        """Fit the model: prepare data, compress, estimate, and compute standard errors"""
+        """Main fitting method - orchestrates the estimation pipeline.
+        
+        Subclasses should not override this; override the individual steps instead.
+        """
         logger.debug(f"fit() START with se_method={se_method}")
         
+        # Step 1: Prepare data (create tables, run first stages for IV, etc.)
         self.prepare_data()
+        
+        # Step 2: Compress data for efficient estimation
         self.compress_data()
+        
+        # Step 3: Estimate coefficients
         self.point_estimate = self.estimate()
+        
+        # Step 4: Compute standard errors
         self._compute_standard_errors(se_method)
         
+        # Cleanup
         if not self.keep_connection_open:
             self.conn.close()
         
         logger.debug(f"fit() END")
 
     def _compute_standard_errors(self, se_method: str):
-        """Compute standard errors based on method"""
-        handlers = {
-            SEMethod.BOOTSTRAP: self._compute_bootstrap_se,
-            SEMethod.ANALYTICAL: self._compute_analytical_se,
-            SEMethod.NONE: lambda: logger.debug("Skipping standard error computation"),
-        }
-        handler = handlers.get(se_method)
-        if handler:
-            handler()
+        """Dispatch standard error computation based on method"""
+        if se_method == SEMethod.BOOTSTRAP:
+            if self.n_bootstraps > 0:
+                logger.debug("Computing bootstrap standard errors")
+                self.vcov = self.bootstrap()
+                self.se = "bootstrap"
+        elif se_method == SEMethod.ANALYTICAL:
+            logger.debug("Computing analytical standard errors")
+            self.fit_vcov()
+        elif se_method == SEMethod.NONE:
+            logger.debug("Skipping standard error computation")
         else:
             logger.warning(f"Unknown se_method '{se_method}'")
 
-    def _compute_bootstrap_se(self):
-        if self.n_bootstraps > 0:
-            logger.debug("Computing bootstrap standard errors")
-            self.vcov = self.bootstrap()
-
-    def _compute_analytical_se(self):
-        logger.debug("Computing analytical standard errors")
-        if hasattr(self, 'fit_vcov'):
-            self.fit_vcov()
-        else:
-            logger.warning(f"{self.__class__.__name__} does not support analytical SEs")
+    # -------------------------------------------------------------------------
+    # Abstract methods - must be implemented by subclasses
+    # -------------------------------------------------------------------------
 
     @abstractmethod
     def prepare_data(self):
+        """Prepare data tables for estimation.
+        
+        This may include:
+        - Creating design matrices
+        - Running first-stage regressions (for IV)
+        - Computing Mundlak means (for Mundlak approach)
+        """
         pass
 
     @abstractmethod
     def compress_data(self):
+        """Compress data for efficient estimation.
+        
+        Creates aggregated views/tables with sufficient statistics.
+        """
         pass
 
     @abstractmethod
-    def collect_data(self):
+    def estimate(self) -> np.ndarray:
+        """Estimate model coefficients.
+        
+        Returns:
+            Array of coefficient estimates
+        """
         pass
 
     @abstractmethod
-    def estimate(self):
+    def fit_vcov(self):
+        """Compute variance-covariance matrix analytically."""
         pass
 
     @abstractmethod
-    def bootstrap(self):
+    def bootstrap(self) -> np.ndarray:
+        """Compute variance-covariance matrix via bootstrap.
+        
+        Returns:
+            Variance-covariance matrix
+        """
         pass
 
-    def summary(self) -> dict:
-        """Summary of regression"""
-        result = {"point_estimate": self.point_estimate}
-        if self.n_bootstraps > 0 and hasattr(self, 'vcov'):
-            result["standard_error"] = np.sqrt(np.diag(self.vcov))
-        return result
+    # -------------------------------------------------------------------------
+    # Common utility methods
+    # -------------------------------------------------------------------------
 
-    def queries(self) -> dict:
-        """Collect all query methods in the class"""
-        return {name: getattr(self, name) for name in dir(self) if "query" in name}
+    def _get_table_columns(self, table_name: str) -> set:
+        """Get column names from a table"""
+        return set(
+            self.conn.execute(f"SELECT column_name FROM (DESCRIBE {table_name})")
+            .fetchdf()['column_name'].tolist()
+        )
+
+    def _build_where_clause(self, user_subset: Optional[str] = None) -> str:
+        """Build WHERE clause with NULL checks and optional user subset"""
+        if hasattr(self, 'formula'):
+            return self.formula.get_where_clause_sql(user_subset)
+        return f"WHERE ({user_subset})" if user_subset else ""
+
+    def summary(self) -> Dict[str, Any]:
+        """Provide results summary. Subclasses should override for richer output."""
+        return {
+            "point_estimate": self.point_estimate,
+            "coef_names": self.coef_names_,
+            "n_obs": self.n_obs,
+            "se_type": self.se,
+        }
+
+
+# ============================================================================
+# Backward compatibility alias
+# ============================================================================
+
+# Keep DuckReg as an alias for backward compatibility
+DuckReg = DuckEstimator

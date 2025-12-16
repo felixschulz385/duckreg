@@ -430,14 +430,18 @@ class DuckDBFitter(BaseFitter):
                 se_type_used = "cluster"
             else:
                 if residual_col:
-                    vcov = self._compute_hc1_vcov_sql(
+                    # Use pre-computed residuals for HC1
+                    vcov = self._compute_hc1_vcov_sql_with_residuals(
                         table_name, x_cols, residual_col, weight_col,
                         XtX, n_obs, add_intercept
                     )
-                    se_type_used = "HC1"
                 else:
-                    vcov = self._compute_classical_vcov(XtX, rss, n_obs, n_features)
-                    se_type_used = "classical"
+                    # Compute residuals on the fly
+                    vcov = self._compute_hc1_vcov_sql(
+                        table_name, x_cols, y_col, weight_col,
+                        theta, XtX, n_obs, add_intercept
+                    )
+                se_type_used = "HC1"
         
         return FitterResult(
             coefficients=theta,
@@ -550,21 +554,22 @@ class DuckDBFitter(BaseFitter):
         k = len(all_x_cols)
         
         if residual_col:
-            # Use pre-computed residuals
+            # Use pre-computed residuals column
             score_cols = [
                 f"SUM(({col}) * {residual_col} * {weight_col}) AS score_{i}"
                 for i, col in enumerate(all_x_cols)
             ]
         else:
-            # Build residual: y - X * theta * weight
+            # Compute residuals on the fly: (y/count) - X @ theta
             theta_terms = " + ".join([
-                f"({theta[i]}) * ({col}) * {weight_col}"
+                f"({theta[i]}) * ({col})"
                 for i, col in enumerate(all_x_cols)
             ])
+            residual_expr = f"(({y_col} / {weight_col}) - ({theta_terms}))"
             
-            # Cluster-level scores: sum of X * residual per cluster
+            # Cluster-level scores: sum of X * residual * weight per cluster
             score_cols = [
-                f"SUM(({col}) * ({y_col} - ({theta_terms}))) AS score_{i}"
+                f"SUM(({col}) * {residual_expr} * {weight_col}) AS score_{i}"
                 for i, col in enumerate(all_x_cols)
             ]
         
@@ -591,7 +596,7 @@ class DuckDBFitter(BaseFitter):
         
         return vcov, n_clusters
     
-    def _compute_hc1_vcov_sql(
+    def _compute_hc1_vcov_sql_with_residuals(
         self,
         table_name: str,
         x_cols: List[str],
@@ -601,7 +606,7 @@ class DuckDBFitter(BaseFitter):
         n_obs: int,
         add_intercept: bool
     ) -> np.ndarray:
-        """Compute HC1 vcov using SQL with pre-computed residuals."""
+        """Compute HC1 vcov using SQL with pre-computed residuals column."""
         if add_intercept:
             all_x_cols = ["1"] + x_cols
         else:
@@ -616,6 +621,69 @@ class DuckDBFitter(BaseFitter):
                 if j >= i:
                     meat_parts.append(
                         f"SUM(({col_i}) * ({col_j}) * POW({residual_col}, 2) * {weight_col}) AS meat_{i}_{j}"
+                    )
+        
+        query = f"""
+        SELECT {', '.join(meat_parts)}
+        FROM {table_name}
+        """
+        
+        result = self.conn.execute(query).fetchone()
+        
+        # Parse meat matrix (upper triangle)
+        meat = np.zeros((k, k))
+        idx = 0
+        for i in range(k):
+            for j in range(i, k):
+                meat[i, j] = result[idx]
+                meat[j, i] = result[idx]  # Symmetric
+                idx += 1
+        
+        # Apply HC1 correction
+        hc1_factor = n_obs / max(1, n_obs - k)
+        meat = meat * hc1_factor
+        
+        # Compute bread
+        XtX_inv = self._linalg.safe_inv(XtX, use_pinv=True)
+        
+        vcov = XtX_inv @ meat @ XtX_inv
+        vcov = 0.5 * (vcov + vcov.T)
+        
+        return vcov
+    
+    def _compute_hc1_vcov_sql(
+        self,
+        table_name: str,
+        x_cols: List[str],
+        y_col: str,
+        weight_col: str,
+        theta: np.ndarray,
+        XtX: np.ndarray,
+        n_obs: int,
+        add_intercept: bool
+    ) -> np.ndarray:
+        """Compute HC1 vcov using SQL by computing residuals on the fly."""
+        if add_intercept:
+            all_x_cols = ["1"] + x_cols
+        else:
+            all_x_cols = x_cols
+        
+        k = len(all_x_cols)
+        
+        # Build residual expression: (y/count) - X @ theta
+        theta_terms = " + ".join([
+            f"({theta[i]}) * ({col})"
+            for i, col in enumerate(all_x_cols)
+        ])
+        residual_expr = f"(({y_col} / {weight_col}) - ({theta_terms}))"
+        
+        # Build X' * diag(e^2 * w) * X using SQL
+        meat_parts = []
+        for i, col_i in enumerate(all_x_cols):
+            for j, col_j in enumerate(all_x_cols):
+                if j >= i:
+                    meat_parts.append(
+                        f"SUM(({col_i}) * ({col_j}) * POW({residual_expr}, 2) * {weight_col}) AS meat_{i}_{j}"
                     )
         
         query = f"""
@@ -666,36 +734,31 @@ class DuckDBFitter(BaseFitter):
 def get_fitter(
     fitter_type: str = "numpy",
     conn: Optional[duckdb.DuckDBPyConnection] = None,
-    alpha: float = DEFAULT_ALPHA,
-    se_type: str = "stata"
+    **kwargs
 ) -> BaseFitter:
     """
-    Factory function to get the appropriate fitter.
+    Get an instance of a fitter class based on the type.
     
     Parameters
     ----------
     fitter_type : str
-        Either "numpy" for in-memory or "duckdb" for out-of-core
+        Type of fitter to use ("numpy" or "duckdb")
     conn : duckdb.DuckDBPyConnection, optional
-        DuckDB connection (required for duckdb fitter)
-    alpha : float
-        Regularization parameter
-    se_type : str
-        Standard error type
-        
+        DuckDB connection object, required if fitter_type is "duckdb"
+    
     Returns
     -------
-    BaseFitter instance
+    BaseFitter
+        An instance of a fitter class
     """
     if fitter_type == "numpy":
-        return NumpyFitter(alpha=alpha, se_type=se_type)
+        return NumpyFitter(**kwargs)
     elif fitter_type == "duckdb":
         if conn is None:
-            raise ValueError("DuckDB connection required for duckdb fitter")
-        return DuckDBFitter(conn=conn, alpha=alpha, se_type=se_type)
+            raise ValueError("Connection object must be provided for DuckDB fitter")
+        return DuckDBFitter(conn, **kwargs)
     else:
-        raise ValueError(f"Unknown fitter type: {fitter_type}. Use 'numpy' or 'duckdb'")
-
+        raise ValueError(f"Unknown fitter type: {fitter_type}")
 
 # ============================================================================
 # Convenience Functions (backward compatible)

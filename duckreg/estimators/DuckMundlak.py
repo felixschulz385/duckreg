@@ -24,6 +24,16 @@ class DuckMundlak(DuckLinearModel, MundlakMixin):
     The Mundlak approach includes group means of covariates as additional
     regressors, which absorbs the fixed effects while keeping the data
     in levels. This allows estimation of between-group variation effects.
+    
+    Out-of-Core Processing:
+        This estimator supports true out-of-core processing with fitter='duckdb'.
+        Unlike DuckRegression (which requires demeaning in memory), Mundlak 
+        computes all transformations in SQL, allowing estimation on datasets 
+        larger than available memory.
+        
+        Example:
+            model = DuckMundlak(..., fitter='duckdb')
+            model.fit()  # No data loaded into memory
     """
     
     _CLUSTER_ALIAS = "__cluster__"
@@ -43,6 +53,17 @@ class DuckMundlak(DuckLinearModel, MundlakMixin):
     def _needs_intercept_for_duckdb(self) -> bool:
         """Mundlak device always requires an intercept."""
         return True
+    
+    def _build_coef_names_from_formula(self) -> List[str]:
+        """Build coefficient names from formula for DuckDB fitter.
+        
+        Mundlak includes intercept + covariates + FE averages.
+        """
+        simple_covs = [var for var in self.formula.covariates if not var.is_intercept()]
+        avg_cols_display = [f"avg_{var.display_name}_fe{i}" 
+                           for i in range(len(self.fe_cols)) 
+                           for var in simple_covs]
+        return ['Intercept'] + [var.display_name for var in simple_covs] + avg_cols_display
 
     # -------------------------------------------------------------------------
     # Data preparation

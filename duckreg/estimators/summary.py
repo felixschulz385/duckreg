@@ -1,21 +1,270 @@
 """
-Unified summary formatting for regression and 2SLS results.
+Summary formatting for regression and 2SLS results.
 
-This module provides a smart summary formatter that:
-- Detects result type and formats appropriately
-- Supports both text (console) and tidy DataFrame outputs
-- Unifies the interface across DuckRegression, DuckMundlak, and Duck2SLS
+This module provides comprehensive formatting for model output, including:
+- Model specification (estimator, variables, FE, clustering)
+- Sample information with compression ratios
+- Coefficient results with significance indicators
+- First stage diagnostics for IV models
 """
 
-import numpy as np
 import pandas as pd
-from typing import Union, Optional, Dict, Any, List
+from typing import Union, Optional, Dict, Any
 
 from .results import RegressionResults, FirstStageResults
 
 
+def format_model_summary(
+    model_summary: Dict[str, Any],
+    spec_config: Optional[Dict[str, Any]] = None,
+    precision: int = 4
+) -> str:
+    """Format comprehensive model summary for printing and storage.
+    
+    This provides the most useful printable representation including:
+    - Model specification (estimator, variables, FE, clustering)
+    - Sample information (n_obs, compression ratio)
+    - Coefficient results with significance
+    - First stage diagnostics for IV models
+    
+    Args:
+        model_summary: Model summary dictionary from estimator.summary()
+        spec_config: Optional specification config with description
+        precision: Number of decimal places for display
+        
+    Returns:
+        Formatted string suitable for console output and file storage
+    """
+    lines = []
+    
+    # Header
+    lines.append("=" * 80)
+    if spec_config and 'description' in spec_config:
+        lines.append(f"ANALYSIS: {spec_config['description']}")
+    else:
+        lines.append("REGRESSION ANALYSIS RESULTS")
+    lines.append("=" * 80)
+    
+    # Version and timestamp
+    version_info = model_summary.get('version_info', {})
+    if version_info:
+        lines.append(f"\nDuckReg Version: {version_info.get('duckreg_version', 'unknown')}")
+        lines.append(f"Computed at: {version_info.get('computed_at', 'unknown')}")
+    
+    # Model specification
+    model_spec = model_summary.get('model_spec', {})
+    if model_spec:
+        lines.append("\nMODEL SPECIFICATION")
+        lines.append("-" * 80)
+        lines.append(f"Estimator: {model_spec.get('estimator_type', 'unknown')}")
+        
+        outcome_vars = model_spec.get('outcome_vars', [])
+        if outcome_vars:
+            lines.append(f"Outcome: {', '.join(outcome_vars)}")
+        
+        covariate_vars = model_spec.get('covariate_vars', [])
+        if covariate_vars:
+            lines.append(f"Covariates: {', '.join(covariate_vars)}")
+        
+        # IV-specific variables
+        if model_spec.get('endogenous_vars'):
+            lines.append(f"Endogenous: {', '.join(model_spec.get('endogenous_vars', []))}")
+        if model_spec.get('instrument_vars'):
+            lines.append(f"Instruments: {', '.join(model_spec.get('instrument_vars', []))}")
+        if model_spec.get('exogenous_vars'):
+            lines.append(f"Exogenous: {', '.join(model_spec.get('exogenous_vars', []))}")
+        
+        # Fixed effects
+        fe_cols = model_spec.get('fe_cols', [])
+        if fe_cols:
+            lines.append(f"Fixed Effects: {', '.join(fe_cols)}")
+            fe_method = model_spec.get('fe_method')
+            if fe_method:
+                lines.append(f"FE Method: {fe_method}")
+        
+        # Clustering
+        cluster_col = model_spec.get('cluster_col')
+        if cluster_col:
+            lines.append(f"Clustering: {cluster_col}")
+    
+    # Sample information
+    sample_info = model_summary.get('sample_info', {})
+    if sample_info:
+        lines.append("\nSAMPLE INFORMATION")
+        lines.append("-" * 80)
+        
+        n_obs = sample_info.get('n_obs')
+        if n_obs is not None:
+            lines.append(f"Observations: {n_obs:,}")
+        
+        n_compressed = sample_info.get('n_compressed')
+        if n_compressed is not None:
+            lines.append(f"Compressed Rows: {n_compressed:,}")
+        
+        compression_ratio = sample_info.get('compression_ratio')
+        if compression_ratio is not None and n_obs and n_compressed:
+            lines.append(f"Compression: {compression_ratio:.1%} reduction ({n_obs:,} → {n_compressed:,} rows)")
+    
+    # Coefficient results
+    coefficients = model_summary.get('coefficients')
+    if coefficients and isinstance(coefficients, dict):
+        lines.append("\nCOEFFICIENT RESULTS")
+        lines.append("-" * 80)
+        
+        coef_names = coefficients.get('coef_names', [])
+        coefs = coefficients.get('coefficients', [])
+        ses = coefficients.get('std_errors')
+        t_stats = coefficients.get('t_statistics')
+        p_vals = coefficients.get('p_values')
+        se_type = coefficients.get('se_type')
+        
+        if se_type:
+            lines.append(f"Standard Errors: {se_type}")
+            lines.append("")
+        
+        if coef_names and coefs:
+            # Table header
+            if ses and t_stats and p_vals:
+                fmt_str = f"{{:<30}} {{:>12}} {{:>12}} {{:>10}} {{:>10}} {{:>3}}"
+                header = fmt_str.format("Variable", "Coefficient", "Std. Error", "t-stat", "p-value", "")
+            else:
+                fmt_str = f"{{:<30}} {{:>12}}"
+                header = fmt_str.format("Variable", "Coefficient")
+            
+            lines.append(header)
+            lines.append("-" * 80)
+            
+            # Coefficient rows
+            for i, name in enumerate(coef_names):
+                coef = coefs[i]
+                sig = ""
+                
+                if ses and t_stats and p_vals:
+                    se = ses[i]
+                    t = t_stats[i]
+                    p = p_vals[i]
+                    
+                    # Significance stars
+                    if p < 0.001:
+                        sig = "***"
+                    elif p < 0.01:
+                        sig = "**"
+                    elif p < 0.05:
+                        sig = "*"
+                    elif p < 0.10:
+                        sig = "."
+                    
+                    line = fmt_str.format(
+                        name[:29],
+                        f"{coef:.{precision}f}",
+                        f"{se:.{precision}f}",
+                        f"{t:.{precision}f}",
+                        f"{p:.{precision}f}",
+                        sig
+                    )
+                else:
+                    line = fmt_str.format(name[:29], f"{coef:.{precision}f}")
+                
+                lines.append(line)
+            
+            lines.append("-" * 80)
+            if ses and t_stats and p_vals:
+                lines.append("Significance: *** p<0.001, ** p<0.01, * p<0.05, . p<0.10")
+    
+    # First stage diagnostics for IV models
+    first_stage = model_summary.get('first_stage')
+    iv_diagnostics = model_summary.get('iv_diagnostics')
+    
+    if first_stage and iv_diagnostics:
+        lines.append("\n" + "=" * 80)
+        lines.append("FIRST STAGE DIAGNOSTICS (IV/2SLS)")
+        lines.append("=" * 80)
+        
+        weak_instruments = iv_diagnostics.get('weak_instruments')
+        if weak_instruments is not None:
+            status = "YES ⚠️" if weak_instruments else "NO"
+            lines.append(f"\nWeak Instruments: {status}")
+        
+        f_stats = iv_diagnostics.get('first_stage_f_stats', {})
+        if f_stats:
+            lines.append("\nFirst Stage F-Statistics:")
+            lines.append("-" * 80)
+            for endog, f_stat in f_stats.items():
+                if f_stat is not None:
+                    status = " [WEAK]" if f_stat < 10 else ""
+                    lines.append(f"{endog:30s}: F = {f_stat:10.2f}{status}")
+        
+        # Show detailed first stage results
+        if first_stage:
+            lines.append("\nFirst Stage Coefficient Results:")
+            for endog, fs_dict in first_stage.items():
+                lines.append("\n" + "-" * 80)
+                lines.append(f"Endogenous Variable: {endog}")
+                lines.append("-" * 80)
+                
+                if isinstance(fs_dict, dict) and 'coef_names' in fs_dict:
+                    fs_coef_names = fs_dict.get('coef_names', [])
+                    fs_coefs = fs_dict.get('coefficients', [])
+                    fs_ses = fs_dict.get('std_errors')
+                    fs_t_stats = fs_dict.get('t_statistics')
+                    fs_p_vals = fs_dict.get('p_values')
+                    
+                    if fs_coef_names and fs_coefs:
+                        fmt_str = f"{{:<25}} {{:>12}} {{:>12}} {{:>10}} {{:>10}}"
+                        header = fmt_str.format("Variable", "Coefficient", "Std. Error", "t-stat", "p-value")
+                        lines.append(header)
+                        
+                        for i, name in enumerate(fs_coef_names):
+                            coef = fs_coefs[i]
+                            if fs_ses and fs_t_stats and fs_p_vals:
+                                line = fmt_str.format(
+                                    name[:24],
+                                    f"{coef:.{precision}f}",
+                                    f"{fs_ses[i]:.{precision}f}",
+                                    f"{fs_t_stats[i]:.{precision}f}",
+                                    f"{fs_p_vals[i]:.{precision}f}"
+                                )
+                            else:
+                                line = f"{name[:24]:<25} {coef:>12.{precision}f}"
+                            lines.append(line)
+    
+    lines.append("\n" + "=" * 80)
+    return "\n".join(lines)
+
+
+# Backward compatibility: convenience functions and SummaryFormatter class
+def format_summary(
+    result: Union[RegressionResults, FirstStageResults, Dict[str, Any]],
+    precision: int = 4,
+    include_diagnostics: bool = True
+) -> str:
+    """Format results for console output."""
+    if isinstance(result, dict):
+        return format_model_summary(result, precision=precision)
+    else:
+        return str(result)
+
+
+def print_summary(
+    result: Union[RegressionResults, FirstStageResults, Dict[str, Any]],
+    precision: int = 4,
+    include_diagnostics: bool = True
+):
+    """Print formatted results to console."""
+    print(format_summary(result, precision, include_diagnostics))
+
+
+def to_tidy_df(
+    result: Union[RegressionResults, FirstStageResults, Dict[str, Any]]
+) -> pd.DataFrame:
+    """Convert results to tidy DataFrame."""
+    if isinstance(result, (RegressionResults, FirstStageResults)):
+        return result.to_tidy_df()
+    return pd.DataFrame()
+
+
 class SummaryFormatter:
-    """Unified formatter for regression and 2SLS results."""
+    """Backward-compatible summary formatter (use format_model_summary() instead)."""
     
     @staticmethod
     def format(
@@ -23,49 +272,8 @@ class SummaryFormatter:
         precision: int = 4,
         include_diagnostics: bool = True
     ) -> str:
-        """
-        Format results for console output (smart detection of result type).
-        
-        Args:
-            result: RegressionResults, FirstStageResults, or summary dict
-            precision: Number of decimal places
-            include_diagnostics: Include diagnostic information (2SLS only)
-            
-        Returns:
-            Formatted string for printing
-        """
-        if isinstance(result, FirstStageResults):
-            return _format_first_stage(result, precision)
-        elif isinstance(result, RegressionResults):
-            return _format_regression(result, precision)
-        elif isinstance(result, dict) and 'first_stage' in result:
-            return _format_2sls_summary(result, precision, include_diagnostics)
-        elif isinstance(result, dict):
-            return _format_generic_summary(result)
-        else:
-            return str(result)
-    
-    @staticmethod
-    def to_tidy_df(
-        result: Union[RegressionResults, FirstStageResults, Dict[str, Any]]
-    ) -> pd.DataFrame:
-        """
-        Convert results to tidy DataFrame (smart detection of result type).
-        
-        Args:
-            result: RegressionResults, FirstStageResults, or summary dict
-            
-        Returns:
-            Tidy (long format) DataFrame
-        """
-        if isinstance(result, (RegressionResults, FirstStageResults)):
-            return result.to_tidy_df()
-        elif isinstance(result, dict) and 'coefficients' in result:
-            # Try to reconstruct from dict
-            coef_dict = result.get('coefficients', {})
-            if isinstance(coef_dict, dict) and 'coef_names' in coef_dict:
-                return _dict_to_tidy_df(coef_dict)
-        return pd.DataFrame()
+        """Format results from dict or result objects."""
+        return format_summary(result, precision, include_diagnostics)
     
     @staticmethod
     def print(
@@ -74,179 +282,13 @@ class SummaryFormatter:
         include_diagnostics: bool = True
     ):
         """Print formatted results to console."""
-        print(SummaryFormatter.format(result, precision, include_diagnostics))
-
-
-def _format_regression(results: RegressionResults, precision: int = 4) -> str:
-    """Format standard regression results."""
-    return results.to_string(precision=precision)
-
-
-def _format_first_stage(results: FirstStageResults, precision: int = 4) -> str:
-    """Format first-stage regression results with F-statistic."""
-    return results.to_string(precision=precision)
-
-
-def _format_2sls_summary(summary_dict: Dict[str, Any], precision: int = 4, 
-                         include_diagnostics: bool = True) -> str:
-    """Format comprehensive 2SLS summary with first stages and diagnostics."""
-    lines = []
-    lines.append("=" * 90)
-    lines.append("TWO-STAGE LEAST SQUARES (2SLS) RESULTS")
-    lines.append("=" * 90)
+        print_summary(result, precision, include_diagnostics)
     
-    # Model specification
-    if 'exogenous_vars' in summary_dict or 'endogenous_vars' in summary_dict:
-        lines.append("\nMODEL SPECIFICATION")
-        lines.append("-" * 90)
-        if 'outcome_vars' in summary_dict:
-            lines.append(f"Outcome:         {', '.join(summary_dict['outcome_vars'])}")
-        if 'exogenous_vars' in summary_dict:
-            lines.append(f"Exogenous:       {', '.join(summary_dict['exogenous_vars']) or 'None'}")
-        if 'endogenous_vars' in summary_dict:
-            lines.append(f"Endogenous:      {', '.join(summary_dict['endogenous_vars'])}")
-        if 'instrument_vars' in summary_dict:
-            lines.append(f"Instruments:     {', '.join(summary_dict['instrument_vars'])}")
-        if 'fe_cols' in summary_dict:
-            lines.append(f"Fixed Effects:   {', '.join(summary_dict['fe_cols']) or 'None'}")
-        if 'fe_method' in summary_dict and summary_dict['fe_method']:
-            lines.append(f"FE Method:       {summary_dict['fe_method']}")
-        if 'cluster_col' in summary_dict and summary_dict['cluster_col']:
-            lines.append(f"Clustering:      {summary_dict['cluster_col']}")
-    
-    # Observations
-    if 'n_obs' in summary_dict:
-        lines.append("\nSAMPLE INFORMATION")
-        lines.append("-" * 90)
-        lines.append(f"Observations:    {summary_dict['n_obs']:,}")
-        if 'n_compressed' in summary_dict:
-            lines.append(f"Compressed:      {summary_dict['n_compressed']:,}")
-    
-    # First stage diagnostics
-    if include_diagnostics and 'first_stage' in summary_dict and summary_dict['first_stage']:
-        lines.append("\nFIRST STAGE DIAGNOSTICS")
-        lines.append("-" * 90)
-        for endog, fs_dict in summary_dict['first_stage'].items():
-            f_stat = fs_dict.get('f_statistic')
-            f_pval = fs_dict.get('f_pvalue')
-            is_weak = fs_dict.get('is_weak_instrument')
-            
-            if f_stat is not None:
-                status = " [WEAK INSTRUMENTS]" if is_weak else ""
-                lines.append(f"{endog:20s}: F = {f_stat:8.{precision}f}, "
-                            f"p-value = {f_pval:.{precision}f}{status}")
-        
-        if summary_dict.get('weak_instruments'):
-            lines.append("\n⚠️  WARNING: Weak instruments detected (F < 10)")
-    
-    # Second stage coefficients
-    if 'coefficients' in summary_dict and summary_dict['coefficients']:
-        coef_dict = summary_dict['coefficients']
-        if isinstance(coef_dict, dict):
-            lines.append("\nSECOND STAGE RESULTS")
-            lines.append("-" * 90)
-            
-            # Extract and format coefficient table
-            coef_names = coef_dict.get('coef_names', [])
-            coefs = coef_dict.get('coefficients', [])
-            ses = coef_dict.get('std_errors')
-            t_stats = coef_dict.get('t_statistics')
-            p_vals = coef_dict.get('p_values')
-            
-            if coef_names and coefs:
-                fmt_str = f"{{:<25}} {{:>12}} {{:>12}} {{:>10}} {{:>10}} {{:>2}}"
-                header = fmt_str.format("Variable", "Coefficient", "Std. Error", "t-stat", "p-value", "")
-                lines.append(header)
-                lines.append("-" * 90)
-                
-                for i, name in enumerate(coef_names):
-                    coef = coefs[i]
-                    sig = ""
-                    
-                    if ses and t_stats and p_vals:
-                        se = ses[i]
-                        t = t_stats[i]
-                        p = p_vals[i]
-                        
-                        if p < 0.001:
-                            sig = "***"
-                        elif p < 0.01:
-                            sig = "**"
-                        elif p < 0.05:
-                            sig = "*"
-                        elif p < 0.10:
-                            sig = "."
-                        
-                        line = fmt_str.format(
-                            name[:24],
-                            f"{coef:.{precision}f}",
-                            f"{se:.{precision}f}",
-                            f"{t:.{precision}f}",
-                            f"{p:.{precision}f}",
-                            sig
-                        )
-                    else:
-                        line = fmt_str.format(name[:24], f"{coef:.{precision}f}", "", "", "")
-                    
-                    lines.append(line)
-                
-                lines.append("-" * 90)
-                lines.append("Significance codes: *** p<0.001, ** p<0.01, * p<0.05, . p<0.10")
-    
-    lines.append("=" * 90)
-    return "\n".join(lines)
+    @staticmethod
+    def to_tidy_df(
+        result: Union[RegressionResults, FirstStageResults, Dict[str, Any]]
+    ) -> pd.DataFrame:
+        """Convert results to tidy DataFrame."""
+        return to_tidy_df(result)
 
 
-def _format_generic_summary(summary_dict: Dict[str, Any]) -> str:
-    """Format generic dictionary summary."""
-    lines = ["SUMMARY", "=" * 80]
-    for key, value in summary_dict.items():
-        if isinstance(value, (dict, list)) and len(str(value)) > 100:
-            lines.append(f"{key}: [nested structure]")
-        else:
-            lines.append(f"{key}: {value}")
-    lines.append("=" * 80)
-    return "\n".join(lines)
-
-
-def _dict_to_tidy_df(coef_dict: Dict[str, Any]) -> pd.DataFrame:
-    """Convert coefficient dictionary to tidy DataFrame."""
-    data = {
-        'variable': coef_dict.get('coef_names', []),
-        'estimate': coef_dict.get('coefficients', []),
-    }
-    
-    if 'std_errors' in coef_dict:
-        data['std_error'] = coef_dict['std_errors']
-    if 't_statistics' in coef_dict:
-        data['t_stat'] = coef_dict['t_statistics']
-    if 'p_values' in coef_dict:
-        data['p_value'] = coef_dict['p_values']
-    
-    return pd.DataFrame(data) if data.get('variable') else pd.DataFrame()
-
-
-# Convenience functions for direct access
-def format_summary(
-    result: Union[RegressionResults, FirstStageResults, Dict[str, Any]],
-    precision: int = 4,
-    include_diagnostics: bool = True
-) -> str:
-    """Format results for console output."""
-    return SummaryFormatter.format(result, precision, include_diagnostics)
-
-
-def print_summary(
-    result: Union[RegressionResults, FirstStageResults, Dict[str, Any]],
-    precision: int = 4,
-    include_diagnostics: bool = True
-):
-    """Print formatted results."""
-    SummaryFormatter.print(result, precision, include_diagnostics)
-
-
-def to_tidy_df(
-    result: Union[RegressionResults, FirstStageResults, Dict[str, Any]]
-) -> pd.DataFrame:
-    """Convert to tidy DataFrame."""
-    return SummaryFormatter.to_tidy_df(result)

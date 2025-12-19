@@ -1,10 +1,13 @@
 import numpy as np
 import pandas as pd
+import logging
 from typing import Tuple, Optional, List
 
 from ..demean import demean, _convert_to_int
 from ..formula_parser import quote_identifier, cast_if_boolean, _make_sql_safe_name
 from .DuckLinearModel import DuckLinearModel
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -12,17 +15,42 @@ from .DuckLinearModel import DuckLinearModel
 # ============================================================================
 
 class DuckRegression(DuckLinearModel):
-    """OLS with fixed effects via demeaning"""
+    """OLS with fixed effects via demeaning.
+    
+    Note: When using fixed effects (fe_cols), demeaning requires loading data
+    into memory. For truly out-of-core FE handling, use DuckMundlak instead.
+    The DuckDB fitter can only be used without fixed effects in this estimator.
+    """
     
     def __init__(self, rowid_col: str = "rowid", **kwargs):
         super().__init__(**kwargs)
         self.rowid_col = rowid_col
         # Use raw names for internal logic
         self.strata_cols = self.covariates + self.fe_cols
+        
+        # Warn if using duckdb fitter with FEs (demeaning requires memory)
+        if self.fitter == "duckdb" and self.fe_cols:
+            logger.warning(
+                f"DuckRegression with fixed effects uses demeaning which requires "
+                f"loading data into memory. The 'duckdb' fitter cannot avoid memory "
+                f"loading for this case. Consider using DuckMundlak for out-of-core "
+                f"FE estimation, or use fitter='numpy' explicitly."
+            )
 
     def _get_n_coefs(self) -> int:
         n_covs = len(self.covariates) if self.fe_cols else len(self.covariates) + 1
         return n_covs * len(self.outcome_vars)
+    
+    def _build_coef_names_from_formula(self) -> List[str]:
+        """Build coefficient names from formula for DuckDB fitter.
+        
+        With FEs, no intercept is included (absorbed by demeaning).
+        Without FEs, intercept is included.
+        """
+        if self.fe_cols:
+            return self.formula.get_covariate_display_names()
+        else:
+            return ['Intercept'] + self.formula.get_covariate_display_names()
 
     def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, Optional[str]]:
         self._ensure_data_fetched()

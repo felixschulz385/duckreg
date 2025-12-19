@@ -1,7 +1,20 @@
 from setuptools import setup, find_packages
 import os
+import re
 
 here = os.path.abspath(os.path.dirname(__file__))
+
+
+def get_version():
+    """Read version from _version.py to have single source of truth."""
+    version_file = os.path.join(here, "duckreg", "_version.py")
+    with open(version_file, "r") as f:
+        content = f.read()
+    match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', content, re.M)
+    if match:
+        return match.group(1)
+    raise RuntimeError("Unable to find version string.")
+
 
 def read_requirements():
     try:
@@ -10,6 +23,7 @@ def read_requirements():
     except FileNotFoundError:
         return []
 
+
 def read_long_description():
     try:
         with open(os.path.join(here, "README.md"), "r", encoding="utf-8") as fh:
@@ -17,9 +31,10 @@ def read_long_description():
     except FileNotFoundError:
         return ""
 
+
 setup(
     name="duckreg",
-    version="0.2",  # Use semantic versioning
+    version=get_version(),
     packages=find_packages(),
     install_requires=read_requirements(),
     author="Apoorva Lal",

@@ -9,7 +9,7 @@ Architecture follows OOP best practices:
 """
 
 # Result containers
-from .results import RegressionResults, FirstStageResults
+from .results import RegressionResults, FirstStageResults, ModelSummary
 
 # Mixins for composition
 from .mixins import (
@@ -43,6 +43,7 @@ __all__ = [
     # Results
     'RegressionResults',
     'FirstStageResults',
+    'ModelSummary',
     # Mixins
     'VCovMixin',
     'SQLBuilderMixin',

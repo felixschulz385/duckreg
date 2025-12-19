@@ -2,6 +2,7 @@
 .. include:: ../README.md
 """
 
+from ._version import __version__, get_version, get_version_info
 from .duckreg import compressed_ols, DuckReg, SEMethod, FEMethod
 from .fitters import (
     wls, 
@@ -14,8 +15,13 @@ from .fitters import (
     FitterResult,
 )
 from .estimators import DuckRegression, DuckMundlak, DuckDoubleDemeaning
+from .estimators.results import RegressionResults, FirstStageResults, ModelSummary
 
 __all__ = [
+    # Version
+    "__version__",
+    "get_version",
+    "get_version_info",
     # High-level API
     "compressed_ols",
     "DuckReg",
@@ -25,6 +31,10 @@ __all__ = [
     "DuckRegression",
     "DuckMundlak",
     "DuckDoubleDemeaning",
+    # Result containers
+    "RegressionResults",
+    "FirstStageResults",
+    "ModelSummary",
     # Fitters
     "wls",
     "wls_duckdb",

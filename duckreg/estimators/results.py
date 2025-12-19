@@ -3,23 +3,40 @@ Result containers for regression output.
 
 This module follows Single Responsibility Principle - contains only
 data containers for storing regression results.
+
+All result containers include duckreg version information for reproducibility.
+When bugs are discovered, results from affected versions can be identified.
 """
 
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
+
+from .._version import __version__, get_version_info
+
+
+def _get_timestamp() -> str:
+    """Get current ISO timestamp."""
+    return datetime.now().isoformat()
 
 
 @dataclass
 class RegressionResults:
-    """Container for regression results with computed statistics"""
+    """Container for regression results with computed statistics.
+    
+    Includes version information for result tracking and reproducibility.
+    """
     coefficients: np.ndarray
     coef_names: List[str]
     vcov: Optional[np.ndarray] = None
     n_obs: Optional[int] = None
     n_compressed: Optional[int] = None
     se_type: Optional[str] = None
+    # Version and timestamp for reproducibility
+    duckreg_version: str = field(default_factory=lambda: __version__)
+    computed_at: str = field(default_factory=_get_timestamp)
     
     @property
     def std_errors(self) -> Optional[np.ndarray]:
@@ -153,8 +170,22 @@ class RegressionResults:
         print(self.to_string(precision=precision))
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization"""
+        """Convert to exhaustive dictionary for JSON serialization.
+        
+        Includes all information needed to reconstruct results and track provenance:
+        - Coefficient estimates and names
+        - Sample size information
+        - Variance-covariance matrix and derived statistics
+        - Version information for reproducibility
+        
+        Returns:
+            Dictionary with all result data, suitable for JSON storage
+        """
         result = {
+            # Versioning for reproducibility
+            'duckreg_version': self.duckreg_version,
+            'computed_at': self.computed_at,
+            # Core results
             'coefficients': self.coefficients.flatten().tolist(),
             'coef_names': self.coef_names,
             'n_obs': self.n_obs,
@@ -167,13 +198,19 @@ class RegressionResults:
                 't_statistics': self.t_stats.tolist(),
                 'p_values': self.p_values.tolist(),
                 'se_type': self.se_type,
+                # Confidence intervals
+                'ci_lower': (self.coefficients.flatten() - 1.96 * self.std_errors).tolist(),
+                'ci_upper': (self.coefficients.flatten() + 1.96 * self.std_errors).tolist(),
             })
         return result
 
 
 @dataclass
 class FirstStageResults:
-    """Container for first-stage regression results with instrument diagnostics"""
+    """Container for first-stage regression results with instrument diagnostics.
+    
+    Includes version information inherited from underlying RegressionResults.
+    """
     endog_var: str
     results: RegressionResults
     instrument_names: List[str]
@@ -181,6 +218,16 @@ class FirstStageResults:
     # Computed on demand
     _f_stat: Optional[float] = field(default=None, repr=False)
     _f_pvalue: Optional[float] = field(default=None, repr=False)
+    
+    @property
+    def duckreg_version(self) -> str:
+        """Get duckreg version from underlying results."""
+        return self.results.duckreg_version
+    
+    @property
+    def computed_at(self) -> str:
+        """Get computation timestamp from underlying results."""
+        return self.results.computed_at
     
     @property
     def coefficients(self) -> np.ndarray:
@@ -316,7 +363,16 @@ class FirstStageResults:
         print(self.to_string(precision=precision))
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization"""
+        """Convert to exhaustive dictionary for JSON serialization.
+        
+        Includes all information needed to reconstruct first-stage results:
+        - All underlying regression results (with version info)
+        - Instrument diagnostics (F-stat, weak instrument flag)
+        - Individual instrument coefficient statistics
+        
+        Returns:
+            Dictionary with all result data, suitable for JSON storage
+        """
         return {
             'endogenous_variable': self.endog_var,
             **self.results.to_dict(),
@@ -326,3 +382,154 @@ class FirstStageResults:
             'is_weak_instrument': self.is_weak_instrument,
             'instrument_statistics': self.get_instrument_stats(),
         }
+
+@dataclass
+class ModelSummary:
+    """Standardized container for complete model output.
+    
+    This provides a consistent structure for all duckreg estimators,
+    making it easy to:
+    - Store and retrieve results
+    - Compare results across specifications
+    - Track provenance and identify buggy versions
+    
+    The structure is:
+    - version_info: Package version and computation timestamp
+    - model_spec: What was estimated (formula components)
+    - sample_info: Observations and compression statistics  
+    - coefficients: Point estimates and inference
+    - first_stage: IV diagnostics (if applicable)
+    """
+    # Version tracking
+    duckreg_version: str
+    computed_at: str
+    
+    # Model specification
+    estimator_type: str
+    outcome_vars: List[str]
+    covariate_vars: List[str]
+    fe_cols: List[str]
+    cluster_col: Optional[str]
+    fe_method: Optional[str] = None
+    
+    # IV-specific (None for OLS)
+    endogenous_vars: Optional[List[str]] = None
+    instrument_vars: Optional[List[str]] = None
+    exogenous_vars: Optional[List[str]] = None
+    
+    # Sample information
+    n_obs: Optional[int] = None
+    n_compressed: Optional[int] = None
+    
+    # Results
+    coefficients: Optional[Dict[str, Any]] = None
+    first_stage: Optional[Dict[str, Any]] = None
+    
+    # IV diagnostics
+    weak_instruments: Optional[bool] = None
+    first_stage_f_stats: Optional[Dict[str, float]] = None
+    
+    @property
+    def compression_ratio(self) -> Optional[float]:
+        """Compute compression ratio (fraction of rows saved)."""
+        if self.n_obs and self.n_compressed:
+            return 1 - self.n_compressed / self.n_obs
+        return None
+    
+    @property
+    def is_iv(self) -> bool:
+        """Check if this is an IV/2SLS model."""
+        return self.endogenous_vars is not None and len(self.endogenous_vars) > 0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary with standardized structure.
+        
+        Output structure:
+        {
+            "version_info": {...},
+            "model_spec": {...},
+            "sample_info": {...},
+            "coefficients": {...},
+            "first_stage": {...}  # only for IV
+        }
+        """
+        result = {
+            "version_info": {
+                "duckreg_version": self.duckreg_version,
+                "computed_at": self.computed_at,
+            },
+            "model_spec": {
+                "estimator_type": self.estimator_type,
+                "outcome_vars": self.outcome_vars,
+                "covariate_vars": self.covariate_vars,
+                "fe_cols": self.fe_cols,
+                "fe_method": self.fe_method,
+                "cluster_col": self.cluster_col,
+            },
+            "sample_info": {
+                "n_obs": self.n_obs,
+                "n_compressed": self.n_compressed,
+                "compression_ratio": self.compression_ratio,
+            },
+            "coefficients": self.coefficients,
+        }
+        
+        # Add IV-specific fields
+        if self.is_iv:
+            result["model_spec"].update({
+                "endogenous_vars": self.endogenous_vars,
+                "instrument_vars": self.instrument_vars,
+                "exogenous_vars": self.exogenous_vars,
+            })
+            result["first_stage"] = self.first_stage
+            result["iv_diagnostics"] = {
+                "weak_instruments": self.weak_instruments,
+                "first_stage_f_stats": self.first_stage_f_stats,
+            }
+        
+        return result
+    
+    @classmethod
+    def from_estimator(cls, estimator) -> "ModelSummary":
+        """Create ModelSummary from a fitted estimator.
+        
+        Works with DuckLinearModel, DuckMundlak, Duck2SLS, etc.
+        """
+        from .._version import __version__
+        
+        # Common fields
+        kwargs = {
+            "duckreg_version": __version__,
+            "computed_at": _get_timestamp(),
+            "estimator_type": estimator.__class__.__name__,
+            "outcome_vars": getattr(estimator, 'outcome_vars', []),
+            "covariate_vars": getattr(estimator, 'covariates', []),
+            "fe_cols": getattr(estimator, 'fe_cols', []),
+            "cluster_col": getattr(estimator, 'cluster_col', None),
+            "fe_method": getattr(estimator, 'fe_method', None),
+            "n_obs": getattr(estimator, 'n_obs', None),
+            "n_compressed": getattr(estimator, 'n_compressed_rows', None),
+        }
+        
+        # Coefficients
+        if hasattr(estimator, 'results') and estimator.results:
+            kwargs["coefficients"] = estimator.results.to_dict()
+        
+        # IV-specific
+        if hasattr(estimator, 'endogenous_vars'):
+            kwargs["endogenous_vars"] = estimator.endogenous_vars
+            kwargs["instrument_vars"] = getattr(estimator, 'instrument_vars', [])
+            kwargs["exogenous_vars"] = getattr(estimator, 'exogenous_vars', [])
+            
+            if hasattr(estimator, '_first_stage_results') and estimator._first_stage_results:
+                kwargs["first_stage"] = {
+                    endog: fs.to_dict() 
+                    for endog, fs in estimator._first_stage_results.items()
+                }
+            
+            if hasattr(estimator, 'has_weak_instruments'):
+                kwargs["weak_instruments"] = estimator.has_weak_instruments()
+            if hasattr(estimator, 'get_first_stage_f_stats'):
+                kwargs["first_stage_f_stats"] = estimator.get_first_stage_f_stats()
+        
+        return cls(**kwargs)

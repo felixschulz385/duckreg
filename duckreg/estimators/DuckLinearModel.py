@@ -287,15 +287,35 @@ class DuckLinearModel(DuckEstimator, SQLBuilderMixin, VCovMixin):
         return None
 
     def _update_coef_names(self):
-        """Update coefficient names from fitter result"""
-        if self._fitter_result is not None and self._fitter_result.coef_names is not None:
-            if not hasattr(self, 'coef_names_') or self.coef_names_ is None:
-                self.coef_names_ = self._fitter_result.coef_names
+        """Update coefficient names from fitter result or formula.
+        
+        For DuckDB fitter, builds names from formula to avoid loading data.
+        """
+        # If we already have coef_names_, use them
+        if hasattr(self, 'coef_names_') and self.coef_names_:
+            pass
+        # Try to get from fitter result
+        elif self._fitter_result is not None and self._fitter_result.coef_names is not None:
+            self.coef_names_ = self._fitter_result.coef_names
+        # Build from formula for DuckDB fitter (avoids loading data)
+        elif self.fitter == "duckdb":
+            self.coef_names_ = self._build_coef_names_from_formula()
         
         if len(self.outcome_vars) > 1 and hasattr(self, 'coef_names_') and self.coef_names_:
             self.coef_names_ = [f"{name}:{outcome}" 
                                for outcome in self.outcome_vars 
                                for name in self.coef_names_]
+    
+    def _build_coef_names_from_formula(self) -> List[str]:
+        """Build coefficient names from formula without loading data.
+        
+        Used by DuckDB fitter path to avoid memory loading.
+        """
+        names = []
+        if self._needs_intercept_for_duckdb():
+            names.append('Intercept')
+        names.extend(self.formula.get_covariate_display_names())
+        return names
 
     # -------------------------------------------------------------------------
     # Variance-covariance
@@ -324,7 +344,20 @@ class DuckLinearModel(DuckEstimator, SQLBuilderMixin, VCovMixin):
     # -------------------------------------------------------------------------
 
     def bootstrap(self) -> np.ndarray:
-        """Run bootstrap to estimate variance-covariance matrix"""
+        """Run bootstrap to estimate variance-covariance matrix.
+        
+        Note: Bootstrap requires loading data into memory and is not compatible
+        with the DuckDB fitter's out-of-core processing. Use analytical SEs instead.
+        """
+        if self.fitter == "duckdb":
+            logger.warning(
+                "Bootstrap requested with fitter='duckdb'. Bootstrap requires "
+                "loading data into memory which defeats the purpose of out-of-core "
+                "processing. Using analytical standard errors from DuckDB fitter instead."
+            )
+            self.fit_vcov()
+            return self.vcov
+        
         self._ensure_data_fetched()
         executor = BootstrapExecutor(self.n_bootstraps, self.n_jobs, self.rng)
         
@@ -372,17 +405,20 @@ class DuckLinearModel(DuckEstimator, SQLBuilderMixin, VCovMixin):
     # -------------------------------------------------------------------------
 
     def summary(self) -> Dict[str, Any]:
-        """Provide comprehensive results summary"""
-        return {
-            "coefficients": self.results.to_dict() if self.results else None,
-            "n_obs": getattr(self, 'n_obs', None),
-            "n_compressed": self.n_compressed_rows,
-            "estimator_type": self.__class__.__name__,
-            "outcome_vars": self.outcome_vars,
-            "covariates": self.covariates,
-            "fe_cols": self.fe_cols,
-            "cluster_col": self.cluster_col,
-        }
+        """Provide comprehensive and exhaustive results summary.
+        
+        Returns a dictionary containing all information needed to:
+        - Reconstruct the analysis
+        - Track provenance (version, timestamp)
+        - Identify results from buggy versions
+        
+        Uses the standardized ModelSummary structure for consistency.
+        
+        Returns:
+            Dictionary with model specification, results, and metadata
+        """
+        from .results import ModelSummary
+        return ModelSummary.from_estimator(self).to_dict()
     
     def summary_df(self) -> pd.DataFrame:
         """Get results as a DataFrame"""
@@ -393,6 +429,7 @@ class DuckLinearModel(DuckEstimator, SQLBuilderMixin, VCovMixin):
     def print_summary(self, precision: int = 4):
         """Print formatted results to console using unified formatter."""
         if self.results:
+            from .summary import print_summary as fmt_print
             fmt_print(self.results, precision=precision)
         else:
             print("No results available. Call fit() first.")
@@ -400,5 +437,6 @@ class DuckLinearModel(DuckEstimator, SQLBuilderMixin, VCovMixin):
     def to_tidy_df(self) -> pd.DataFrame:
         """Get results as a tidy DataFrame using unified formatter."""
         if self.results:
+            from .summary import to_tidy_df as fmt_tidy
             return fmt_tidy(self.results)
         return pd.DataFrame()

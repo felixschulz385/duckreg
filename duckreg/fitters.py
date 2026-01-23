@@ -6,14 +6,61 @@ Provides two approaches:
 - DuckDBFitter: Out-of-core estimation using DuckDB sufficient statistics
 
 Both fitters implement the same interface for seamless switching based on data size.
+
+Canonical Parameter Names (v0.6.0+):
+-------------------------------------
+All fitters use these standardized parameter names:
+
+Data parameters:
+- X: np.ndarray - Design matrix (n, k)
+- y: np.ndarray - Response vector (n,)
+- weights: np.ndarray - Frequency weights (n,)
+- coefficients: Optional[np.ndarray] - Pre-computed coefficients
+- residuals: Optional[np.ndarray] - Pre-computed residuals
+
+Variance-covariance parameters:
+- vcov_type: str - Standard error type ("iid", "HC1", "HC2", "HC3")
+- ssc_dict: Optional[Dict[str, Any]] - Small sample correction config
+- k_fe: int - Number of fixed effect levels
+- n_fe: int - Number of fixed effect variables
+
+Clustering (Numpy):
+- cluster_ids: Optional[np.ndarray] - Cluster identifiers (n,)
+
+Clustering (DuckDB):
+- cluster_col: Optional[str] - Cluster column name
+
+Instrumental Variables (Numpy):
+- Z: Optional[np.ndarray] - Instrument matrix (n, m)
+- is_iv: bool - Whether this is IV regression
+
+Instrumental Variables (DuckDB):
+- z_cols: Optional[List[str]] - Instrument column names
+- is_iv: bool - Whether this is IV regression
 """
 
 import numpy as np
 import logging
 from abc import ABC, abstractmethod
 from typing import List, Tuple, Optional, Dict, Any
+from dataclasses import dataclass, field
 
 import duckdb
+
+from .core.linalg import safe_solve, safe_inv
+from .core.vcov import (
+    SSCConfig,
+    VcovContext,
+    compute_iid_vcov,
+    compute_hetero_vcov,
+    compute_cluster_vcov,
+)
+from .core import (
+    compute_sufficient_stats_numpy,
+    compute_sufficient_stats_sql,
+    compute_residual_aggregates_numpy,
+    compute_residual_aggregates_sql
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,81 +70,36 @@ CONDITION_NUMBER_THRESHOLD = 1e12
 
 
 # ============================================================================
-# Linear Algebra Helpers
+# Fitter Result Container (Dataclass)
 # ============================================================================
 
-class LinAlgHelper:
-    """Helper class for linear algebra operations with error handling."""
-    
-    _regularization_warned = False
-    
-    @staticmethod
-    def safe_solve(A: np.ndarray, b: np.ndarray, alpha: float = DEFAULT_ALPHA,
-                   multiplier: int = 10) -> np.ndarray:
-        """Safely solve linear system with fallback regularization."""
-        try:
-            return np.linalg.solve(A, b)
-        except np.linalg.LinAlgError:
-            if not LinAlgHelper._regularization_warned:
-                logger.info("Using regularization for numerical stability")
-                LinAlgHelper._regularization_warned = True
-            regularized_A = A + alpha * multiplier * np.eye(A.shape[0])
-            return np.linalg.solve(regularized_A, b)
-    
-    @staticmethod
-    def safe_inv(A: np.ndarray, use_pinv: bool = False) -> np.ndarray:
-        """Safely invert matrix with fallback to pseudo-inverse."""
-        try:
-            return np.linalg.inv(A)
-        except np.linalg.LinAlgError:
-            if use_pinv:
-                return np.linalg.pinv(A)
-            raise
-    
-    @staticmethod
-    def check_condition_number(A: np.ndarray, 
-                                threshold: float = CONDITION_NUMBER_THRESHOLD) -> Tuple[bool, float]:
-        """Check if matrix is well-conditioned."""
-        try:
-            eigvals = np.linalg.eigvalsh(A)
-            cond = eigvals.max() / max(eigvals.min(), 1e-10)
-            return cond < threshold, cond
-        except np.linalg.LinAlgError:
-            return False, float('inf')
-
-
-# ============================================================================
-# Fitter Result Container
-# ============================================================================
-
+@dataclass
 class FitterResult:
-    """Container for estimation results from any fitter."""
+    """Container for estimation results from any fitter.
     
-    def __init__(
-        self,
-        coefficients: np.ndarray,
-        coef_names: List[str],
-        n_obs: int,
-        vcov: Optional[np.ndarray] = None,
-        se_type: str = "none",
-        r_squared: Optional[float] = None,
-        rss: Optional[float] = None,
-        XtX: Optional[np.ndarray] = None,
-        Xty: Optional[np.ndarray] = None,
-        n_clusters: Optional[int] = None,
-        extra: Optional[Dict[str, Any]] = None
-    ):
-        self.coefficients = coefficients
-        self.coef_names = coef_names
-        self.n_obs = n_obs
-        self.vcov = vcov
-        self.se_type = se_type
-        self.r_squared = r_squared
-        self.rss = rss
-        self.XtX = XtX
-        self.Xty = Xty
-        self.n_clusters = n_clusters
-        self.extra = extra or {}
+    Includes optional residual statistics to enable efficient vcov 
+    recomputation without re-running estimation.
+    """
+    coefficients: np.ndarray
+    coef_names: List[str]
+    n_obs: int
+    vcov: Optional[np.ndarray] = None
+    se_type: str = "none"
+    r_squared: Optional[float] = None
+    rss: Optional[float] = None
+    XtX: Optional[np.ndarray] = None
+    Xty: Optional[np.ndarray] = None
+    n_clusters: Optional[int] = None
+    vcov_meta: Dict[str, Any] = field(default_factory=dict)
+    extra: Dict[str, Any] = field(default_factory=dict)
+    
+    # Residual statistics for vcov recomputation
+    XtX_inv: Optional[np.ndarray] = None
+    meat: Optional[np.ndarray] = None
+    scores: Optional[np.ndarray] = None
+    cluster_scores: Optional[np.ndarray] = None
+    leverages: Optional[np.ndarray] = None
+    residuals: Optional[np.ndarray] = None
     
     @property
     def standard_errors(self) -> Optional[np.ndarray]:
@@ -114,15 +116,286 @@ class FitterResult:
             "n_obs": self.n_obs,
             "se_type": self.se_type,
         }
+        
+        # Add optional fields
         if self.vcov is not None:
             result["vcov"] = self.vcov
             result["standard_errors"] = self.standard_errors
         if self.r_squared is not None:
             result["r_squared"] = self.r_squared
+        if self.rss is not None:
+            result["rss"] = self.rss
+        if self.XtX is not None:
+            result["XtX"] = self.XtX
+        if self.Xty is not None:
+            result["Xty"] = self.Xty
         if self.n_clusters is not None:
             result["n_clusters"] = self.n_clusters
+        if self.vcov_meta:
+            result["vcov_meta"] = self.vcov_meta
+        
+        # Residual statistics
+        for attr in ['XtX_inv', 'meat', 'scores', 'cluster_scores', 'leverages', 'residuals']:
+            val = getattr(self, attr)
+            if val is not None:
+                result[attr] = val
+        
         result.update(self.extra)
         return result
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def _validate_and_prepare_data(
+    X: np.ndarray,
+    y: np.ndarray,
+    weights: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    """Validate and prepare input arrays.
+    
+    Returns:
+        Tuple of (X, y, weights, n_rows, n_obs)
+    """
+    y = y.reshape(-1, 1) if y.ndim == 1 else y
+    X = X.reshape(-1, 1) if X.ndim == 1 else X
+    weights = weights.flatten()
+    
+    n_rows = X.shape[0]
+    n_obs = int(weights.sum())
+    
+    return X, y, weights, n_rows, n_obs
+
+
+def _compute_weighted_matrices(
+    X: np.ndarray,
+    y: np.ndarray,
+    weights: np.ndarray,
+    alpha: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute X'WX and X'Wy with regularization.
+    
+    Returns:
+        Tuple of (XtX, Xty)
+    """
+    sqrt_w = np.sqrt(weights).reshape(-1, 1)
+    Xw = X * sqrt_w
+    yw = y * sqrt_w
+    
+    XtX = Xw.T @ Xw + alpha * np.eye(X.shape[1])
+    Xty = Xw.T @ yw
+    
+    return XtX, Xty
+
+
+def _compute_r_squared(
+    theta: np.ndarray,
+    Xty: np.ndarray,
+    y: np.ndarray,
+    weights: np.ndarray,
+    n_obs: int
+) -> Tuple[float, float]:
+    """Compute R-squared and RSS.
+    
+    Returns:
+        Tuple of (r_squared, rss)
+    """
+    sum_y = (y.flatten() * weights).sum()
+    sum_y_squared = ((y.flatten() ** 2) * weights).sum()
+    rss = sum_y_squared - theta @ Xty.flatten()
+    mean_y = sum_y / n_obs
+    tss = sum_y_squared - n_obs * (mean_y ** 2)
+    r_squared = max(0.0, 1.0 - rss / tss) if tss > 0 else 0.0
+    
+    return r_squared, rss
+
+
+def compute_vcov_dispatch(
+    X: np.ndarray,
+    y: np.ndarray,
+    weights: np.ndarray,
+    coefficients: np.ndarray,
+    residuals: Optional[np.ndarray],
+    XtX_inv: np.ndarray,
+    vcov_type: str,
+    cluster_ids: Optional[np.ndarray] = None,
+    ssc_dict: Optional[Dict[str, Any]] = None,
+    k_fe: int = 0,
+    n_fe: int = 0,
+    Z: Optional[np.ndarray] = None,
+    is_iv: bool = False,
+    alpha: float = DEFAULT_ALPHA
+) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
+    """Unified variance-covariance computation dispatcher.
+    
+    Parameters
+    ----------
+    X : np.ndarray
+        Design matrix (n, k)
+    y : np.ndarray
+        Response vector (n,)
+    weights : np.ndarray
+        Frequency weights (n,)
+    coefficients : np.ndarray
+        Coefficient estimates (k,)
+    residuals : np.ndarray, optional
+        Pre-computed residuals. If None, computed as y - X @ coefficients
+    XtX_inv : np.ndarray
+        (X'X)^{-1} matrix (k, k)
+    vcov_type : str
+        Standard error type: "iid", "HC1", "HC2", "HC3"
+    cluster_ids : np.ndarray, optional
+        Cluster identifiers (n,)
+    ssc_dict : Dict[str, Any], optional
+        SSC configuration
+    k_fe : int
+        Number of fixed effect levels
+    n_fe : int
+        Number of fixed effect variables
+    Z : np.ndarray, optional
+        Instrument matrix (n, m) for IV
+    is_iv : bool
+        Whether this is IV regression
+    alpha : float
+        Regularization parameter for IV matrices
+        
+    Returns
+    -------
+    Tuple of (vcov, vcov_meta, aggregates)
+    """
+    n_rows, n_features = X.shape
+    n_obs = int(weights.sum())
+    theta = coefficients.flatten()
+    
+    # Compute residuals if not provided
+    if residuals is None:
+        residuals = y.flatten() - X @ theta
+    else:
+        residuals = residuals.flatten()
+    
+    aggregates = {
+        'XtX_inv': XtX_inv,
+        'residuals': residuals,
+        'theta': theta
+    }
+    
+    # Compute IV matrices if needed
+    tXZ = None
+    tZZinv = None
+    tZX = None
+    if is_iv and Z is not None:
+        sqrt_w = np.sqrt(weights).reshape(-1, 1)
+        Xw = X * sqrt_w
+        Zw = Z * sqrt_w
+        
+        tXZ = Xw.T @ Zw
+        tZZ = Zw.T @ Zw + alpha * np.eye(Z.shape[1])
+        tZZinv = safe_inv(tZZ, use_pinv=True)
+        tZX = tXZ.T
+        
+        aggregates.update({'tXZ': tXZ, 'tZZinv': tZZinv, 'tZX': tZX})
+    
+    # Dispatch based on vcov type
+    if cluster_ids is not None:
+        # Cluster-robust
+        agg = compute_residual_aggregates_numpy(
+            theta=theta,
+            X=X,
+            y=y,
+            weights=weights,
+            residuals=residuals,
+            cluster_ids=cluster_ids,
+            compute_cluster_scores=True,
+            Z=Z,
+            is_iv=is_iv
+        )
+        
+        context = VcovContext(N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe)
+        ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict else None
+        vcov, vcov_meta = compute_cluster_vcov(
+            bread=XtX_inv,
+            cluster_scores=agg['cluster_scores'],
+            context=context,
+            G=agg['n_clusters'],
+            ssc_config=ssc_config,
+            is_iv=is_iv,
+            tXZ=tXZ,
+            tZZinv=tZZinv,
+            tZX=tZX
+        )
+        aggregates['cluster_scores'] = agg['cluster_scores']
+        aggregates['n_clusters'] = agg['n_clusters']
+    
+    elif vcov_type == "iid":
+        # Classical IID
+        agg = compute_residual_aggregates_numpy(
+            theta=theta,
+            X=X,
+            y=y,
+            weights=weights,
+            residuals=residuals,
+            compute_rss=True,
+            Z=Z,
+            is_iv=is_iv
+        )
+        
+        context = VcovContext(N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe)
+        ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict else None
+        vcov, vcov_meta = compute_iid_vcov(
+            bread=XtX_inv,
+            rss=agg['rss'],
+            context=context,
+            ssc_config=ssc_config,
+            is_iv=is_iv,
+            tXZ=tXZ,
+            tZZinv=tZZinv,
+            tZX=tZX
+        )
+        aggregates['rss'] = agg['rss']
+    
+    else:
+        # Heteroskedastic (HC1, HC2, HC3)
+        compute_lev = vcov_type in ["HC2", "HC3"]
+        if compute_lev:
+            logger.warning(
+                f"{vcov_type} with compressed data: leverages at stratum level. "
+                f"Approximation when strata have multiple observations."
+            )
+        
+        agg = compute_residual_aggregates_numpy(
+            theta=theta,
+            X=X,
+            y=y,
+            weights=weights,
+            residuals=residuals,
+            XtX_inv=XtX_inv if compute_lev else None,
+            compute_meat=True,
+            compute_leverages=compute_lev,
+            Z=Z,
+            is_iv=is_iv
+        )
+        
+        vcov, vcov_meta = compute_hetero_vcov(
+            bread=XtX_inv,
+            meat=agg['meat'],
+            leverages=agg.get('leverages'),
+            vcov_type_detail=vcov_type,  # Pass to vcov module
+            ssc_dict=ssc_dict,
+            N=n_obs,
+            k=n_features,
+            k_fe=k_fe,
+            n_fe=n_fe,
+            is_iv=is_iv,
+            tXZ=tXZ,
+            tZZinv=tZZinv,
+            tZX=tZX
+        )
+        aggregates['meat'] = agg['meat']
+        if 'leverages' in agg:
+            aggregates['leverages'] = agg['leverages']
+    
+    return vcov, vcov_meta, aggregates
 
 
 # ============================================================================
@@ -130,34 +403,30 @@ class FitterResult:
 # ============================================================================
 
 class BaseFitter(ABC):
-    """Abstract base class for OLS fitters."""
+    """Abstract base class for OLS fitters.
+    
+    Canonical Interface:
+    --------------------
+    All fitters accept these standardized parameters:
+    
+    - X, y, weights: Core data (always frequency weights)
+    - coefficients, residuals: Optional pre-computed values
+    - vcov_type: Standard error type ("iid", "HC1", "HC2", "HC3")
+    - ssc_dict: Small sample correction configuration
+    - k_fe, n_fe: Fixed effects parameters
+    - cluster_ids (numpy) / cluster_col (duckdb): Clustering
+    - Z (numpy) / z_cols (duckdb): Instruments for IV
+    - is_iv: Flag for IV estimation
+    """
     
     def __init__(self, alpha: float = DEFAULT_ALPHA, se_type: str = "stata"):
         self.alpha = alpha
         self.se_type = se_type
-        self._linalg = LinAlgHelper()
     
     @abstractmethod
     def fit(self, **kwargs) -> FitterResult:
         """Fit the model and return results."""
         pass
-    
-    def _compute_small_sample_correction(self, n_obs: int, n_features: int, 
-                                          n_clusters: Optional[int] = None) -> float:
-        """Compute small sample correction factor."""
-        if n_clusters is not None:
-            # Cluster-robust correction
-            if self.se_type == "stata":
-                return (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / (n_obs - n_features))
-            elif self.se_type == "HC0":
-                return 1.0
-            elif self.se_type == "HC1":
-                return n_obs / (n_obs - n_features)
-            else:
-                return (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / (n_obs - n_features))
-        else:
-            # Non-clustered correction
-            return n_obs / max(1, n_obs - n_features)
 
 
 # ============================================================================
@@ -165,11 +434,11 @@ class BaseFitter(ABC):
 # ============================================================================
 
 class NumpyFitter(BaseFitter):
-    """
-    In-memory OLS estimation using numpy.
+    """In-memory OLS estimation using numpy."""
     
-    Suitable when compressed data fits in memory.
-    """
+    def __init__(self, alpha: float = DEFAULT_ALPHA, se_type: str = "stata"):
+        super().__init__(alpha=alpha, se_type=se_type)
+        self._last_result: Optional[FitterResult] = None
     
     def fit(
         self,
@@ -178,164 +447,139 @@ class NumpyFitter(BaseFitter):
         weights: np.ndarray,
         coef_names: Optional[List[str]] = None,
         cluster_ids: Optional[np.ndarray] = None,
-        compute_vcov: bool = True,
         residuals: Optional[np.ndarray] = None,
-        coefficients: Optional[np.ndarray] = None
+        coefficients: Optional[np.ndarray] = None,
+        ssc_dict: Optional[Dict[str, Any]] = None,
+        k_fe: int = 0,
+        n_fe: int = 0,
+        vcov_type: str = "HC1"
     ) -> FitterResult:
-        """
-        Fit WLS model using numpy.
-        
-        Parameters
-        ----------
-        X : np.ndarray
-            Design matrix (n_rows, n_features)
-        y : np.ndarray
-            Response vector/matrix (n_rows,) or (n_rows, n_outcomes)
-        weights : np.ndarray
-            Frequency weights (n_rows,)
-        coef_names : List[str], optional
-            Names for coefficients
-        cluster_ids : np.ndarray, optional
-            Cluster identifiers for cluster-robust SEs
-        compute_vcov : bool
-            Whether to compute variance-covariance matrix
-        residuals : np.ndarray, optional
-            Pre-computed residuals for vcov computation (e.g., for 2SLS correction).
-            If provided, these are used instead of computing y - X @ theta.
-        coefficients : np.ndarray, optional
-            Pre-computed coefficients. If provided along with residuals,
-            skips coefficient estimation and only computes vcov.
-            
-        Returns
-        -------
-        FitterResult with coefficients, vcov, etc.
-        """
-        # Ensure proper shapes
-        y = y.reshape(-1, 1) if y.ndim == 1 else y
-        X = X.reshape(-1, 1) if X.ndim == 1 else X
-        weights = weights.flatten()
-        
-        n_rows, n_features = X.shape
-        n_obs = int(weights.sum())
+        """Fit WLS model using numpy."""
+        # Validate and prepare
+        X, y, weights, n_rows, n_obs = _validate_and_prepare_data(X, y, weights)
+        n_features = X.shape[1]
         
         # Compute sufficient statistics
-        sqrt_w = np.sqrt(weights).reshape(-1, 1)
-        Xw = X * sqrt_w
-        yw = y * sqrt_w
+        XtX, Xty, n_obs, sum_y, sum_y_sq, coef_names_suffstats = compute_sufficient_stats_numpy(
+            X=X,
+            y=y,
+            weights=weights,
+            coef_names=coef_names,
+            alpha=self.alpha
+        )
         
-        XtX = Xw.T @ Xw + self.alpha * np.eye(n_features)
-        Xty = Xw.T @ yw
+        # Use provided coef_names or fall back to suffstats
+        if coef_names is None:
+            coef_names = coef_names_suffstats
         
-        # Use provided coefficients or solve for them
+        # Get or compute coefficients
         if coefficients is not None:
             theta = coefficients.flatten()
         else:
-            theta = self._linalg.safe_solve(XtX, Xty.flatten(), self.alpha)
+            theta = safe_solve(XtX, Xty.flatten(), self.alpha)
         
-        # Compute R-squared
-        sum_y = (y.flatten() * weights).sum()
-        sum_y_squared = ((y.flatten() ** 2) * weights).sum()
-        rss = sum_y_squared - theta @ Xty.flatten()
+        # Compute R-squared from suffstats results
+        rss = sum_y_sq - theta @ Xty
         mean_y = sum_y / n_obs
-        tss = sum_y_squared - n_obs * (mean_y ** 2)
+        tss = sum_y_sq - n_obs * (mean_y ** 2)
         r_squared = max(0.0, 1.0 - rss / tss) if tss > 0 else 0.0
         
-        # Coefficient names
-        if coef_names is None:
-            coef_names = [f"x{i}" for i in range(n_features)]
-        
-        # Compute vcov if requested
-        vcov = None
-        se_type_used = "none"
-        n_clusters = None
-        
-        if compute_vcov:
-            # Use provided residuals or compute them
-            if residuals is not None:
-                resid = residuals.flatten()
-            else:
-                resid = (y.flatten() - X @ theta)
-            
-            if cluster_ids is not None:
-                vcov, n_clusters = self._compute_cluster_robust_vcov(
-                    X, resid, weights, XtX, cluster_ids
-                )
-                se_type_used = "cluster"
-            else:
-                vcov = self._compute_hc1_vcov(X, resid, weights, XtX, n_obs)
-                se_type_used = "HC1"
-        
-        return FitterResult(
+        result = FitterResult(
             coefficients=theta,
             coef_names=coef_names,
             n_obs=n_obs,
-            vcov=vcov,
-            se_type=se_type_used,
+            vcov=None,
+            se_type="none",
             r_squared=r_squared,
             rss=rss,
             XtX=XtX,
             Xty=Xty.flatten(),
-            n_clusters=n_clusters
+            n_clusters=None,
+            vcov_meta={}
         )
+        
+        self._last_result = result
+        return result
     
-    def _compute_cluster_robust_vcov(
+    def fit_vcov(
         self,
         X: np.ndarray,
-        residuals: np.ndarray,
+        y: np.ndarray,
         weights: np.ndarray,
-        XtX: np.ndarray,
-        cluster_ids: np.ndarray
-    ) -> Tuple[np.ndarray, int]:
-        """Compute cluster-robust variance-covariance matrix."""
-        n_features = X.shape[1]
-        n_obs = int(weights.sum())
+        coefficients: Optional[np.ndarray] = None,
+        coef_names: Optional[List[str]] = None,
+        cluster_ids: Optional[np.ndarray] = None,
+        vcov_type: str = "HC1",
+        ssc_dict: Optional[Dict[str, Any]] = None,
+        k_fe: int = 0,
+        n_fe: int = 0,
+        existing_result: Optional[FitterResult] = None,
+        Z: Optional[np.ndarray] = None,
+        is_iv: bool = False,
+        residual_X: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
+        """Compute variance-covariance matrix.
         
-        # Compute weighted residuals
-        weighted_residuals = residuals * weights
+        Parameters
+        ----------
+        residual_X : np.ndarray, optional
+            Alternative X matrix for residual computation (for 2SLS).
+            If provided, residuals are computed as y - residual_X @ coefficients,
+            but bread/IV matrices use the main X parameter.
+            This is needed for 2SLS where residuals use actual endogenous
+            but bread uses fitted endogenous.
+        """
+        result = existing_result or self._last_result
         
-        # Get unique clusters
-        unique_clusters = np.unique(cluster_ids)
-        n_clusters = len(unique_clusters)
-        
-        # Compute meat matrix
-        meat = np.zeros((n_features, n_features))
-        for cluster in unique_clusters:
-            mask = cluster_ids == cluster
-            score_g = (X[mask] * weighted_residuals[mask, np.newaxis]).sum(axis=0)
-            meat += np.outer(score_g, score_g)
-        
-        # Compute bread
-        XtX_inv = self._linalg.safe_inv(XtX, use_pinv=True)
-        
-        # Apply correction
-        correction = self._compute_small_sample_correction(n_obs, n_features, n_clusters)
-        vcov = correction * (XtX_inv @ meat @ XtX_inv)
-        vcov = 0.5 * (vcov + vcov.T)  # Ensure symmetry
-        
-        return vcov, n_clusters
-    
-    def _compute_hc1_vcov(
-        self,
-        X: np.ndarray,
-        residuals: np.ndarray,
-        weights: np.ndarray,
-        XtX: np.ndarray,
-        n_obs: int
-    ) -> np.ndarray:
-        """Compute HC1 heteroskedasticity-robust variance-covariance matrix."""
+        # Validate and prepare
+        X, y, weights, n_rows, n_obs = _validate_and_prepare_data(X, y, weights)
         n_features = X.shape[1]
         
-        XtX_inv = self._linalg.safe_inv(XtX, use_pinv=True)
+        # Get or compute coefficients
+        if coefficients is None:
+            if result and result.coefficients is not None:
+                theta = result.coefficients.flatten()
+            else:
+                raise ValueError("coefficients must be provided or available in existing_result")
+        else:
+            theta = coefficients.flatten()
         
-        # HC1: (n/(n-k)) * (X'X)^-1 * X' * diag(e^2 * w) * X * (X'X)^-1
-        hc1_factor = n_obs / max(1, n_obs - n_features)
-        weighted_resid_sq = (residuals ** 2) * weights
-        meat = X.T @ np.diag(weighted_resid_sq) @ X * hc1_factor
+        # Get or compute XtX_inv (always from main X, not residual_X)
+        if result and result.XtX_inv is not None:
+            XtX_inv = result.XtX_inv
+        else:
+            if result and result.XtX is not None:
+                XtX = result.XtX
+            else:
+                XtX, _ = _compute_weighted_matrices(X, y, weights, self.alpha)
+            XtX_inv = safe_inv(XtX, use_pinv=True)
         
-        vcov = XtX_inv @ meat @ XtX_inv
-        vcov = 0.5 * (vcov + vcov.T)  # Ensure symmetry
+        # Get or compute residuals
+        # For 2SLS: use residual_X if provided (actual endogenous)
+        # For OLS: residual_X is None, so uses main X
+        if residual_X is not None:
+            # Compute residuals using alternative X matrix (2SLS case)
+            residuals = y.flatten() - residual_X @ theta
+        else:
+            residuals = result.residuals if result and result.residuals is not None else None
         
-        return vcov
+        # Call unified dispatcher
+        return compute_vcov_dispatch(
+            X=X,
+            y=y,
+            weights=weights,
+            coefficients=theta,
+            residuals=residuals,
+            XtX_inv=XtX_inv,
+            vcov_type=vcov_type,
+            cluster_ids=cluster_ids,
+            ssc_dict=ssc_dict,
+            k_fe=k_fe,
+            n_fe=n_fe,
+            Z=Z,
+            is_iv=is_iv,
+            alpha=self.alpha
+        )
 
 
 # ============================================================================
@@ -343,17 +587,13 @@ class NumpyFitter(BaseFitter):
 # ============================================================================
 
 class DuckDBFitter(BaseFitter):
-    """
-    Out-of-core OLS estimation using DuckDB sufficient statistics.
-    
-    Suitable when compressed data is too large to fit in memory.
-    Computes X'X and X'y directly in the database using SQL aggregations.
-    """
+    """Out-of-core OLS estimation using DuckDB sufficient statistics."""
     
     def __init__(self, conn: duckdb.DuckDBPyConnection, alpha: float = DEFAULT_ALPHA,
                  se_type: str = "stata"):
         super().__init__(alpha=alpha, se_type=se_type)
         self.conn = conn
+        self._last_result: Optional[FitterResult] = None
     
     def fit(
         self,
@@ -363,52 +603,35 @@ class DuckDBFitter(BaseFitter):
         weight_col: str = "count",
         add_intercept: bool = True,
         cluster_col: Optional[str] = None,
-        compute_vcov: bool = True,
         coefficients: Optional[np.ndarray] = None,
-        residual_col: Optional[str] = None
+        residual_x_cols: Optional[List[str]] = None,
+        ssc_dict: Optional[Dict[str, Any]] = None,
+        k_fe: int = 0,
+        n_fe: int = 0,
+        vcov_type: str = "HC1"
     ) -> FitterResult:
-        """
-        Fit WLS model using DuckDB sufficient statistics.
-        
-        Parameters
-        ----------
-        table_name : str
-            Name of table/view containing data
-        x_cols : List[str]
-            Column names for X variables
-        y_col : str
-            Column name for y (sum format, e.g., "sum_outcome")
-        weight_col : str
-            Column name for weights
-        add_intercept : bool
-            Whether to add intercept term
-        cluster_col : str, optional
-            Column for cluster-robust SEs
-        compute_vcov : bool
-            Whether to compute variance-covariance matrix
-        coefficients : np.ndarray, optional
-            Pre-computed coefficients. If provided, skips coefficient estimation.
-        residual_col : str, optional
-            Column name containing pre-computed residuals for vcov computation
-            (e.g., for 2SLS correction). If provided, uses this instead of
-            computing residuals from y - X @ theta.
-            
-        Returns
-        -------
-        FitterResult with coefficients, vcov, etc.
-        """
+        """Fit WLS model using DuckDB sufficient statistics."""
         # Compute sufficient statistics
-        XtX, Xty, n_obs, sum_y, sum_y_sq, coef_names = self._compute_sufficient_stats(
-            table_name, x_cols, y_col, weight_col, add_intercept
+        # Try to use exact sum_y_sq if available:
+        # - For compressed data: sum_{outcome}_sq (created during compression)
+        # - For uncompressed data: {outcome}_sq (created in view if needed)
+        sum_y_sq_col = f"{y_col}_sq"
+        
+        XtX, Xty, n_obs, sum_y, sum_y_sq, coef_names = compute_sufficient_stats_sql(
+            conn=self.conn,
+            table_name=table_name,
+            x_cols=x_cols,
+            y_col=y_col,
+            weight_col=weight_col,
+            add_intercept=add_intercept,
+            alpha=self.alpha,
+            sum_y_sq_col=sum_y_sq_col
         )
         
         n_features = len(coef_names)
         
-        # Use provided coefficients or solve for them
-        if coefficients is not None:
-            theta = coefficients.flatten()
-        else:
-            theta = self._linalg.safe_solve(XtX, Xty, self.alpha)
+        # Get or compute coefficients
+        theta = coefficients.flatten() if coefficients is not None else safe_solve(XtX, Xty, self.alpha)
         
         # Compute R-squared
         rss = sum_y_sq - theta @ Xty
@@ -416,315 +639,180 @@ class DuckDBFitter(BaseFitter):
         tss = sum_y_sq - n_obs * (mean_y ** 2)
         r_squared = max(0.0, 1.0 - rss / tss) if tss > 0 else 0.0
         
-        # Compute vcov if requested
-        vcov = None
-        se_type_used = "none"
-        n_clusters = None
-        
-        if compute_vcov:
-            if cluster_col:
-                vcov, n_clusters = self._compute_cluster_robust_vcov_sql(
-                    table_name, x_cols, y_col, weight_col, cluster_col,
-                    theta, XtX, n_obs, add_intercept, residual_col
-                )
-                se_type_used = "cluster"
-            else:
-                if residual_col:
-                    # Use pre-computed residuals for HC1
-                    vcov = self._compute_hc1_vcov_sql_with_residuals(
-                        table_name, x_cols, residual_col, weight_col,
-                        XtX, n_obs, add_intercept
-                    )
-                else:
-                    # Compute residuals on the fly
-                    vcov = self._compute_hc1_vcov_sql(
-                        table_name, x_cols, y_col, weight_col,
-                        theta, XtX, n_obs, add_intercept
-                    )
-                se_type_used = "HC1"
-        
-        return FitterResult(
+        result = FitterResult(
             coefficients=theta,
             coef_names=coef_names,
             n_obs=n_obs,
-            vcov=vcov,
-            se_type=se_type_used,
+            vcov=None,
+            se_type="none",
             r_squared=r_squared,
             rss=rss,
             XtX=XtX,
             Xty=Xty,
-            n_clusters=n_clusters
+            n_clusters=None,
+            vcov_meta={}
         )
+        
+        self._last_result = result
+        return result
     
-    def _compute_sufficient_stats(
+    def fit_vcov(
         self,
         table_name: str,
         x_cols: List[str],
         y_col: str,
-        weight_col: str,
-        add_intercept: bool
-    ) -> Tuple[np.ndarray, np.ndarray, int, float, float, List[str]]:
-        """Compute X'WX and X'Wy using DuckDB aggregations."""
-        if add_intercept:
-            all_x_cols = ["1"] + x_cols
-            coef_names = ["Intercept"] + x_cols
+        weight_col: str = "count",
+        add_intercept: bool = True,
+        coefficients: Optional[np.ndarray] = None,
+        cluster_col: Optional[str] = None,
+        vcov_type: str = "HC1",
+        residual_x_cols: Optional[List[str]] = None,
+        ssc_dict: Optional[Dict[str, Any]] = None,
+        k_fe: int = 0,
+        n_fe: int = 0,
+        existing_result: Optional[FitterResult] = None,
+        z_cols: Optional[List[str]] = None,
+        is_iv: bool = False
+    ) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
+        """Compute variance-covariance matrix using DuckDB SQL."""
+        result = existing_result or self._last_result
+        
+        # Get or compute sufficient statistics
+        if result and result.XtX is not None:
+            XtX = result.XtX
+            Xty = result.Xty
+            n_obs = result.n_obs
+            coef_names = result.coef_names
         else:
-            all_x_cols = x_cols
-            coef_names = x_cols.copy()
-        
-        k = len(all_x_cols)
-        
-        # Build X'WX computation (upper triangle only)
-        xtx_parts = []
-        for i, col_i in enumerate(all_x_cols):
-            for j, col_j in enumerate(all_x_cols):
-                if j >= i:
-                    xtx_parts.append(
-                        f"SUM(({col_i}) * ({col_j}) * {weight_col}) AS xtx_{i}_{j}"
-                    )
-        
-        # Build X'Wy computation
-        xty_parts = [
-            f"SUM(({col}) * {y_col}) AS xty_{i}"
-            for i, col in enumerate(all_x_cols)
-        ]
-        
-        # Additional statistics
-        stats_parts = [
-            f"SUM({weight_col}) AS n_obs",
-            f"SUM({y_col}) AS sum_y",
-        ]
-        
-        # Sum of y squared - compute from sum and count (y_col is already sum_y)
-        # For compressed data: sum_y_sq = sum((y_i)^2) which we approximate as sum_y^2/count per stratum
-        # This is an approximation when we don't have the actual sum of squares
-        stats_parts.append(
-            f"SUM(POW({y_col} / {weight_col}, 2) * {weight_col}) AS sum_y_sq"
-        )
-        
-        query = f"""
-        SELECT {', '.join(xtx_parts)}, {', '.join(xty_parts)}, {', '.join(stats_parts)}
-        FROM {table_name}
-        """
-        
-        logger.debug(f"Executing sufficient stats query")
-        result = self.conn.execute(query).fetchone()
-        
-        # Parse XtX (upper triangle)
-        XtX = np.zeros((k, k))
-        idx = 0
-        for i in range(k):
-            for j in range(i, k):
-                XtX[i, j] = result[idx]
-                XtX[j, i] = result[idx]  # Symmetric
-                idx += 1
-        
-        # Add regularization
-        XtX += self.alpha * np.eye(k)
-        
-        # Parse Xty
-        Xty = np.array([result[idx + i] for i in range(k)])
-        idx += k
-        
-        n_obs = int(result[idx])
-        sum_y = float(result[idx + 1])
-        sum_y_sq = float(result[idx + 2])
-        
-        return XtX, Xty, n_obs, sum_y, sum_y_sq, coef_names
-    
-    def _compute_cluster_robust_vcov_sql(
-        self,
-        table_name: str,
-        x_cols: List[str],
-        y_col: str,
-        weight_col: str,
-        cluster_col: str,
-        theta: np.ndarray,
-        XtX: np.ndarray,
-        n_obs: int,
-        add_intercept: bool,
-        residual_col: Optional[str] = None
-    ) -> Tuple[np.ndarray, int]:
-        """Compute cluster-robust vcov using SQL aggregations."""
-        if add_intercept:
-            all_x_cols = ["1"] + x_cols
-        else:
-            all_x_cols = x_cols
-        
-        k = len(all_x_cols)
-        
-        if residual_col:
-            # Use pre-computed residuals column
-            score_cols = [
-                f"SUM(({col}) * {residual_col} * {weight_col}) AS score_{i}"
-                for i, col in enumerate(all_x_cols)
-            ]
-        else:
-            # Compute residuals on the fly: (y/count) - X @ theta
-            theta_terms = " + ".join([
-                f"({theta[i]}) * ({col})"
-                for i, col in enumerate(all_x_cols)
-            ])
-            residual_expr = f"(({y_col} / {weight_col}) - ({theta_terms}))"
+            # Try to use exact sum_y_sq if available (will check if column exists)
+            sum_y_sq_col = f"{y_col}_sq"
             
-            # Cluster-level scores: sum of X * residual * weight per cluster
-            score_cols = [
-                f"SUM(({col}) * {residual_expr} * {weight_col}) AS score_{i}"
-                for i, col in enumerate(all_x_cols)
-            ]
+            XtX, Xty, n_obs, _, _, coef_names = compute_sufficient_stats_sql(
+                conn=self.conn,
+                table_name=table_name,
+                x_cols=x_cols,
+                y_col=y_col,
+                weight_col=weight_col,
+                add_intercept=add_intercept,
+                alpha=self.alpha,
+                sum_y_sq_col=sum_y_sq_col
+            )
         
-        query = f"""
-        SELECT {cluster_col}, {', '.join(score_cols)}
-        FROM {table_name}
-        GROUP BY {cluster_col}
-        """
+        n_features = XtX.shape[0]
         
-        df = self.conn.execute(query).fetchdf()
-        n_clusters = len(df)
+        # Get or compute coefficients
+        theta = (coefficients.flatten() if coefficients is not None
+                else result.coefficients.flatten() if result and result.coefficients is not None
+                else safe_solve(XtX, Xty, self.alpha))
         
-        # Compute meat matrix
-        scores = df[[f"score_{i}" for i in range(k)]].values
-        meat = scores.T @ scores
+        # Get or compute XtX_inv
+        XtX_inv = (result.XtX_inv if result and result.XtX_inv is not None
+                  else safe_inv(XtX, use_pinv=True))
         
-        # Compute bread
-        XtX_inv = self._linalg.safe_inv(XtX, use_pinv=True)
+        aggregates = {'XtX_inv': XtX_inv, 'theta': theta}
         
-        # Apply correction
-        correction = self._compute_small_sample_correction(n_obs, k, n_clusters)
-        vcov = correction * (XtX_inv @ meat @ XtX_inv)
-        vcov = 0.5 * (vcov + vcov.T)
+        # Compute IV matrices if needed
+        tXZ = None
+        tZZinv = None
+        tZX = None
+        if is_iv and z_cols is not None:
+            from .core.residual_aggregates import compute_cross_sufficient_stats_sql
+            
+            iv_stats = compute_cross_sufficient_stats_sql(
+                conn=self.conn,
+                table_name=table_name,
+                x_cols=x_cols,
+                z_cols=z_cols,
+                weight_col=weight_col,
+                add_intercept=add_intercept
+            )
+            
+            tXZ = iv_stats['tXZ']
+            tZZ = iv_stats['tZZ'] + self.alpha * np.eye(iv_stats['tZZ'].shape[0])
+            tZZinv = safe_inv(tZZ, use_pinv=True)
+            tZX = tXZ.T
+            
+            aggregates.update({'tXZ': tXZ, 'tZZinv': tZZinv, 'tZX': tZX})
         
-        return vcov, n_clusters
-    
-    def _compute_hc1_vcov_sql_with_residuals(
-        self,
-        table_name: str,
-        x_cols: List[str],
-        residual_col: str,
-        weight_col: str,
-        XtX: np.ndarray,
-        n_obs: int,
-        add_intercept: bool
-    ) -> np.ndarray:
-        """Compute HC1 vcov using SQL with pre-computed residuals column."""
-        if add_intercept:
-            all_x_cols = ["1"] + x_cols
+        # Dispatch based on vcov type
+        if cluster_col:
+            agg = compute_residual_aggregates_sql(
+                theta=theta,
+                conn=self.conn,
+                table_name=table_name,
+                x_cols=x_cols,
+                y_col=y_col,
+                weight_col=weight_col,
+                cluster_col=cluster_col,
+                add_intercept=add_intercept,
+                residual_x_cols=residual_x_cols,
+                compute_cluster_scores=True,
+                z_cols=z_cols,
+                is_iv=is_iv
+            )
+            
+            context = VcovContext(N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe)
+            ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict else None
+            vcov, vcov_meta = compute_cluster_vcov(
+                bread=XtX_inv,
+                cluster_scores=agg['cluster_scores'],
+                context=context,
+                G=agg['n_clusters'],
+                ssc_config=ssc_config,
+                is_iv=is_iv,
+                tXZ=tXZ,
+                tZZinv=tZZinv,
+                tZX=tZX
+            )
+            aggregates.update({'cluster_scores': agg['cluster_scores'], 'n_clusters': agg['n_clusters']})
+        
+        elif vcov_type == "iid":
+            rss = (result.rss if result and result.rss is not None
+                  else compute_residual_aggregates_sql(
+                      theta=theta, conn=self.conn, table_name=table_name,
+                      x_cols=x_cols, y_col=y_col, weight_col=weight_col,
+                      add_intercept=add_intercept, residual_x_cols=residual_x_cols,
+                      compute_rss=True
+                  )['rss'])
+            
+            context = VcovContext(N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe)
+            ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict else None
+            vcov, vcov_meta = compute_iid_vcov(
+                bread=XtX_inv, rss=rss, context=context, ssc_config=ssc_config,
+                is_iv=is_iv, tXZ=tXZ, tZZinv=tZZinv, tZX=tZX
+            )
+            aggregates['rss'] = rss
+        
         else:
-            all_x_cols = x_cols
+            compute_lev = vcov_type in ["HC2", "HC3"]
+            if compute_lev:
+                logger.warning(
+                    f"{vcov_type} with compressed data: leverages at stratum level. "
+                    f"Approximation when strata have multiple observations."
+                )
+            
+            agg = compute_residual_aggregates_sql(
+                theta=theta, conn=self.conn, table_name=table_name,
+                x_cols=x_cols, y_col=y_col, weight_col=weight_col,
+                add_intercept=add_intercept, residual_x_cols=residual_x_cols,
+                XtX_inv=XtX_inv if compute_lev else None,
+                compute_meat=True, compute_leverages=compute_lev,
+                z_cols=z_cols, is_iv=is_iv
+            )
+            
+            vcov, vcov_meta = compute_hetero_vcov(
+                bread=XtX_inv, meat=agg['meat'],
+                leverages=agg.get('leverages'),
+                vcov_type_detail=vcov_type,  # Pass to vcov module
+                ssc_dict=ssc_dict,
+                N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
+                is_iv=is_iv, tXZ=tXZ, tZZinv=tZZinv, tZX=tZX
+            )
+            aggregates['meat'] = agg['meat']
+            if 'leverages' in agg:
+                aggregates['leverages'] = agg['leverages']
         
-        k = len(all_x_cols)
-        
-        # Build X' * diag(e^2 * w) * X using SQL
-        meat_parts = []
-        for i, col_i in enumerate(all_x_cols):
-            for j, col_j in enumerate(all_x_cols):
-                if j >= i:
-                    meat_parts.append(
-                        f"SUM(({col_i}) * ({col_j}) * POW({residual_col}, 2) * {weight_col}) AS meat_{i}_{j}"
-                    )
-        
-        query = f"""
-        SELECT {', '.join(meat_parts)}
-        FROM {table_name}
-        """
-        
-        result = self.conn.execute(query).fetchone()
-        
-        # Parse meat matrix (upper triangle)
-        meat = np.zeros((k, k))
-        idx = 0
-        for i in range(k):
-            for j in range(i, k):
-                meat[i, j] = result[idx]
-                meat[j, i] = result[idx]  # Symmetric
-                idx += 1
-        
-        # Apply HC1 correction
-        hc1_factor = n_obs / max(1, n_obs - k)
-        meat = meat * hc1_factor
-        
-        # Compute bread
-        XtX_inv = self._linalg.safe_inv(XtX, use_pinv=True)
-        
-        vcov = XtX_inv @ meat @ XtX_inv
-        vcov = 0.5 * (vcov + vcov.T)
-        
-        return vcov
-    
-    def _compute_hc1_vcov_sql(
-        self,
-        table_name: str,
-        x_cols: List[str],
-        y_col: str,
-        weight_col: str,
-        theta: np.ndarray,
-        XtX: np.ndarray,
-        n_obs: int,
-        add_intercept: bool
-    ) -> np.ndarray:
-        """Compute HC1 vcov using SQL by computing residuals on the fly."""
-        if add_intercept:
-            all_x_cols = ["1"] + x_cols
-        else:
-            all_x_cols = x_cols
-        
-        k = len(all_x_cols)
-        
-        # Build residual expression: (y/count) - X @ theta
-        theta_terms = " + ".join([
-            f"({theta[i]}) * ({col})"
-            for i, col in enumerate(all_x_cols)
-        ])
-        residual_expr = f"(({y_col} / {weight_col}) - ({theta_terms}))"
-        
-        # Build X' * diag(e^2 * w) * X using SQL
-        meat_parts = []
-        for i, col_i in enumerate(all_x_cols):
-            for j, col_j in enumerate(all_x_cols):
-                if j >= i:
-                    meat_parts.append(
-                        f"SUM(({col_i}) * ({col_j}) * POW({residual_expr}, 2) * {weight_col}) AS meat_{i}_{j}"
-                    )
-        
-        query = f"""
-        SELECT {', '.join(meat_parts)}
-        FROM {table_name}
-        """
-        
-        result = self.conn.execute(query).fetchone()
-        
-        # Parse meat matrix (upper triangle)
-        meat = np.zeros((k, k))
-        idx = 0
-        for i in range(k):
-            for j in range(i, k):
-                meat[i, j] = result[idx]
-                meat[j, i] = result[idx]  # Symmetric
-                idx += 1
-        
-        # Apply HC1 correction
-        hc1_factor = n_obs / max(1, n_obs - k)
-        meat = meat * hc1_factor
-        
-        # Compute bread
-        XtX_inv = self._linalg.safe_inv(XtX, use_pinv=True)
-        
-        vcov = XtX_inv @ meat @ XtX_inv
-        vcov = 0.5 * (vcov + vcov.T)
-        
-        return vcov
-    
-    def _compute_classical_vcov(
-        self,
-        XtX: np.ndarray,
-        rss: float,
-        n_obs: int,
-        n_features: int
-    ) -> np.ndarray:
-        """Compute classical (homoskedastic) variance-covariance matrix."""
-        XtX_inv = self._linalg.safe_inv(XtX, use_pinv=True)
-        sigma2 = rss / max(1, n_obs - n_features)
-        return sigma2 * XtX_inv
+        return vcov, vcov_meta, aggregates
 
 
 # ============================================================================
@@ -736,21 +824,7 @@ def get_fitter(
     conn: Optional[duckdb.DuckDBPyConnection] = None,
     **kwargs
 ) -> BaseFitter:
-    """
-    Get an instance of a fitter class based on the type.
-    
-    Parameters
-    ----------
-    fitter_type : str
-        Type of fitter to use ("numpy" or "duckdb")
-    conn : duckdb.DuckDBPyConnection, optional
-        DuckDB connection object, required if fitter_type is "duckdb"
-    
-    Returns
-    -------
-    BaseFitter
-        An instance of a fitter class
-    """
+    """Get an instance of a fitter class based on the type."""
     if fitter_type == "numpy":
         return NumpyFitter(**kwargs)
     elif fitter_type == "duckdb":
@@ -760,16 +834,13 @@ def get_fitter(
     else:
         raise ValueError(f"Unknown fitter type: {fitter_type}")
 
+
 # ============================================================================
 # Convenience Functions (backward compatible)
 # ============================================================================
 
 def wls(X: np.ndarray, y: np.ndarray, n: np.ndarray) -> np.ndarray:
-    """
-    Weighted least squares with frequency weights.
-    
-    Backward-compatible function for simple WLS computation.
-    """
+    """Weighted least squares with frequency weights."""
     N = np.sqrt(n).reshape(-1, 1)
     y = y.reshape(-1, 1) if y.ndim == 1 else y
     return np.linalg.lstsq(X * N, y * N, rcond=None)[0]
@@ -801,7 +872,7 @@ def ridge_closed_form_batch(X: np.ndarray, y: np.ndarray, n: np.ndarray, lambda_
 
 
 def wls_duckdb(
-    conn: "duckdb.DuckDBPyConnection",
+    conn: duckdb.DuckDBPyConnection,
     table_name: str,
     x_cols: List[str],
     y_col: str,
@@ -811,36 +882,7 @@ def wls_duckdb(
     se_type: str = "stata",
     alpha: float = DEFAULT_ALPHA
 ) -> Dict[str, Any]:
-    """
-    Weighted least squares using DuckDB sufficient statistics.
-    
-    Backward-compatible function that wraps DuckDBFitter.
-    
-    Parameters
-    ----------
-    conn : duckdb.DuckDBPyConnection
-        Active DuckDB connection
-    table_name : str
-        Table with compressed data
-    x_cols : List[str]
-        Feature column names
-    y_col : str
-        Outcome column (sum_y format)
-    weight_col : str
-        Weight column (count)
-    add_intercept : bool
-        Add intercept term
-    cluster_col : Optional[str]
-        Cluster column for robust SEs
-    se_type : str
-        Standard error type
-    alpha : float
-        Regularization parameter
-        
-    Returns
-    -------
-    dict with coefficients, standard errors, vcov, etc.
-    """
+    """Weighted least squares using DuckDB sufficient statistics."""
     fitter = DuckDBFitter(conn=conn, alpha=alpha, se_type=se_type)
     result = fitter.fit(
         table_name=table_name,
@@ -848,9 +890,25 @@ def wls_duckdb(
         y_col=y_col,
         weight_col=weight_col,
         add_intercept=add_intercept,
-        cluster_col=cluster_col,
-        compute_vcov=True
+        cluster_col=cluster_col
     )
+    
+    # Compute vcov separately
+    vcov, vcov_meta, _ = fitter.fit_vcov(
+        table_name=table_name,
+        x_cols=x_cols,
+        y_col=y_col,
+        weight_col=weight_col,
+        add_intercept=add_intercept,
+        cluster_col=cluster_col,
+        coefficients=result.coefficients,
+        existing_result=result
+    )
+    
+    result.vcov = vcov
+    result.se_type = vcov_meta.get('vcov_type_detail', se_type)
+    result.vcov_meta = vcov_meta
+    
     return result.to_dict()
 
 
@@ -859,12 +917,12 @@ def wls_duckdb(
 # ============================================================================
 
 __all__ = [
-    'LinAlgHelper',
     'FitterResult',
     'BaseFitter',
     'NumpyFitter',
     'DuckDBFitter',
     'get_fitter',
+    'compute_vcov_dispatch',
     'wls',
     'wls_duckdb',
     'ridge_closed_form',

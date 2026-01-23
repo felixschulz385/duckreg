@@ -14,6 +14,7 @@ import logging
 from ..formula_parser import needs_quoting, quote_identifier
 from .DuckLinearModel import DuckLinearModel
 from .mixins import MundlakMixin
+from .name_utils import build_coef_name_lists
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +59,20 @@ class DuckMundlak(DuckLinearModel, MundlakMixin):
         """Build coefficient names from formula for DuckDB fitter.
         
         Mundlak includes intercept + covariates + FE averages.
+        
+        Returns:
+            List of display names for coefficients
         """
-        simple_covs = [var for var in self.formula.covariates if not var.is_intercept()]
-        avg_cols_display = [f"avg_{var.display_name}_fe{i}" 
-                           for i in range(len(self.fe_cols)) 
-                           for var in simple_covs]
-        return ['Intercept'] + [var.display_name for var in simple_covs] + avg_cols_display
+        display_names, sql_names = build_coef_name_lists(
+            formula=self.formula,
+            fe_method='mundlak',
+            include_intercept=True,
+            fe_cols=self.fe_cols,
+            is_iv=False
+        )
+        # Store sql_names for SQL column selection
+        self._coef_sql_names = sql_names
+        return display_names
 
     # -------------------------------------------------------------------------
     # Data preparation
@@ -104,33 +113,29 @@ class DuckMundlak(DuckLinearModel, MundlakMixin):
 
     def _add_fe_averages(self):
         """Add FE-level averages for Mundlak device (excluding intercept)"""
+        from ..core.sql_builders import build_add_mundlak_means_sql
+        
         simple_covs = [var for var in self.formula.covariates if not var.is_intercept()]
         
         if not simple_covs:
             return
         
+        var_sql_names = [var.sql_name for var in simple_covs]
+        
         for i, fe_col_name in enumerate(self.fe_cols):
-            avg_parts = []
-            avg_col_parts = []
-            for cov_var in simple_covs:
-                avg_alias = f"avg_{cov_var.sql_name}_fe{i}"
-                avg_parts.append(f"AVG({cov_var.sql_name}) AS {avg_alias}")
-                avg_col_parts.append(f"fe{i}.{avg_alias}")
-            
-            avg_cols = ", ".join(avg_parts)
-            avg_col_list = ", ".join(avg_col_parts)
-            
+            # Get FE SQL name
             fe_var = self.formula.get_fe_by_name(fe_col_name)
             mfe = self.formula.get_merged_fe_by_name(fe_col_name)
             fe_sql_name = fe_var.sql_name if fe_var else (mfe.sql_name if mfe else fe_col_name)
             
-            self.conn.execute(f"""
-            CREATE OR REPLACE TABLE {self._DESIGN_MATRIX_TABLE} AS
-            SELECT dm.*, {avg_col_list}
-            FROM {self._DESIGN_MATRIX_TABLE} dm
-            JOIN (SELECT {fe_sql_name}, {avg_cols} FROM {self._DESIGN_MATRIX_TABLE} GROUP BY {fe_sql_name}) fe{i} 
-            ON dm.{fe_sql_name} = fe{i}.{fe_sql_name}
-            """)
+            # Use centralized SQL builder
+            sql = build_add_mundlak_means_sql(
+                table_name=self._DESIGN_MATRIX_TABLE,
+                var_sql_names=var_sql_names,
+                fe_col_sql_name=fe_sql_name,
+                fe_index=i
+            )
+            self.conn.execute(sql)
 
     # -------------------------------------------------------------------------
     # Data compression
@@ -175,9 +180,11 @@ class DuckMundlak(DuckLinearModel, MundlakMixin):
         select_clause = ", ".join(select_parts)
         group_by_clause = ", ".join(group_parts)
         
+        # Add outcome aggregations (including sum_y_sq for exact variance computation)
         outcome_aggs = []
         for var in self.formula.outcomes:
             outcome_aggs.append(f"SUM({var.sql_name}) as sum_{var.sql_name}")
+            outcome_aggs.append(f"SUM(({var.sql_name}) * ({var.sql_name})) as sum_{var.sql_name}_sq")
         outcome_aggs_sql = ", ".join(outcome_aggs)
         
         self.agg_query = f"""
@@ -198,11 +205,12 @@ class DuckMundlak(DuckLinearModel, MundlakMixin):
         return f"sum_{outcome_var.sql_name}"
 
     def _get_x_cols_for_duckdb(self) -> List[str]:
-        simple_covs = [var for var in self.formula.covariates if not var.is_intercept()]
-        avg_cols = [f"avg_{var.sql_name}_fe{i}" 
-                    for i in range(len(self.fe_cols)) 
-                    for var in simple_covs]
-        return [var.sql_name for var in simple_covs] + avg_cols
+        """Get X column names for DuckDB fitter"""
+        return self.build_x_cols_for_duckdb(
+            fe_method='mundlak',
+            fe_cols=self.fe_cols,
+            is_iv=False
+        )
 
     # -------------------------------------------------------------------------
     # Data collection
@@ -236,9 +244,12 @@ class DuckMundlak(DuckLinearModel, MundlakMixin):
         X = np.c_[np.ones(len(data)), data[rhs_cols_sql].values]
         self.coef_names_ = ['Intercept'] + [var.display_name for var in simple_covs] + avg_cols_display
         
-        y_cols = [f"mean_{var.sql_name}" for var in self.formula.outcomes]
+        y_cols = [f"sum_{var.sql_name}" for var in self.formula.outcomes]
         y = data[y_cols].values
         n = data["count"].values
+        
+        # Convert sum to mean for WLS (WLS will multiply by sqrt(n) internally)
+        y = y / n.reshape(-1, 1)
 
         y = y.reshape(-1, 1) if y.ndim == 1 else y
         X = X.reshape(-1, 1) if X.ndim == 1 else X

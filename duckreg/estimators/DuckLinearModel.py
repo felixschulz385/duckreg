@@ -5,7 +5,7 @@ This module provides the shared functionality for OLS estimators that use
 either demeaning or Mundlak device for fixed effects.
 
 Architecture:
-- DuckLinearModel extends DuckEstimator and composes VCovMixin, SQLBuilderMixin
+- DuckLinearModel extends DuckEstimator and composes SQLBuilderMixin
 - Results containers are imported from results.py (Single Responsibility)
 - Bootstrap and vcov helpers are imported from mixins.py (DRY)
 """
@@ -23,9 +23,10 @@ from ..formula_parser import cast_if_boolean, needs_quoting, quote_identifier, _
 # Import from refactored modules - Single Responsibility Principle
 from .results import RegressionResults, FirstStageResults
 from .mixins import (
-    VCovMixin, SQLBuilderMixin, BootstrapExecutor,
+    SQLBuilderMixin, BootstrapExecutor,
     _bootstrap_iteration_iid, _bootstrap_iteration_cluster
 )
+from .name_utils import build_coef_name_lists
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Base Linear Model
 # ============================================================================
 
-class DuckLinearModel(DuckEstimator, SQLBuilderMixin, VCovMixin):
+class DuckLinearModel(DuckEstimator, SQLBuilderMixin):
     """Base class for single-stage linear models (OLS, Mundlak).
     
     This class handles:
@@ -168,18 +169,6 @@ class DuckLinearModel(DuckEstimator, SQLBuilderMixin, VCovMixin):
             f"SELECT * FROM {self._COMPRESSED_VIEW}"
         ).fetchdf()
         self._data_fetched = True
-        self._compute_means()
-
-    def _compute_means(self):
-        """Compute mean columns from sum columns"""
-        for outcome_var in self.formula.outcomes:
-            sum_col = f"sum_{outcome_var.sql_name}"
-            mean_col = f"mean_{outcome_var.sql_name}"
-            
-            if mean_col not in self.df_compressed.columns and sum_col in self.df_compressed.columns:
-                self.df_compressed[mean_col] = (
-                    self.df_compressed[sum_col] / self.df_compressed["count"]
-                )
 
     def _create_compressed_view(self):
         """Create a view for compressed data without fetching"""
@@ -236,8 +225,7 @@ class DuckLinearModel(DuckEstimator, SQLBuilderMixin, VCovMixin):
         self._fitter_result = numpy_fitter.fit(
             X=X, y=y, weights=n,
             coef_names=getattr(self, 'coef_names_', None),
-            cluster_ids=cluster_ids,
-            compute_vcov=True
+            cluster_ids=cluster_ids
         )
         
         self._update_coef_names()
@@ -257,8 +245,7 @@ class DuckLinearModel(DuckEstimator, SQLBuilderMixin, VCovMixin):
             y_col=y_col,
             weight_col="count",
             add_intercept=self._needs_intercept_for_duckdb(),
-            cluster_col=cluster_col if cluster_col in view_cols else None,
-            compute_vcov=True
+            cluster_col=cluster_col if cluster_col in view_cols else None
         )
         
         self._update_coef_names()
@@ -310,33 +297,91 @@ class DuckLinearModel(DuckEstimator, SQLBuilderMixin, VCovMixin):
         """Build coefficient names from formula without loading data.
         
         Used by DuckDB fitter path to avoid memory loading.
+        
+        Returns:
+            List of display names for coefficients
         """
-        names = []
-        if self._needs_intercept_for_duckdb():
-            names.append('Intercept')
-        names.extend(self.formula.get_covariate_display_names())
-        return names
+        include_intercept = self._needs_intercept_for_duckdb()
+        display_names, sql_names = build_coef_name_lists(
+            formula=self.formula,
+            fe_method='demean',  # DuckLinearModel uses demeaning by default
+            include_intercept=include_intercept,
+            fe_cols=None,  # No Mundlak means in base class
+            is_iv=False
+        )
+        # Store sql_names for potential use in SQL column selection
+        self._coef_sql_names = sql_names
+        return display_names
 
     # -------------------------------------------------------------------------
     # Variance-covariance
     # -------------------------------------------------------------------------
 
-    def fit_vcov(self):
-        """Compute variance-covariance matrix"""
-        # If duckdb fitter already computed vcov, use it
-        if self.fitter == "duckdb" and self._fitter_result is not None and self._fitter_result.vcov is not None:
-            self.vcov = self._fitter_result.vcov
-            self.se = self._fitter_result.se_type
-            return
+    def fit_vcov(self, se_method: str = "HC1"):
+        """Compute variance-covariance matrix.
         
+        Args:
+            se_method: Type of standard errors ('iid', 'HC1', 'CRV1')
+        """
+        if self.fitter == "duckdb":
+            self._fit_vcov_duckdb(se_method=se_method)
+        else:
+            self._fit_vcov_numpy(se_method=se_method)
+    
+    def _fit_vcov_numpy(self, se_method: str = "HC1"):
+        """Compute vcov using numpy (in-memory) backend via NumpyFitter"""
         self._ensure_data_fetched()
         
         y, X, n = self.collect_data(data=self.df_compressed)
         cluster_ids = self._get_cluster_ids_from_df()
         
-        self.vcov, self.se, _ = self.compute_vcov_from_data(
-            X=X, y=y, weights=n, cluster_ids=cluster_ids
+        # Use NumpyFitter for vcov computation
+        fitter = NumpyFitter(alpha=1e-8, se_type=se_method)
+        
+        vcov, vcov_meta, _ = fitter.fit_vcov(
+            X=X,
+            y=y,
+            weights=n,
+            coefficients=self.point_estimate,
+            cluster_ids=cluster_ids,
+            vcov_type=se_method,
+            coef_names=getattr(self, 'coef_names_', None)
         )
+        
+        self.vcov = vcov
+        self.se = vcov_meta.get('vcov_type_detail', se_method)
+        self._results = None
+    
+    def _fit_vcov_duckdb(self, se_method: str = "HC1"):
+        """Compute vcov using DuckDB (out-of-core) backend"""
+        # If duckdb fitter already computed vcov with correct se_type, use it
+        if self._fitter_result is not None and self._fitter_result.vcov is not None:
+            if self._fitter_result.se_type == se_method or se_method in self._fitter_result.se_type:
+                self.vcov = self._fitter_result.vcov
+                self.se = self._fitter_result.se_type
+                self._results = None
+                return
+        
+        # Compute using DuckDB fitter
+        x_cols = self._get_x_cols_for_duckdb()
+        y_col = self._get_y_col_for_duckdb()
+        cluster_col = self._get_cluster_col_for_vcov()
+        view_cols = self._get_view_columns()
+        
+        duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type=se_method)
+        vcov, vcov_meta, _ = duckdb_fitter.fit_vcov(
+            table_name=self._COMPRESSED_VIEW,
+            x_cols=x_cols,
+            y_col=y_col,
+            weight_col="count",
+            add_intercept=self._needs_intercept_for_duckdb(),
+            coefficients=self.point_estimate,
+            cluster_col=cluster_col if cluster_col in view_cols else None,
+            vcov_type=se_method
+        )
+        
+        self.vcov = vcov
+        self.se = vcov_meta.get('vcov_type_detail', se_method)
         self._results = None
 
     # -------------------------------------------------------------------------

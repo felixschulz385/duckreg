@@ -46,11 +46,23 @@ class DuckRegression(DuckLinearModel):
         
         With FEs, no intercept is included (absorbed by demeaning).
         Without FEs, intercept is included.
+        
+        Returns:
+            List of display names for coefficients
         """
-        if self.fe_cols:
-            return self.formula.get_covariate_display_names()
-        else:
-            return ['Intercept'] + self.formula.get_covariate_display_names()
+        from .name_utils import build_coef_name_lists
+        
+        include_intercept = not bool(self.fe_cols)
+        display_names, sql_names = build_coef_name_lists(
+            formula=self.formula,
+            fe_method='demean',
+            include_intercept=include_intercept,
+            fe_cols=None,  # Demeaning doesn't use Mundlak means
+            is_iv=False
+        )
+        # Store sql_names for SQL column selection
+        self._coef_sql_names = sql_names
+        return display_names
 
     def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, Optional[str]]:
         self._ensure_data_fetched()
@@ -124,58 +136,34 @@ class DuckRegression(DuckLinearModel):
             self.df_compressed.columns = self._expected_cols
         
         self._data_fetched = True
-        self._compute_means()
 
     def _build_strata_select_sql(self, boolean_cols: set, unit_col: Optional[str]) -> Tuple[List[str], List[str]]:
-        """Build SELECT and GROUP BY parts for strata columns"""
-        select_parts, group_by_parts = [], []
+        """Build SELECT and GROUP BY parts for strata columns.
         
-        for col_name in self.strata_cols:
-            # col_name is the raw name - use it to look up the Variable object
-            var = (self.formula.get_covariate_by_name(col_name) or 
-                   self.formula.get_fe_by_name(col_name))
-            
-            if var:
-                col_expr = var.get_sql_expression(unit_col, 'year')
-                col_expr = cast_if_boolean(col_expr, var.name, boolean_cols)
-                # Use sql_name as the SQL-safe alias
-                select_expr, group_expr = self._build_round_expr(col_expr, var.sql_name)
-            else:
-                # Handle interactions or merged FEs
-                interaction = self.formula.get_interaction_by_name(col_name)
-                if interaction:
-                    col_expr = interaction.get_sql_expression(unit_col, 'year', boolean_cols)
-                    select_expr, group_expr = self._build_round_expr(col_expr, interaction.sql_name)
-                else:
-                    mfe = self.formula.get_merged_fe_by_name(col_name)
-                    if mfe:
-                        col_expr = mfe.get_sql_expression(boolean_cols)
-                        select_expr, group_expr = self._build_round_expr(col_expr, mfe.sql_name)
-                    else:
-                        # Fallback: use the raw column name
-                        col_expr = self.formula.get_covariate_expression(col_name, unit_col, 'year', boolean_cols)
-                        if col_expr == quote_identifier(col_name) or col_expr == col_name:
-                            col_expr = self.formula.get_fe_expression(col_name, boolean_cols)
-                        # Generate a SQL-safe name for fallback
-                        safe_name = _make_sql_safe_name(col_name)
-                        select_expr, group_expr = self._build_round_expr(col_expr, safe_name)
-            
-            select_parts.append(select_expr)
-            group_by_parts.append(group_expr)
-        
-        return select_parts, group_by_parts
+        Delegates to centralized sql_builders.build_strata_select_sql.
+        """
+        from ..core.sql_builders import build_strata_select_sql
+        return build_strata_select_sql(
+            self.formula,
+            self.strata_cols,
+            boolean_cols,
+            unit_col,
+            self.round_strata
+        )
 
     def collect_data(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Collect and demean data"""
-        # Use sql_name to find columns in the dataframe (they were aliased with sql_name)
-        outcome_sql_names = self.formula.get_outcome_sql_names()
-        pattern = f"mean_({'|'.join(outcome_sql_names)})"
-        y = data.filter(regex=pattern, axis=1).values
+        # Use explicit column names to avoid matching _sq columns with regex
+        y_cols = [f"sum_{var.sql_name}" for var in self.formula.outcomes]
+        y = data[y_cols].values
+        n = data["count"].values
+        
+        # Convert sum to mean for WLS (WLS will multiply by sqrt(n) internally)
+        y = y / n.reshape(-1, 1)
         
         # Use sql_names for covariates too
         covariate_sql_names = self.formula.get_covariate_sql_names()
         X = data[covariate_sql_names].values
-        n = data["count"].values
 
         y = y.reshape(-1, 1) if y.ndim == 1 else y
         X = X.reshape(-1, 1) if X.ndim == 1 else X

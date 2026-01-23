@@ -8,7 +8,7 @@ a focused set of related methods that can be composed as needed.
 import numpy as np
 import pandas as pd
 import logging
-from typing import List, Tuple, Optional, Set
+from typing import List, Tuple, Optional, Set, Dict, Any
 from tqdm import tqdm
 
 from ..fitters import wls
@@ -84,134 +84,13 @@ class BootstrapExecutor:
 
 
 # ============================================================================
-# Variance-Covariance Computation Mixin
-# ============================================================================
-
-class VCovMixin:
-    """Mixin providing variance-covariance computation methods.
-    
-    Requires the host class to have:
-    - self.point_estimate: np.ndarray
-    - self.n_obs: int
-    - self.se: str (will be set by this mixin)
-    """
-    
-    def compute_vcov_from_data(
-        self,
-        X: np.ndarray,
-        y: np.ndarray,
-        weights: np.ndarray,
-        cluster_ids: Optional[np.ndarray] = None,
-        se_type: str = "stata"
-    ) -> Tuple[np.ndarray, str, Optional[int]]:
-        """
-        Compute variance-covariance matrix.
-        
-        Args:
-            X: Design matrix
-            y: Response variable
-            weights: Frequency weights
-            cluster_ids: Optional cluster identifiers
-            se_type: SE type ("stata", "HC0", "HC1")
-        
-        Returns:
-            Tuple of (vcov matrix, se_type string, n_clusters or None)
-        """
-        theta = self.point_estimate.flatten()
-        n_obs = int(weights.sum())
-        n_features = X.shape[1]
-        
-        # Compute residuals
-        y_pred = X @ theta
-        residuals = y.flatten() - y_pred
-        
-        # Compute XtX inverse
-        sqrt_w = np.sqrt(weights).reshape(-1)
-        Xw = X * sqrt_w.reshape(-1, 1)
-        XtX = Xw.T @ Xw + 1e-8 * np.eye(n_features)
-        
-        try:
-            XtX_inv = np.linalg.inv(XtX)
-        except np.linalg.LinAlgError:
-            XtX_inv = np.linalg.pinv(XtX)
-        
-        if cluster_ids is not None:
-            vcov, n_clusters = self._compute_cluster_vcov(
-                X, residuals, weights, cluster_ids, XtX_inv, n_obs, n_features, se_type
-            )
-            return vcov, "cluster", n_clusters
-        else:
-            vcov = self._compute_robust_vcov(
-                X, residuals, weights, XtX_inv, n_obs, n_features, se_type
-            )
-            return vcov, se_type, None
-    
-    def _compute_cluster_vcov(
-        self,
-        X: np.ndarray,
-        residuals: np.ndarray,
-        weights: np.ndarray,
-        cluster_ids: np.ndarray,
-        XtX_inv: np.ndarray,
-        n_obs: int,
-        n_features: int,
-        se_type: str
-    ) -> Tuple[np.ndarray, int]:
-        """Compute cluster-robust variance-covariance matrix."""
-        unique_clusters = np.unique(cluster_ids)
-        n_clusters = len(unique_clusters)
-        
-        sqrt_w = np.sqrt(weights).reshape(-1)
-        n_k = n_features
-        
-        meat = np.zeros((n_k, n_k))
-        for cluster in unique_clusters:
-            mask = cluster_ids == cluster
-            X_g = X[mask] * sqrt_w[mask].reshape(-1, 1)
-            e_g = residuals[mask] * sqrt_w[mask]
-            score_g = (X_g * e_g.reshape(-1, 1)).sum(axis=0)
-            meat += np.outer(score_g, score_g)
-        
-        # Small sample correction
-        if se_type == "stata":
-            correction = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / (n_obs - n_k))
-        elif se_type == "HC0":
-            correction = 1.0
-        else:
-            correction = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / (n_obs - n_k))
-        
-        vcov = correction * XtX_inv @ meat @ XtX_inv
-        return 0.5 * (vcov + vcov.T), n_clusters
-    
-    def _compute_robust_vcov(
-        self,
-        X: np.ndarray,
-        residuals: np.ndarray,
-        weights: np.ndarray,
-        XtX_inv: np.ndarray,
-        n_obs: int,
-        n_features: int,
-        se_type: str
-    ) -> np.ndarray:
-        """Compute heteroskedasticity-robust variance-covariance matrix."""
-        sqrt_w = np.sqrt(weights).reshape(-1)
-        Xw = X * sqrt_w.reshape(-1, 1)
-        
-        # HC1 factor
-        hc1_factor = n_obs / max(1, n_obs - n_features)
-        resid_sq = (residuals * sqrt_w) ** 2
-        meat = (Xw.T * resid_sq) @ Xw * hc1_factor
-        
-        vcov = XtX_inv @ meat @ XtX_inv
-        return 0.5 * (vcov + vcov.T)
-
-
-# ============================================================================
 # SQL Builder Mixin
 # ============================================================================
 
 class SQLBuilderMixin:
     """Mixin providing SQL building utilities for DuckDB operations.
+    
+    Delegates to duckreg.core.sql_builders for actual query construction.
     
     Requires the host class to have:
     - self.conn: duckdb connection
@@ -241,22 +120,174 @@ class SQLBuilderMixin:
         )
 
     def _build_round_expr(self, expr: str, alias: str) -> Tuple[str, str]:
-        """Build expression with optional rounding for data compression."""
-        if hasattr(self, 'round_strata') and self.round_strata is not None:
-            round_expr = f"ROUND({expr}, {self.round_strata})"
-            return f"{round_expr} AS {alias}", round_expr
-        return f"{expr} AS {alias}", expr
+        """Build expression with optional rounding for data compression.
+        
+        Delegates to sql_builders.build_round_expr.
+        """
+        from ..core.sql_builders import build_round_expr
+        round_strata = getattr(self, 'round_strata', None)
+        return build_round_expr(expr, alias, round_strata)
 
     def _build_agg_columns(self, outcome_vars, boolean_cols: Set[str], unit_col: Optional[str]) -> List[str]:
-        """Build aggregation column expressions."""
-        agg_parts = ["COUNT(*) as count"]
-        for var in outcome_vars:
-            col_expr = var.get_sql_expression(unit_col, 'year')
-            from ..formula_parser import cast_if_boolean
-            col_expr = cast_if_boolean(col_expr, var.name, boolean_cols)
-            agg_parts.append(f"SUM({col_expr}) as sum_{var.sql_name}")
-            agg_parts.append(f"SUM(({col_expr}) * ({col_expr})) as sum_{var.sql_name}_sq")
-        return agg_parts
+        """Build aggregation column expressions.
+        
+        Delegates to sql_builders.build_agg_columns.
+        """
+        from ..core.sql_builders import build_agg_columns
+        return build_agg_columns(outcome_vars, boolean_cols, unit_col)
+    
+    # -------------------------------------------------------------------------
+    # Column List Builders for DuckDB Fitter
+    # -------------------------------------------------------------------------
+    
+    def build_x_cols_for_duckdb(
+        self, 
+        fe_method: str = "demean",
+        fe_cols: Optional[List[str]] = None,
+        is_iv: bool = False,
+        endogenous_vars: Optional[List[str]] = None
+    ) -> List[str]:
+        """Build X column names for DuckDB fitter.
+        
+        Args:
+            fe_method: Method for handling fixed effects ('demean' or 'mundlak')
+            fe_cols: List of fixed effect column names
+            is_iv: Whether this is IV/2SLS regression
+            endogenous_vars: List of endogenous variable display names (for IV)
+            
+        Returns:
+            List of SQL column names for X matrix
+        """
+        x_cols = []
+        
+        if not is_iv:
+            # Standard OLS case
+            for var in self.formula.covariates:
+                if not var.is_intercept():
+                    x_cols.append(var.sql_name)
+            
+            # Mundlak means if applicable
+            if fe_method == "mundlak" and fe_cols:
+                simple_covs = [var for var in self.formula.covariates if not var.is_intercept()]
+                for i in range(len(fe_cols)):
+                    for var in simple_covs:
+                        x_cols.append(f"avg_{var.sql_name}_fe{i}")
+        else:
+            # 2SLS case
+            endogenous_set = set(endogenous_vars or [])
+            
+            # Exogenous covariates
+            for var in self.formula.covariates:
+                if not var.is_intercept() and var.display_name not in endogenous_set:
+                    x_cols.append(var.sql_name)
+            
+            # Mundlak means for exogenous
+            if fe_method == "mundlak" and fe_cols:
+                for var in self.formula.covariates:
+                    if not var.is_intercept() and var.display_name not in endogenous_set:
+                        for i in range(len(fe_cols)):
+                            x_cols.append(f"avg_{var.sql_name}_fe{i}")
+                
+                # Mundlak means for fitted endogenous
+                for var in self.formula.endogenous:
+                    for i in range(len(fe_cols)):
+                        x_cols.append(f"avg_fitted_{var.sql_name}_fe{i}")
+            
+            # Fitted endogenous
+            for var in self.formula.endogenous:
+                x_cols.append(f"fitted_{var.sql_name}")
+        
+        return x_cols
+    
+    def build_z_cols_for_duckdb(
+        self,
+        fe_method: str = "demean",
+        fe_cols: Optional[List[str]] = None,
+        endogenous_vars: Optional[List[str]] = None
+    ) -> List[str]:
+        """Build instrument (Z) column names for first-stage DuckDB fitter.
+        
+        Args:
+            fe_method: Method for handling fixed effects
+            fe_cols: List of fixed effect column names
+            endogenous_vars: List of endogenous variable display names
+            
+        Returns:
+            List of SQL column names for Z matrix (exogenous + instruments + Mundlak means)
+        """
+        z_cols = []
+        endogenous_set = set(endogenous_vars or [])
+        
+        # Exogenous covariates
+        for var in self.formula.covariates:
+            if not var.is_intercept() and var.display_name not in endogenous_set:
+                z_cols.append(var.sql_name)
+        
+        # Instruments
+        for var in self.formula.instruments:
+            z_cols.append(var.sql_name)
+        
+        # Mundlak means if applicable
+        if fe_method == "mundlak" and fe_cols:
+            # Means of exogenous covariates
+            for var in self.formula.covariates:
+                if not var.is_intercept() and var.display_name not in endogenous_set:
+                    for i in range(len(fe_cols)):
+                        z_cols.append(f"avg_{var.sql_name}_fe{i}")
+            
+            # Means of instruments
+            for var in self.formula.instruments:
+                for i in range(len(fe_cols)):
+                    z_cols.append(f"avg_{var.sql_name}_fe{i}")
+        
+        return z_cols
+    
+    def build_residual_x_cols_for_duckdb(
+        self,
+        fe_method: str = "demean",
+        fe_cols: Optional[List[str]] = None,
+        endogenous_vars: Optional[List[str]] = None
+    ) -> List[str]:
+        """Build X column names using ACTUAL endogenous for residual computation (2SLS).
+        
+        This is critical for correct 2SLS standard errors: residuals must use
+        actual endogenous values, not fitted ones. The order matches
+        build_x_cols_for_duckdb so coefficients align correctly.
+        
+        Args:
+            fe_method: Method for handling fixed effects
+            fe_cols: List of fixed effect column names
+            endogenous_vars: List of endogenous variable display names
+            
+        Returns:
+            List of SQL column expressions for residual computation
+        """
+        actual_x_cols = []
+        endogenous_set = set(endogenous_vars or [])
+        
+        # Exogenous covariates (same as fitted)
+        for var in self.formula.covariates:
+            if not var.is_intercept() and var.display_name not in endogenous_set:
+                actual_x_cols.append(var.sql_name)
+        
+        # Mundlak means for exogenous (same as fitted)
+        if fe_method == "mundlak" and fe_cols:
+            for var in self.formula.covariates:
+                if not var.is_intercept() and var.display_name not in endogenous_set:
+                    for i in range(len(fe_cols)):
+                        actual_x_cols.append(f"avg_{var.sql_name}_fe{i}")
+            
+            # Mundlak means for fitted endogenous (keep fitted for consistency)
+            for var in self.formula.endogenous:
+                for i in range(len(fe_cols)):
+                    actual_x_cols.append(f"avg_fitted_{var.sql_name}_fe{i}")
+        
+        # ACTUAL endogenous (key difference: use actual, not fitted)
+        # For compressed data, these are sum columns divided by count
+        for var in self.formula.endogenous:
+            actual_x_cols.append(f"sum_{var.sql_name} / count")
+        
+        return actual_x_cols
 
 
 # ============================================================================

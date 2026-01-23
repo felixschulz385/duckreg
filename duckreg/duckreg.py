@@ -10,6 +10,8 @@ import duckdb
 import numpy as np
 import pandas as pd
 
+from .core.vcov import parse_vcov_specification, parse_cluster_vars, VcovTypeNotSupportedError
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,8 +21,10 @@ logger = logging.getLogger(__name__)
 
 class SEMethod:
     """Standard error computation methods"""
-    ANALYTICAL = "analytical"
-    BOOTSTRAP = "bootstrap"
+    IID = "iid"
+    HC1 = "HC1"
+    CRV1 = "CRV1"
+    BS = "BS"
     NONE = "none"
 
 
@@ -32,10 +36,20 @@ class FEMethod:
 
 
 # ============================================================================
+# File Format Configuration
+# ============================================================================
+
+_FILE_READERS = {
+    ".parquet": "read_parquet",
+    ".csv": "read_csv",
+    ".parquet.gz": "read_parquet",
+}
+
+
+# ============================================================================
 # Data Source Utilities
 # ============================================================================
 
-_FILE_READERS = {".csv": "read_csv", ".parquet": "read_parquet"}
 
 
 def _resolve_table_name(data_path: Path) -> str:
@@ -83,7 +97,7 @@ def compressed_ols(
     duckdb_kwargs: dict = None,
     db_name: str = None,
     n_jobs: int = 1,
-    se_method: str = SEMethod.ANALYTICAL,
+    se_method: str = SEMethod.HC1,
     fitter: str = "numpy",
     **kwargs
 ) -> "DuckEstimator":
@@ -93,7 +107,7 @@ def compressed_ols(
         formula: Regression formula in format "y ~ x1 + x2 | fe1 + fe2 | endog (inst1 + inst2) | cluster"
         data: Filepath to data file (.csv, .parquet, or directory of .parquet files)
         subset: SQL WHERE clause to subset data
-        n_bootstraps: Number of bootstrap iterations (only used if se_method="bootstrap")
+        n_bootstraps: Number of bootstrap iterations (only used if se_method="BS")
         cache_dir: Directory for DuckDB cache files
         round_strata: Number of decimals to round strata columns
         seed: Random seed for reproducibility
@@ -101,7 +115,7 @@ def compressed_ols(
         duckdb_kwargs: Dictionary of DuckDB configuration settings
         db_name: Full path to DuckDB database file
         n_jobs: Number of parallel jobs for bootstrap
-        se_method: Method for computing standard errors ('analytical', 'bootstrap', or 'none')
+        se_method: Method for computing standard errors ('iid', 'HC1', 'CRV1', 'BS', or 'none')
         fitter: Estimation method ('numpy' for in-memory, 'duckdb' for out-of-core)
         **kwargs: Additional arguments passed to estimator
     
@@ -138,7 +152,7 @@ def compressed_ols(
             table_name=table_name,
             formula=parsed_formula,
             subset=subset,
-            n_bootstraps=n_bootstraps if se_method == SEMethod.BOOTSTRAP else 0,
+            n_bootstraps=n_bootstraps if se_method == SEMethod.BS else 0,
             round_strata=round_strata,
             seed=seed,
             duckdb_kwargs=duckdb_kwargs,
@@ -158,7 +172,7 @@ def compressed_ols(
             table_name=table_name,
             formula=parsed_formula,
             subset=subset,
-            n_bootstraps=n_bootstraps if se_method == SEMethod.BOOTSTRAP else 0,
+            n_bootstraps=n_bootstraps if se_method == SEMethod.BS else 0,
             round_strata=round_strata,
             seed=seed,
             duckdb_kwargs=duckdb_kwargs,
@@ -229,7 +243,7 @@ class DuckEstimator(ABC):
             for key, value in config.items():
                 self.conn.execute(f"SET {key} = '{value}'")
 
-    def fit(self, se_method: str = SEMethod.ANALYTICAL):
+    def fit(self, se_method: str = SEMethod.IID):
         """Main fitting method - orchestrates the estimation pipeline.
         
         Subclasses should not override this; override the individual steps instead.
@@ -256,14 +270,14 @@ class DuckEstimator(ABC):
 
     def _compute_standard_errors(self, se_method: str):
         """Dispatch standard error computation based on method"""
-        if se_method == SEMethod.BOOTSTRAP:
+        if se_method == SEMethod.BS:
             if self.n_bootstraps > 0:
                 logger.debug("Computing bootstrap standard errors")
                 self.vcov = self.bootstrap()
                 self.se = "bootstrap"
-        elif se_method == SEMethod.ANALYTICAL:
-            logger.debug("Computing analytical standard errors")
-            self.fit_vcov()
+        elif se_method in (SEMethod.IID, SEMethod.HC1, SEMethod.CRV1):
+            logger.debug(f"Computing {se_method} standard errors")
+            self.fit_vcov(se_method=se_method)
         elif se_method == SEMethod.NONE:
             logger.debug("Skipping standard error computation")
         else:
@@ -302,8 +316,8 @@ class DuckEstimator(ABC):
         pass
 
     @abstractmethod
-    def fit_vcov(self):
-        """Compute variance-covariance matrix analytically."""
+    def fit_vcov(self, se_method: str = SEMethod.HC1):
+        """Compute variance-covariance matrix."""
         pass
 
     @abstractmethod

@@ -13,7 +13,6 @@ from .results import RegressionResults, FirstStageResults, ModelSummary
 
 # Mixins for composition
 from .mixins import (
-    VCovMixin,
     SQLBuilderMixin,
     MundlakMixin,
     BootstrapExecutor,
@@ -45,7 +44,6 @@ __all__ = [
     'FirstStageResults',
     'ModelSummary',
     # Mixins
-    'VCovMixin',
     'SQLBuilderMixin',
     'MundlakMixin',
     'BootstrapExecutor',

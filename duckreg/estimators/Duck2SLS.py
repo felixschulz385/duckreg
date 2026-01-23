@@ -8,7 +8,22 @@ Key Design Principles:
 1. Self-contained: Does not delegate to sub-estimators to avoid state conflicts
 2. Direct computation: Builds design matrices directly in Python/numpy or SQL
 3. Correct SEs: Uses actual endogenous values for residual computation
-4. Mundlak device: Handles FEs by including group means as regressors
+4. IV-adjusted sandwich: Applies proper IV correction to the meat matrix
+5. Mundlak device: Handles FEs by including group means as regressors
+
+Standard Error Computation:
+    The second-stage standard errors use the IV-adjusted sandwich estimator:
+    
+    V = Bread @ Meat_IV @ Bread
+    
+    where:
+        Bread = (X'P_Z X)^{-1}  (inverse Hessian)
+        Meat_IV = (X'Z)(Z'Z)^{-1} Omega (Z'Z)^{-1} (Z'X)  (IV-adjusted meat)
+        Omega = X' diag(e²w) X  (inner meat from scores using actual X)
+        Z = instrument matrix (intercept + exogenous + instruments + FE means)
+    
+    This ensures correct inference for instrumental variable estimation, accounting
+    for the first-stage prediction uncertainty through the instrument projection.
 
 Out-of-Core Processing:
     When using fitter='duckdb', all computations are done in SQL without loading
@@ -29,6 +44,7 @@ from ..duckreg import DuckEstimator
 # Import from refactored modules - following DRY principle
 from .results import RegressionResults, FirstStageResults
 from .mixins import MundlakMixin, SQLBuilderMixin
+from .name_utils import build_coef_name_lists, build_first_stage_coef_names
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +136,7 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
         self._y: Optional[np.ndarray] = None
         self._X_fitted: Optional[np.ndarray] = None
         self._X_actual: Optional[np.ndarray] = None
+        self._Z: Optional[np.ndarray] = None  # Instrument matrix for IV SE correction
         self._weights: Optional[np.ndarray] = None
         self._cluster_ids: Optional[np.ndarray] = None
         
@@ -189,14 +206,24 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
         return self._estimate_numpy()
     
     def _estimate_numpy(self) -> np.ndarray:
-        """Estimate using in-memory numpy WLS"""
+        """Estimate using in-memory numpy WLS with NumpyFitter"""
         if self._X_fitted is None:
             raise ValueError("Must call compress_data() before estimate()")
-        return wls(self._X_fitted, self._y, self._weights)
+        
+        fitter = NumpyFitter(alpha=1e-8, se_type="stata")
+        result = fitter.fit(
+            X=self._X_fitted,
+            y=self._y,
+            weights=self._weights,
+            coef_names=self.coef_names_
+        )
+        
+        return result.coefficients
     
     def _estimate_duckdb(self) -> np.ndarray:
         """Estimate using DuckDB sufficient statistics (out-of-core)"""
         x_cols = self._get_x_cols_for_duckdb()
+        residual_x_cols = self._get_actual_x_cols_for_duckdb()
         y_col = self._get_y_col_for_duckdb()
         
         duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type="stata")
@@ -207,68 +234,92 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
             weight_col="count",
             add_intercept=True,
             cluster_col=self.cluster_col if self.cluster_col else None,
-            compute_vcov=False  # Will compute separately with actual residuals
+            residual_x_cols=residual_x_cols
         )
         
         self.coef_names_ = self._build_coef_names_for_duckdb()
         self._coef_sql_names = self._build_coef_sql_names_for_duckdb()
         return self._fitter_result.coefficients
     
-    def fit_vcov(self):
-        """Compute vcov with correct 2SLS formula using actual residuals"""
+    def fit_vcov(self, se_method: str = "HC1"):
+        """Compute vcov with correct 2SLS formula using actual residuals.
+        
+        Args:
+            se_method: Type of standard errors ('iid', 'HC1', 'CRV1')
+        """
         if self.fitter == "duckdb":
-            self._fit_vcov_duckdb()
+            self._fit_vcov_duckdb(se_method=se_method)
         else:
-            self._fit_vcov_numpy()
+            self._fit_vcov_numpy(se_method=se_method)
     
-    def _fit_vcov_numpy(self):
-        """Compute vcov using numpy (in-memory)"""
-        if self._X_actual is None or self._X_fitted is None:
+    def _fit_vcov_numpy(self, se_method: str = "HC1"):
+        """Compute vcov using numpy (in-memory) with 2SLS-specific logic.
+        
+        For IV/2SLS, we need:
+        1. Bread matrix (X_fitted' X_fitted)^{-1}
+        2. Residuals from actual endogenous: e = y - X_actual @ β
+        3. IV cross-products using X_fitted and Z
+        4. Scores using Z and residuals: scores = Z * e
+        """
+        if self._X_actual is None or self._X_fitted is None or self._Z is None:
             raise ValueError("Must call compress_data() before fit_vcov()")
         
-        coefs = self.point_estimate.flatten()
+        # Use NumpyFitter with 2SLS-specific parameters:
+        # - X = X_fitted (for bread matrix and IV cross-products)
+        # - residual_X = X_actual (for residual computation)
+        # - Z = instruments (for IV correction)
+        fitter = NumpyFitter(alpha=1e-8, se_type=se_method)
         
-        # Residuals using ACTUAL endogenous: e = y - X_actual * β
-        residuals = self._y.flatten() - self._X_actual @ coefs
-        
-        if self._cluster_ids is not None:
-            vcov, n_clusters = self._compute_cluster_robust_vcov(
-                self._X_fitted, residuals, self._weights, self._cluster_ids
-            )
-            self.se = "cluster"
-            self._n_clusters = n_clusters
-        else:
-            vcov = self._compute_hc1_vcov(self._X_fitted, residuals, self._weights)
-            self.se = "HC1"
-            self._n_clusters = None
+        vcov, vcov_meta, _ = fitter.fit_vcov(
+            X=self._X_fitted,
+            y=self._y,
+            weights=self._weights,
+            coefficients=self.point_estimate,
+            cluster_ids=self._cluster_ids,
+            vcov_type=se_method if se_method != "CRV1" else "HC1",
+            Z=self._Z,
+            is_iv=True,
+            residual_X=self._X_actual  # Use actual endogenous for residuals
+        )
         
         self.vcov = vcov
+        self.se = vcov_meta['vcov_type_detail']
+        self._n_clusters = vcov_meta.get('n_clusters')
         self._results = None
     
-    def _fit_vcov_duckdb(self):
-        """Compute vcov using DuckDB with pre-computed residuals (out-of-core)"""
-        # First add residual column to the view using actual endogenous
-        self._add_actual_residuals_column()
+    def _fit_vcov_duckdb(self, se_method: str = "HC1"):
+        """Compute vcov using DuckDB with unified vcov helpers"""
+        if self._fitter_result is not None and self._fitter_result.vcov is not None:
+            self.vcov = self._fitter_result.vcov
+            self.se = self._fitter_result.se_type
+            self._n_clusters = self._fitter_result.n_clusters
+            self._results = None
+            return
         
+        # Compute using fitter
         x_cols = self._get_x_cols_for_duckdb()
+        residual_x_cols = self._get_actual_x_cols_for_duckdb()
         y_col = self._get_y_col_for_duckdb()
+        z_cols = self._get_z_cols_for_duckdb()
         
-        duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type="stata")
-        result = duckdb_fitter.fit(
+        duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type=se_method)
+        vcov, vcov_meta, _ = duckdb_fitter.fit_vcov(
             table_name=self._COMPRESSED_VIEW,
             x_cols=x_cols,
             y_col=y_col,
             weight_col="count",
             add_intercept=True,
+            coefficients=self.point_estimate,
             cluster_col=self.cluster_col if self.cluster_col else None,
-            compute_vcov=True,
-            coefficients=self.point_estimate,  # Use existing coefficients
-            residual_col="residual_actual"  # Use actual residuals for 2SLS correction
+            vcov_type=se_method if se_method != "CRV1" else "HC1",
+            residual_x_cols=residual_x_cols,
+            z_cols=z_cols,
+            is_iv=True
         )
         
-        self.vcov = result.vcov
-        self.se = result.se_type
-        self._n_clusters = result.n_clusters
+        self.vcov = vcov
+        self.se = vcov_meta['vcov_type_detail']
+        self._n_clusters = vcov_meta.get('n_clusters')
         self._results = None
     
     def bootstrap(self) -> np.ndarray:
@@ -362,6 +413,8 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
         This computes FE-level averages of covariates and instruments
         and adds them as columns, allowing DuckDB fitter to work out-of-core.
         """
+        from ..core.sql_builders import build_add_mundlak_means_sql
+        
         # Get columns to compute means for
         mean_cols = []
         for var in self.formula.covariates:
@@ -379,35 +432,22 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
             mfe = self.formula.get_merged_fe_by_name(fe_col_name)
             fe_sql_name = fe_var.sql_name if fe_var else (mfe.sql_name if mfe else fe_col_name)
             
-            # Build avg column expressions
-            avg_select_parts = []
-            avg_col_aliases = []
-            for col in mean_cols:
-                avg_alias = f"avg_{col}_fe{i}"
-                avg_select_parts.append(f"AVG({col}) AS {avg_alias}")
-                avg_col_aliases.append(f"fe_means.{avg_alias}")
-            
-            avg_cols_sql = ", ".join(avg_select_parts)
-            join_cols_sql = ", ".join(avg_col_aliases)
-            
-            self.conn.execute(f"""
-            CREATE OR REPLACE TABLE {self._DATA_TABLE} AS
-            SELECT t.*, {join_cols_sql}
-            FROM {self._DATA_TABLE} t
-            JOIN (
-                SELECT {fe_sql_name}, {avg_cols_sql} 
-                FROM {self._DATA_TABLE} 
-                GROUP BY {fe_sql_name}
-            ) fe_means ON t.{fe_sql_name} = fe_means.{fe_sql_name}
-            """)
+            # Use centralized SQL builder
+            sql = build_add_mundlak_means_sql(
+                table_name=self._DATA_TABLE,
+                var_sql_names=mean_cols,
+                fe_col_sql_name=fe_sql_name,
+                fe_index=i
+            )
+            self.conn.execute(sql)
         
         logger.debug(f"Added Mundlak mean columns for {len(self.fe_cols)} FEs")
     
     def _create_second_stage_view(self):
         """Create compressed view for second stage estimation (DuckDB fitter).
         
-        Groups by fitted endogenous + exogenous + Mundlak means and
-        aggregates outcome for efficient sufficient statistics computation.
+        Groups by fitted endogenous + exogenous + instruments + Mundlak means and
+        aggregates outcome AND actual endogenous for residual computation.
         """
         # Build the compression query
         outcome_var = self.formula.outcomes[0]
@@ -423,12 +463,17 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
                 group_cols.append(var.sql_name)
                 select_cols.append(var.sql_name)
         
-        # Fitted endogenous (group by fitted, aggregate actual)
+        # Instruments (needed for IV vcov computation)
+        for var in self.formula.instruments:
+            group_cols.append(var.sql_name)
+            select_cols.append(var.sql_name)
+        
+        # Fitted endogenous (group by fitted)
         for var in self.formula.endogenous:
             fitted_col = f"fitted_{var.sql_name}"
             group_cols.append(fitted_col)
             select_cols.append(fitted_col)
-            # Aggregate actual endogenous for residual computation
+            # Aggregate ACTUAL endogenous for residual computation (key for 2SLS)
             agg_cols.append(f"SUM({var.sql_name}) as sum_{var.sql_name}")
         
         # Mundlak means
@@ -439,6 +484,7 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
                         col = f"avg_{var.sql_name}_fe{i}"
                         group_cols.append(col)
                         select_cols.append(col)
+            # Mundlak means for instruments
             for var in self.formula.instruments:
                 for i in range(len(self.fe_cols)):
                     col = f"avg_{var.sql_name}_fe{i}"
@@ -464,9 +510,10 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
         group_by_sql = ", ".join(group_cols) if group_cols else "1"
         select_sql = ", ".join(select_cols) if select_cols else "1 AS dummy"
         
-        # Add outcome aggregation
+        # Add outcome aggregation (including sum_y_sq for exact variance computation)
         agg_cols.append("COUNT(*) as count")
         agg_cols.append(f"SUM({outcome_var.sql_name}) as sum_{outcome_var.sql_name}")
+        agg_cols.append(f"SUM(({outcome_var.sql_name}) * ({outcome_var.sql_name})) as sum_{outcome_var.sql_name}_sq")
         agg_sql = ", ".join(agg_cols)
         
         self.conn.execute(f"""
@@ -489,109 +536,35 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
     
     def _add_fitted_mundlak_means_sql(self):
         """Add Mundlak means for fitted endogenous variables"""
+        from ..core.sql_builders import build_add_fitted_mundlak_means_sql
+        
+        if not self.formula.endogenous:
+            return
+        
+        fitted_var_sql_names = [var.sql_name for var in self.formula.endogenous]
+        
         for i, fe_col_name in enumerate(self.fe_cols):
             fe_var = self.formula.get_fe_by_name(fe_col_name)
             mfe = self.formula.get_merged_fe_by_name(fe_col_name)
             fe_sql_name = fe_var.sql_name if fe_var else (mfe.sql_name if mfe else fe_col_name)
             
-            avg_select_parts = []
-            avg_col_aliases = []
-            
-            for var in self.formula.endogenous:
-                fitted_col = f"fitted_{var.sql_name}"
-                avg_alias = f"avg_{fitted_col}_fe{i}"
-                avg_select_parts.append(f"AVG({fitted_col}) AS {avg_alias}")
-                avg_col_aliases.append(f"fe_means.{avg_alias}")
-            
-            if not avg_select_parts:
-                continue
-            
-            avg_cols_sql = ", ".join(avg_select_parts)
-            join_cols_sql = ", ".join(avg_col_aliases)
-            
-            self.conn.execute(f"""
-            CREATE OR REPLACE TABLE {self._DATA_TABLE} AS
-            SELECT t.*, {join_cols_sql}
-            FROM {self._DATA_TABLE} t
-            JOIN (
-                SELECT {fe_sql_name}, {avg_cols_sql} 
-                FROM {self._DATA_TABLE} 
-                GROUP BY {fe_sql_name}
-            ) fe_means ON t.{fe_sql_name} = fe_means.{fe_sql_name}
-            """)
-    
-    def _add_actual_residuals_column(self):
-        """Add residuals computed using actual endogenous to compressed view.
-        
-        For 2SLS, the residuals for vcov must use actual endogenous values:
-        e = y - X_actual * β
-        
-        Since the data is compressed, we use mean values:
-        e = (sum_y / count) - (sum of coef * variable values)
-        """
-        coefs = self.point_estimate.flatten()
-        sql_names = self._coef_sql_names
-        
-        # Build the predicted value expression using SQL names
-        pred_parts = []
-        for sql_name, coef in zip(sql_names, coefs):
-            if sql_name == 'Intercept':
-                pred_parts.append(f"{coef}")
-            elif sql_name in [v.sql_name for v in self.formula.endogenous]:
-                # Use actual endogenous (aggregated as sum), not fitted
-                pred_parts.append(f"({coef} * (sum_{sql_name} / count))")
-            elif sql_name.startswith('avg_fitted_') and '_fe' in sql_name:
-                # Mundlak mean of fitted - skip for residual computation
-                # These are absorbed by FE and have small impact on residuals
-                continue
-            else:
-                # Exogenous covariate or Mundlak mean - use SQL name directly
-                pred_parts.append(f"({coef} * {quote_identifier(sql_name)})")
-        
-        pred_expr = " + ".join(pred_parts) if pred_parts else "0"
-        outcome_var = self.formula.outcomes[0]
-        
-        # Materialize to temp table to avoid recursive view definition
-        temp_table = f"{self._COMPRESSED_VIEW}_temp"
-        self.conn.execute(f"DROP TABLE IF EXISTS {temp_table}")
-        self.conn.execute(f"CREATE TEMP TABLE {temp_table} AS SELECT * FROM {self._COMPRESSED_VIEW}")
-        
-        # Recreate view with residual column from temp table
-        self.conn.execute(f"""
-        CREATE OR REPLACE VIEW {self._COMPRESSED_VIEW} AS
-        SELECT *,
-               (sum_{outcome_var.sql_name} / count) - ({pred_expr}) AS residual_actual
-        FROM {temp_table}
-        """)
+            # Use centralized SQL builder
+            sql = build_add_fitted_mundlak_means_sql(
+                table_name=self._DATA_TABLE,
+                fitted_var_sql_names=fitted_var_sql_names,
+                fe_col_sql_name=fe_sql_name,
+                fe_index=i
+            )
+            self.conn.execute(sql)
     
     def _get_x_cols_for_duckdb(self) -> List[str]:
         """Get x column names for second stage DuckDB fitter"""
-        x_cols = []
-        
-        # Exogenous covariates
-        for var in self.formula.covariates:
-            if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                x_cols.append(var.sql_name)
-        
-        # Mundlak means for exogenous
-        if self.fe_cols and self.fe_method == "mundlak":
-            for var in self.formula.covariates:
-                if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                    for i in range(len(self.fe_cols)):
-                        x_cols.append(f"avg_{var.sql_name}_fe{i}")
-            for var in self.formula.instruments:
-                for i in range(len(self.fe_cols)):
-                    x_cols.append(f"avg_{var.sql_name}_fe{i}")
-            # Mundlak means for fitted endogenous
-            for var in self.formula.endogenous:
-                for i in range(len(self.fe_cols)):
-                    x_cols.append(f"avg_fitted_{var.sql_name}_fe{i}")
-        
-        # Fitted endogenous
-        for var in self.formula.endogenous:
-            x_cols.append(f"fitted_{var.sql_name}")
-        
-        return x_cols
+        return self.build_x_cols_for_duckdb(
+            fe_method=self.fe_method,
+            fe_cols=self.fe_cols,
+            is_iv=True,
+            endogenous_vars=self.endogenous_vars
+        )
     
     def _get_y_col_for_duckdb(self) -> str:
         """Get y column name for second stage DuckDB fitter"""
@@ -600,60 +573,46 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
     
     def _build_coef_names_for_duckdb(self) -> List[str]:
         """Build coefficient names for DuckDB fitter results"""
-        coef_names = ['Intercept']
-        
-        # Exogenous covariates
-        for var in self.formula.covariates:
-            if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                coef_names.append(var.display_name)
-        
-        # Mundlak means for exogenous
-        if self.fe_cols and self.fe_method == "mundlak":
-            for var in self.formula.covariates:
-                if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                    for i in range(len(self.fe_cols)):
-                        coef_names.append(f"avg_{var.display_name}_fe{i}")
-            for var in self.formula.instruments:
-                for i in range(len(self.fe_cols)):
-                    coef_names.append(f"avg_{var.display_name}_fe{i}")
-            # Mundlak means for fitted endogenous
-            for var in self.formula.endogenous:
-                for i in range(len(self.fe_cols)):
-                    coef_names.append(f"avg_{var.display_name}_fe{i}")
-        
-        # Endogenous
-        for var in self.formula.endogenous:
-            coef_names.append(var.display_name)
-        
-        return coef_names
+        display_names, _ = build_coef_name_lists(
+            formula=self.formula,
+            fe_method=self.fe_method,
+            include_intercept=True,
+            fe_cols=self.fe_cols,
+            is_iv=True,
+            endogenous_vars=self.endogenous_vars
+        )
+        return display_names
     
     def _build_coef_sql_names_for_duckdb(self) -> List[str]:
         """Build SQL-safe coefficient names parallel to coef_names_"""
-        coef_sql_names = ['Intercept']
+        _, sql_names = build_coef_name_lists(
+            formula=self.formula,
+            fe_method=self.fe_method,
+            include_intercept=True,
+            fe_cols=self.fe_cols,
+            is_iv=True,
+            endogenous_vars=self.endogenous_vars
+        )
+        return sql_names
+    
+    def _get_actual_x_cols_for_duckdb(self) -> List[str]:
+        """Get x column names using ACTUAL endogenous (not fitted) for residual computation.
         
-        # Exogenous covariates
-        for var in self.formula.covariates:
-            if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                coef_sql_names.append(var.sql_name)
+        This is the key difference for 2SLS: residuals should use actual endogenous values,
+        not fitted ones. The order must match _get_x_cols_for_duckdb() so coefficients
+        align correctly when computing residuals.
         
-        # Mundlak means
-        if self.fe_cols and self.fe_method == "mundlak":
-            for var in self.formula.covariates:
-                if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                    for i in range(len(self.fe_cols)):
-                        coef_sql_names.append(f"avg_{var.sql_name}_fe{i}")
-            for var in self.formula.instruments:
-                for i in range(len(self.fe_cols)):
-                    coef_sql_names.append(f"avg_{var.sql_name}_fe{i}")
-            for var in self.formula.endogenous:
-                for i in range(len(self.fe_cols)):
-                    coef_sql_names.append(f"avg_fitted_{var.sql_name}_fe{i}")
+        For compressed data where actual values are aggregated as sum_{var.sql_name},
+        the DuckDBFitter will automatically divide by count when computing residuals.
         
-        # Endogenous
-        for var in self.formula.endogenous:
-            coef_sql_names.append(var.sql_name)
-        
-        return coef_sql_names
+        Returns:
+            List of column names in same order as x_cols, but with actual endogenous
+        """
+        return self.build_residual_x_cols_for_duckdb(
+            fe_method=self.fe_method,
+            fe_cols=self.fe_cols,
+            endogenous_vars=self.endogenous_vars
+        )
 
     # =========================================================================
     # First Stage
@@ -690,16 +649,23 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
         result = fitter.fit(
             X=X_fs, y=y_fs, weights=weights,
             coef_names=coef_names_fs,
+            cluster_ids=cluster_ids
+        )
+        
+        # Compute vcov separately
+        vcov, vcov_meta, _ = fitter.fit_vcov(
+            X=X_fs, y=y_fs, weights=weights,
+            coefficients=result.coefficients,
             cluster_ids=cluster_ids,
-            compute_vcov=True
+            existing_result=result
         )
         
         reg_results = RegressionResults(
             coefficients=coefs,
             coef_names=coef_names_fs,
-            vcov=result.vcov,
+            vcov=vcov,
             n_obs=len(df),
-            se_type=result.se_type,
+            se_type=vcov_meta.get('vcov_type_detail', 'HC1'),
         )
         
         return FirstStageResults(
@@ -720,10 +686,11 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
         x_cols = self._get_first_stage_x_cols()
         y_col = endog_var_obj.sql_name
         
-        # Create first stage view (no compression, weight=1)
+        # Create first stage view (uncompressed data, need to add sum_y_sq column)
+        # For uncompressed data: sum_y_sq = y * y (each row is one observation)
         self.conn.execute(f"""
         CREATE OR REPLACE VIEW first_stage_view AS
-        SELECT *, 1 as count
+        SELECT *, 1 as count, ({y_col}) * ({y_col}) AS {y_col}_sq
         FROM {self._DATA_TABLE}
         WHERE {y_col} IS NOT NULL
         """)
@@ -735,8 +702,19 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
             y_col=y_col,
             weight_col="count",
             add_intercept=True,
+            cluster_col=self.cluster_col if self.cluster_col else None
+        )
+        
+        # Compute vcov separately
+        vcov, vcov_meta, _ = duckdb_fitter.fit_vcov(
+            table_name="first_stage_view",
+            x_cols=x_cols,
+            y_col=y_col,
+            weight_col="count",
+            add_intercept=True,
             cluster_col=self.cluster_col if self.cluster_col else None,
-            compute_vcov=True
+            coefficients=result.coefficients,
+            existing_result=result
         )
         
         coef_names_fs = self._build_first_stage_coef_names()
@@ -744,9 +722,9 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
         reg_results = RegressionResults(
             coefficients=result.coefficients,
             coef_names=coef_names_fs,
-            vcov=result.vcov,
+            vcov=vcov,
             n_obs=result.n_obs,
-            se_type=result.se_type,
+            se_type=vcov_meta.get('vcov_type_detail', 'HC1'),
         )
         
         return FirstStageResults(
@@ -757,29 +735,20 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
     
     def _get_first_stage_x_cols(self) -> List[str]:
         """Get x column names for first stage regression"""
-        x_cols = []
-        
-        # Exogenous covariates
-        for var in self.formula.covariates:
-            if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                x_cols.append(var.sql_name)
-        
-        # Instruments
-        for var in self.formula.instruments:
-            x_cols.append(var.sql_name)
-        
-        # Mundlak means (if added to table)
-        if self.fe_cols and self.fe_method == "mundlak":
-            for var in self.formula.covariates:
-                if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                    for i in range(len(self.fe_cols)):
-                        x_cols.append(f"avg_{var.sql_name}_fe{i}")
-            for var in self.formula.instruments:
-                for i in range(len(self.fe_cols)):
-                    x_cols.append(f"avg_{var.sql_name}_fe{i}")
-        
-        return x_cols
+        return self.build_z_cols_for_duckdb(
+            fe_method=self.fe_method,
+            fe_cols=self.fe_cols,
+            endogenous_vars=self.endogenous_vars
+        )
     
+    def _build_first_stage_coef_names(self) -> List[str]:
+        """Build coefficient names for first stage using centralized utility"""
+        return build_first_stage_coef_names(
+            formula=self.formula,
+            fe_method=self.fe_method,
+            fe_cols=self.fe_cols
+        )
+        
     def _build_first_stage_coef_names(self) -> List[str]:
         """Build coefficient names for first stage"""
         coef_names = ['Intercept']
@@ -887,7 +856,7 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
                     if sql_col_name and sql_col_name in available_cols:
                         expr_parts.append(f"({coef} * {quote_identifier(sql_col_name)})")
             else:
-                sql_name = self._display_to_sql_name(name)
+                sql_name = self.formula.get_sql_name_for_display(name)
                 if sql_name and sql_name in available_cols:
                     expr_parts.append(f"({coef} * {quote_identifier(sql_name)})")
         
@@ -901,19 +870,6 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
         """)
         
         logger.debug(f"Added fitted values column: {fitted_col}")
-    
-    def _display_to_sql_name(self, display_name: str) -> Optional[str]:
-        """Map display name to sql_name"""
-        for var in self.formula.covariates:
-            if var.display_name == display_name:
-                return var.sql_name
-        for var in self.formula.instruments:
-            if var.display_name == display_name:
-                return var.sql_name
-        for var in self.formula.endogenous:
-            if var.display_name == display_name:
-                return var.sql_name
-        return None
 
     # =========================================================================
     # Second Stage Design Matrices
@@ -923,7 +879,7 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
         """Build design matrices for second stage estimation"""
         df = self._fetch_second_stage_data()
         
-        # Outcome
+        # Outcome (raw values, not aggregated - Duck2SLS uses uncompressed data)
         outcome_var = self.formula.outcomes[0]
         self._y = df[outcome_var.sql_name].values.reshape(-1, 1)
         
@@ -936,8 +892,12 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
         self._X_fitted = np.hstack([X_common, X_endog_fitted])
         self._X_actual = np.hstack([X_common, X_endog_actual])
         
+        # Build instrument matrix Z (exogenous + instruments + Mundlak means)
+        self._Z = self._build_instrument_matrix(df)
+        
         self.coef_names_ = coef_names + endog_names
         self._coef_sql_names = coef_names_sql + endog_names_sql
+        # Unit weights for uncompressed data
         self._weights = np.ones(len(df))
         
         if self.cluster_col and self.cluster_col in df.columns:
@@ -948,6 +908,37 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
     def _fetch_second_stage_data(self) -> pd.DataFrame:
         """Fetch data for second stage"""
         return self.conn.execute(f"SELECT * FROM {self._DATA_TABLE}").fetchdf().dropna()
+    
+    def _build_endogenous_X(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
+        """Build endogenous part of design matrix (both fitted and actual).
+        
+        Returns:
+            Tuple of (X_fitted array, X_actual array, display names, SQL names)
+        """
+        X_fitted_parts = []
+        X_actual_parts = []
+        endog_names = []
+        endog_sql_names = []
+        
+        for var in self.formula.endogenous:
+            fitted_col = f"fitted_{var.sql_name}"
+            actual_col = var.sql_name
+            
+            if fitted_col in df.columns and actual_col in df.columns:
+                X_fitted_parts.append(df[fitted_col].values.reshape(-1, 1))
+                X_actual_parts.append(df[actual_col].values.reshape(-1, 1))
+                endog_names.append(var.display_name)
+                endog_sql_names.append(var.sql_name)
+            else:
+                logger.warning(f"Missing fitted or actual column for {var.display_name}")
+        
+        if X_fitted_parts:
+            return (np.hstack(X_fitted_parts), np.hstack(X_actual_parts), 
+                    endog_names, endog_sql_names)
+        
+        # Return empty arrays if no endogenous variables found
+        n_rows = len(df)
+        return (np.zeros((n_rows, 0)), np.zeros((n_rows, 0)), [], [])
     
     def _build_common_X(self, df: pd.DataFrame) -> Tuple[np.ndarray, List[str], List[str]]:
         """Build exogenous part of design matrix
@@ -982,6 +973,7 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
             coef_sql_names.extend(exog_sql_names)
         
         # Mundlak means - uses MundlakMixin.compute_mundlak_means
+        # NOTE: Only includes covariates and fitted endogenous, NOT instruments
         if self.fe_cols and self.fe_method == "mundlak":
             # Get fitted endogenous column names
             fitted_cols = []
@@ -990,6 +982,7 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
                 if fc in df.columns:
                     fitted_cols.append(fc)
             
+            # Only group means of exogenous covariates and fitted endogenous (no instruments)
             all_cov_cols = exog_cols + fitted_cols
             if all_cov_cols:
                 X_mundlak, names_mundlak = self.compute_mundlak_means(df, all_cov_cols)
@@ -1003,88 +996,85 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
             return np.hstack(X_parts), coef_names, coef_sql_names
         return np.ones((len(df), 1)), ['Intercept'], ['Intercept']
     
-    def _build_endogenous_X(
-        self, df: pd.DataFrame
-    ) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
-        """Build endogenous part of design matrices (fitted and actual)
+    def _build_instrument_matrix(self, df: pd.DataFrame) -> np.ndarray:
+        """Build instrument matrix Z for IV standard error correction.
         
-        Returns:
-            Tuple of (X_fitted, X_actual, display names, SQL names)
+        Z consists of:
+        1. Intercept
+        2. Exogenous covariates
+        3. Instruments
+        4. Mundlak means (if applicable)
         """
-        X_fitted_parts = []
-        X_actual_parts = []
-        names = []
-        sql_names = []
+        Z_parts = []
         
-        for var in self.formula.endogenous:
-            fitted_col = f"fitted_{var.sql_name}"
+        # Intercept
+        Z_parts.append(np.ones((len(df), 1)))
+        
+        # Exogenous covariates
+        for var in self.formula.covariates:
+            if not var.is_intercept() and var.display_name not in self.endogenous_vars:
+                if var.sql_name in df.columns:
+                    Z_parts.append(df[var.sql_name].values.reshape(-1, 1))
+        
+        # Instruments
+        for var in self.formula.instruments:
+            if var.sql_name in df.columns:
+                Z_parts.append(df[var.sql_name].values.reshape(-1, 1))
+        
+        # Mundlak means (if added)
+        if self.fe_cols and self.fe_method == "mundlak":
+            # Exogenous variable means
+            for var in self.formula.covariates:
+                if not var.is_intercept() and var.display_name not in self.endogenous_vars:
+                    for i in range(len(self.fe_cols)):
+                        col = f"avg_{var.sql_name}_fe{i}"
+                        if col in df.columns:
+                            Z_parts.append(df[col].values.reshape(-1, 1))
             
-            if fitted_col in df.columns:
-                X_fitted_parts.append(df[fitted_col].values.reshape(-1, 1))
-            else:
-                logger.warning(f"Fitted column {fitted_col} not found, using actual")
-                X_fitted_parts.append(df[var.sql_name].values.reshape(-1, 1))
-            
-            X_actual_parts.append(df[var.sql_name].values.reshape(-1, 1))
-            names.append(var.display_name)
-            sql_names.append(var.sql_name)
+            # Instrument means
+            for var in self.formula.instruments:
+                for i in range(len(self.fe_cols)):
+                    col = f"avg_{var.sql_name}_fe{i}"
+                    if col in df.columns:
+                        Z_parts.append(df[col].values.reshape(-1, 1))
         
-        X_fitted = np.hstack(X_fitted_parts) if X_fitted_parts else np.empty((len(df), 0))
-        X_actual = np.hstack(X_actual_parts) if X_actual_parts else np.empty((len(df), 0))
-        
-        return X_fitted, X_actual, names, sql_names
+        return np.hstack(Z_parts)
 
-    # =========================================================================
-    # Variance-Covariance Computation
-    # =========================================================================
-    
-    def _compute_hc1_vcov(
-        self, Z: np.ndarray, residuals: np.ndarray, weights: np.ndarray
-    ) -> np.ndarray:
-        """HC1 heteroskedasticity-robust 2SLS vcov"""
-        n_obs = len(residuals)
-        n_features = Z.shape[1]
+    def _get_z_cols_for_duckdb(self) -> List[str]:
+        """Get instrument column names for DuckDB vcov computation.
         
-        ZtZ = Z.T @ Z + 1e-8 * np.eye(n_features)
-        try:
-            ZtZ_inv = np.linalg.inv(ZtZ)
-        except np.linalg.LinAlgError:
-            ZtZ_inv = np.linalg.pinv(ZtZ)
+        Z consists of:
+        - Exogenous covariates (same as X)
+        - Instruments (not in X)
+        - Mundlak means for both exogenous and instruments
         
-        hc1_factor = n_obs / max(1, n_obs - n_features)
-        resid_sq = residuals ** 2
-        meat = (Z.T * resid_sq) @ Z * hc1_factor
+        This matches the in-memory Z matrix construction in _build_instrument_matrix.
+        """
+        z_cols = []
         
-        vcov = ZtZ_inv @ meat @ ZtZ_inv
-        return 0.5 * (vcov + vcov.T)
-    
-    def _compute_cluster_robust_vcov(
-        self, Z: np.ndarray, residuals: np.ndarray, 
-        weights: np.ndarray, cluster_ids: np.ndarray
-    ) -> Tuple[np.ndarray, int]:
-        """Cluster-robust 2SLS vcov"""
-        n_obs = len(residuals)
-        n_features = Z.shape[1]
+        # Exogenous covariates
+        for var in self.formula.covariates:
+            if not var.is_intercept() and var.display_name not in self.endogenous_vars:
+                z_cols.append(var.sql_name)
         
-        ZtZ = Z.T @ Z + 1e-8 * np.eye(n_features)
-        try:
-            ZtZ_inv = np.linalg.inv(ZtZ)
-        except np.linalg.LinAlgError:
-            ZtZ_inv = np.linalg.pinv(ZtZ)
+        # Instruments
+        for var in self.formula.instruments:
+            z_cols.append(var.sql_name)
         
-        unique_clusters = np.unique(cluster_ids)
-        n_clusters = len(unique_clusters)
+        # Mundlak means (if added)
+        if self.fe_cols and self.fe_method == "mundlak":
+            # Exogenous variable means
+            for var in self.formula.covariates:
+                if not var.is_intercept() and var.display_name not in self.endogenous_vars:
+                    for i in range(len(self.fe_cols)):
+                        z_cols.append(f"avg_{var.sql_name}_fe{i}")
+            
+            # Instrument means
+            for var in self.formula.instruments:
+                for i in range(len(self.fe_cols)):
+                    z_cols.append(f"avg_{var.sql_name}_fe{i}")
         
-        meat = np.zeros((n_features, n_features))
-        for cluster in unique_clusters:
-            mask = cluster_ids == cluster
-            score_g = (Z[mask] * residuals[mask, np.newaxis]).sum(axis=0)
-            meat += np.outer(score_g, score_g)
-        
-        correction = (n_clusters / (n_clusters - 1)) * ((n_obs - 1) / (n_obs - n_features))
-        
-        vcov = correction * (ZtZ_inv @ meat @ ZtZ_inv)
-        return 0.5 * (vcov + vcov.T), n_clusters
+        return z_cols
 
     # =========================================================================
     # Summary

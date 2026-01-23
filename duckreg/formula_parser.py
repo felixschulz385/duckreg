@@ -452,6 +452,38 @@ class Formula:
     def get_fe_by_name(self, name: str) -> Optional[Variable]:
         return self._find_in_tuple(self.fixed_effects, name)
     
+    def get_sql_name_for_display(self, display_name: str) -> Optional[str]:
+        """Map display name to SQL name.
+        
+        Searches across all variable types (covariates, outcomes, fixed effects,
+        endogenous, instruments, interactions) to find the matching display_name
+        and returns the corresponding sql_name.
+        
+        Args:
+            display_name: The display name to look up
+            
+        Returns:
+            The SQL-safe name, or None if not found
+        """
+        # Search in all variable tuples
+        for var_list in (self.covariates, self.outcomes, self.fixed_effects, 
+                         self.endogenous, self.instruments):
+            for var in var_list:
+                if var.display_name == display_name:
+                    return var.sql_name
+        
+        # Check interactions
+        for interaction in self.interactions:
+            if interaction.name == display_name:
+                return interaction.sql_name
+        
+        # Check merged FEs
+        for mfe in self.merged_fes:
+            if mfe.name == display_name:
+                return mfe.sql_name
+        
+        return None
+    
     # -------------------------------------------------------------------------
     # Source column methods (for NULL checks in WHERE clause)
     # -------------------------------------------------------------------------

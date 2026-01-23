@@ -2,8 +2,8 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from ..duckreg import DuckReg
-from ..fitters import wls
+from .base import DuckReg
+from ..core.fitters import wls
 
 
 class DuckMundlakEventStudy(DuckReg):

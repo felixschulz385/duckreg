@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from .duckreg import DuckReg, ridge_closed_form, ridge_closed_form_batch
+from .base import DuckReg
+from ..core.fitters import ridge_closed_form, ridge_closed_form_batch
 
 
 class DuckRidge(DuckReg):

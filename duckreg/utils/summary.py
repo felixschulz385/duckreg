@@ -11,7 +11,7 @@ This module provides comprehensive formatting for model output, including:
 import pandas as pd
 from typing import Union, Optional, Dict, Any
 
-from .results import RegressionResults, FirstStageResults
+from ..core.results import RegressionResults, FirstStageResults
 
 
 def format_model_summary(

@@ -11,15 +11,15 @@ import pandas as pd
 from typing import Tuple, Optional, List
 import logging
 
-from ..formula_parser import needs_quoting, quote_identifier
+from ..utils.formula_parser import needs_quoting, quote_identifier
 from .DuckLinearModel import DuckLinearModel
-from .mixins import MundlakMixin
-from .name_utils import build_coef_name_lists
+from ..core.sql_builders import compute_mundlak_means_numpy
+from ..utils.name_utils import build_coef_name_lists
 
 logger = logging.getLogger(__name__)
 
 
-class DuckMundlak(DuckLinearModel, MundlakMixin):
+class DuckMundlak(DuckLinearModel):
     """OLS with fixed effects via Mundlak device.
     
     The Mundlak approach includes group means of covariates as additional
@@ -50,6 +50,11 @@ class DuckMundlak(DuckLinearModel, MundlakMixin):
 
     def _get_cluster_col_for_vcov(self) -> str:
         return self._CLUSTER_ALIAS
+
+    def _build_round_expr(self, expr: str, alias: str):
+        """Build expression with optional rounding for data compression."""
+        from ..core.sql_builders import build_round_expr
+        return build_round_expr(expr, alias, self.round_strata)
 
     def _needs_intercept_for_duckdb(self) -> bool:
         """Mundlak device always requires an intercept."""
@@ -206,7 +211,9 @@ class DuckMundlak(DuckLinearModel, MundlakMixin):
 
     def _get_x_cols_for_duckdb(self) -> List[str]:
         """Get X column names for DuckDB fitter"""
-        return self.build_x_cols_for_duckdb(
+        from ..core.sql_builders import build_x_cols_for_duckdb
+        return build_x_cols_for_duckdb(
+            formula=self.formula,
             fe_method='mundlak',
             fe_cols=self.fe_cols,
             is_iv=False

@@ -18,6 +18,7 @@ API Design Principles:
 """
 
 import numpy as np
+import pandas as pd
 import logging
 from typing import List, Optional, Tuple, Set, Dict, Any, Union
 import duckdb
@@ -67,7 +68,7 @@ def build_round_expr(
     ValueError
         If expr or alias is empty
     """
-    from ..formula_parser import quote_identifier
+    from ..utils.formula_parser import quote_identifier
     
     if not expr or not expr.strip():
         raise ValueError("expr cannot be empty")
@@ -241,7 +242,7 @@ def build_agg_columns(
     if not outcome_vars:
         raise ValueError("outcome_vars cannot be empty")
     
-    from ..formula_parser import cast_if_boolean
+    from ..utils.formula_parser import cast_if_boolean
     
     agg_parts = ["COUNT(*) as count"]
     for var in outcome_vars:
@@ -306,7 +307,7 @@ def build_strata_select_sql(
     if not strata_cols:
         raise ValueError("strata_cols cannot be empty")
     
-    from ..formula_parser import cast_if_boolean, _make_sql_safe_name, quote_identifier
+    from ..utils.formula_parser import cast_if_boolean, _make_sql_safe_name, quote_identifier
     
     select_parts, group_by_parts = [], []
     
@@ -391,7 +392,7 @@ def build_xtx_query(
     >>> #                SUM((x2)*(x2)*"count") AS xtx_1_1
     >>> #         FROM "data"
     """
-    from ..formula_parser import quote_identifier
+    from ..utils.formula_parser import quote_identifier
     
     if not table_name or not table_name.strip():
         raise ValueError("table_name cannot be empty")
@@ -469,7 +470,7 @@ def build_xty_query(
     >>> #                SUM((x2)*"sum_y") AS xty_1
     >>> #         FROM "data"
     """
-    from ..formula_parser import quote_identifier
+    from ..utils.formula_parser import quote_identifier
     
     if not table_name or not table_name.strip():
         raise ValueError("table_name cannot be empty")
@@ -544,7 +545,7 @@ def build_cross_xtz_query(
     >>> query = build_cross_xtz_query("data", ["x1"], ["z1", "z2"], "count")
     >>> # Returns columns: txz_0_0, txz_0_1, tzz_0_0, tzz_0_1, tzz_1_1, n_obs
     """
-    from ..formula_parser import quote_identifier
+    from ..utils.formula_parser import quote_identifier
     
     if not table_name or not table_name.strip():
         raise ValueError("table_name cannot be empty")
@@ -1097,7 +1098,7 @@ def build_add_mundlak_means_sql(
         GROUP BY "country"
     ) fe_means ON t."country" = fe_means."country"
     """
-    from ..formula_parser import quote_identifier
+    from ..utils.formula_parser import quote_identifier
     
     if not var_sql_names:
         raise ValueError("var_sql_names cannot be empty")
@@ -1191,6 +1192,291 @@ JOIN (
 
 
 # ============================================================================
+# SECTION 5: Utility Classes and Functions
+# ============================================================================
+# Helper utilities for working with DuckDB and formulas
+
+def get_boolean_columns(conn: duckdb.DuckDBPyConnection, 
+                       table_name: str, 
+                       column_names: List[str]) -> Set[str]:
+    """Get boolean columns from a table.
+    
+    Parameters
+    ----------
+    conn : duckdb.DuckDBPyConnection
+        Database connection
+    table_name : str
+        Table name to query
+    column_names : List[str]
+        Column names to check
+        
+    Returns
+    -------
+    Set[str]
+        Set of column names that are BOOLEAN type
+    """
+    cols_sql = ', '.join(f"'{c}'" for c in column_names)
+    query = f"""
+    SELECT column_name FROM (DESCRIBE SELECT * FROM {table_name})
+    WHERE column_name IN ({cols_sql}) AND column_type = 'BOOLEAN'
+    """
+    return set(conn.execute(query).fetchdf()['column_name'].tolist())
+
+
+def get_table_columns(conn: duckdb.DuckDBPyConnection, table_name: str) -> Set[str]:
+    """Get all column names from a table.
+    
+    Parameters
+    ----------
+    conn : duckdb.DuckDBPyConnection
+        Database connection
+    table_name : str
+        Table name to query
+        
+    Returns
+    -------
+    Set[str]
+        Set of column names
+    """
+    return set(
+        conn.execute(f"SELECT column_name FROM (DESCRIBE {table_name})")
+        .fetchdf()['column_name'].tolist()
+    )
+
+
+def build_x_cols_for_duckdb(
+    formula,
+    fe_method: str = "demean",
+    fe_cols: Optional[List[str]] = None,
+    is_iv: bool = False,
+    endogenous_vars: Optional[List[str]] = None
+) -> List[str]:
+    """Build X column names for DuckDB fitter.
+    
+    Parameters
+    ----------
+    formula : Formula
+        Parsed formula object
+    fe_method : str
+        Method for handling fixed effects ('demean' or 'mundlak')
+    fe_cols : List[str], optional
+        List of fixed effect column names
+    is_iv : bool
+        Whether this is IV/2SLS regression
+    endogenous_vars : List[str], optional
+        List of endogenous variable display names (for IV)
+        
+    Returns
+    -------
+    List[str]
+        List of SQL column names for X matrix
+    """
+    x_cols = []
+    
+    if not is_iv:
+        # Standard OLS case
+        for var in formula.covariates:
+            if not var.is_intercept():
+                x_cols.append(var.sql_name)
+        
+        # Mundlak means if applicable
+        if fe_method == "mundlak" and fe_cols:
+            simple_covs = [var for var in formula.covariates if not var.is_intercept()]
+            for i in range(len(fe_cols)):
+                for var in simple_covs:
+                    x_cols.append(f"avg_{var.sql_name}_fe{i}")
+    else:
+        # 2SLS case
+        endogenous_set = set(endogenous_vars or [])
+        
+        # Exogenous covariates
+        for var in formula.covariates:
+            if not var.is_intercept() and var.display_name not in endogenous_set:
+                x_cols.append(var.sql_name)
+        
+        # Mundlak means for exogenous
+        if fe_method == "mundlak" and fe_cols:
+            for var in formula.covariates:
+                if not var.is_intercept() and var.display_name not in endogenous_set:
+                    for i in range(len(fe_cols)):
+                        x_cols.append(f"avg_{var.sql_name}_fe{i}")
+            
+            # Mundlak means for fitted endogenous
+            for var in formula.endogenous:
+                for i in range(len(fe_cols)):
+                    x_cols.append(f"avg_fitted_{var.sql_name}_fe{i}")
+        
+        # Fitted endogenous
+        for var in formula.endogenous:
+            x_cols.append(f"fitted_{var.sql_name}")
+    
+    return x_cols
+
+
+def build_z_cols_for_duckdb(
+    formula,
+    fe_method: str = "demean",
+    fe_cols: Optional[List[str]] = None,
+    endogenous_vars: Optional[List[str]] = None
+) -> List[str]:
+    """Build instrument (Z) column names for first-stage DuckDB fitter.
+    
+    Parameters
+    ----------
+    formula : Formula
+        Parsed formula object
+    fe_method : str
+        Method for handling fixed effects
+    fe_cols : List[str], optional
+        List of fixed effect column names
+    endogenous_vars : List[str], optional
+        List of endogenous variable display names
+        
+    Returns
+    -------
+    List[str]
+        List of SQL column names for Z matrix (exogenous + instruments + Mundlak means)
+    """
+    z_cols = []
+    endogenous_set = set(endogenous_vars or [])
+    
+    # Exogenous covariates
+    for var in formula.covariates:
+        if not var.is_intercept() and var.display_name not in endogenous_set:
+            z_cols.append(var.sql_name)
+    
+    # Instruments
+    for var in formula.instruments:
+        z_cols.append(var.sql_name)
+    
+    # Mundlak means if applicable
+    if fe_method == "mundlak" and fe_cols:
+        # Means of exogenous covariates
+        for var in formula.covariates:
+            if not var.is_intercept() and var.display_name not in endogenous_set:
+                for i in range(len(fe_cols)):
+                    z_cols.append(f"avg_{var.sql_name}_fe{i}")
+        
+        # Means of instruments
+        for var in formula.instruments:
+            for i in range(len(fe_cols)):
+                z_cols.append(f"avg_{var.sql_name}_fe{i}")
+    
+    return z_cols
+
+
+def build_residual_x_cols_for_duckdb(
+    formula,
+    fe_method: str = "demean",
+    fe_cols: Optional[List[str]] = None,
+    endogenous_vars: Optional[List[str]] = None
+) -> List[str]:
+    """Build X column names using ACTUAL endogenous for residual computation (2SLS).
+    
+    This is critical for correct 2SLS standard errors: residuals must use
+    actual endogenous values, not fitted ones. The order matches
+    build_x_cols_for_duckdb so coefficients align correctly.
+    
+    Parameters
+    ----------
+    formula : Formula
+        Parsed formula object
+    fe_method : str
+        Method for handling fixed effects
+    fe_cols : List[str], optional
+        List of fixed effect column names
+    endogenous_vars : List[str], optional
+        List of endogenous variable display names
+        
+    Returns
+    -------
+    List[str]
+        List of SQL column expressions for residual computation
+    """
+    actual_x_cols = []
+    endogenous_set = set(endogenous_vars or [])
+    
+    # Exogenous covariates (same as fitted)
+    for var in formula.covariates:
+        if not var.is_intercept() and var.display_name not in endogenous_set:
+            actual_x_cols.append(var.sql_name)
+    
+    # Mundlak means for exogenous (same as fitted)
+    if fe_method == "mundlak" and fe_cols:
+        for var in formula.covariates:
+            if not var.is_intercept() and var.display_name not in endogenous_set:
+                for i in range(len(fe_cols)):
+                    actual_x_cols.append(f"avg_{var.sql_name}_fe{i}")
+        
+        # Mundlak means for fitted endogenous (keep fitted for consistency)
+        for var in formula.endogenous:
+            for i in range(len(fe_cols)):
+                actual_x_cols.append(f"avg_fitted_{var.sql_name}_fe{i}")
+    
+    # ACTUAL endogenous (key difference: use actual, not fitted)
+    # For compressed data, these are sum columns divided by count
+    for var in formula.endogenous:
+        actual_x_cols.append(f"sum_{var.sql_name} / count")
+    
+    return actual_x_cols
+
+
+def compute_mundlak_means_numpy(
+    df: pd.DataFrame,
+    cov_cols: List[str],
+    fe_cols: List[str],
+    formula
+) -> Tuple[np.ndarray, List[str]]:
+    """Compute group means for Mundlak device (numpy/pandas version).
+    
+    The Mundlak device absorbs fixed effects by including group means
+    of covariates as additional regressors.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with data
+    cov_cols : List[str]
+        Columns to compute means for
+    fe_cols : List[str]
+        Fixed effect column names
+    formula : Formula
+        Parsed formula object (for getting SQL names)
+        
+    Returns
+    -------
+    Tuple[np.ndarray, List[str]]
+        (mean values array, column names)
+    """
+    mean_parts = []
+    mean_names = []
+    
+    for i, fe_name in enumerate(fe_cols):
+        # Get SQL-safe name for FE
+        fe_var = formula.get_fe_by_name(fe_name)
+        if fe_var:
+            fe_col = fe_var.sql_name
+        else:
+            mfe = formula.get_merged_fe_by_name(fe_name)
+            fe_col = mfe.sql_name if mfe else fe_name
+        
+        if fe_col not in df.columns:
+            logger.debug(f"FE column {fe_col} not found in dataframe")
+            continue
+        
+        for cov_col in cov_cols:
+            if cov_col not in df.columns:
+                continue
+            group_means = df.groupby(fe_col)[cov_col].transform('mean')
+            mean_parts.append(group_means.values.reshape(-1, 1))
+            mean_names.append(f"avg_{cov_col}_fe{i}")
+    
+    if mean_parts:
+        return np.hstack(mean_parts), mean_names
+    return np.empty((len(df), 0)), []
+
+
+# ============================================================================
 # Exports
 # ============================================================================
 
@@ -1218,4 +1504,12 @@ __all__ = [
     'build_mundlak_avg_col_names',
     'build_add_mundlak_means_sql',
     'build_add_fitted_mundlak_means_sql',
+    
+    # Section 5: Utility Functions
+    'get_boolean_columns',
+    'get_table_columns',
+    'build_x_cols_for_duckdb',
+    'build_z_cols_for_duckdb',
+    'build_residual_x_cols_for_duckdb',
+    'compute_mundlak_means_numpy',
 ]

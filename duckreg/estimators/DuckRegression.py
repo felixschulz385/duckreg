@@ -3,8 +3,8 @@ import pandas as pd
 import logging
 from typing import Tuple, Optional, List
 
-from ..demean import demean, _convert_to_int
-from ..formula_parser import quote_identifier, cast_if_boolean, _make_sql_safe_name
+from ..core.demean import demean, _convert_to_int
+from ..utils.formula_parser import quote_identifier, cast_if_boolean, _make_sql_safe_name
 from .DuckLinearModel import DuckLinearModel
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ class DuckRegression(DuckLinearModel):
         Returns:
             List of display names for coefficients
         """
-        from .name_utils import build_coef_name_lists
+        from ..utils.name_utils import build_coef_name_lists
         
         include_intercept = not bool(self.fe_cols)
         display_names, sql_names = build_coef_name_lists(
@@ -67,6 +67,11 @@ class DuckRegression(DuckLinearModel):
     def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, Optional[str]]:
         self._ensure_data_fetched()
         return self.df_compressed, self.cluster_col
+
+    def _build_agg_columns(self, outcome_vars, boolean_cols, unit_col):
+        """Build aggregation column expressions."""
+        from ..core.sql_builders import build_agg_columns
+        return build_agg_columns(outcome_vars, boolean_cols, unit_col)
 
     def prepare_data(self):
         pass

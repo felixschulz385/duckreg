@@ -5,9 +5,10 @@ This module provides the shared functionality for OLS estimators that use
 either demeaning or Mundlak device for fixed effects.
 
 Architecture:
-- DuckLinearModel extends DuckEstimator and composes SQLBuilderMixin
-- Results containers are imported from results.py (Single Responsibility)
-- Bootstrap and vcov helpers are imported from mixins.py (DRY)
+- DuckLinearModel extends DuckEstimator
+- Results containers are imported from core/results.py (Single Responsibility)
+- Bootstrap and vcov helpers are imported from core/vcov.py (DRY)
+- SQL builders are imported from core/sql_builders.py (DRY)
 """
 
 import numpy as np
@@ -15,18 +16,18 @@ import pandas as pd
 import logging
 from typing import Tuple, Optional, List, Dict, Any
 
-from ..demean import demean, _convert_to_int
-from ..duckreg import DuckEstimator, SEMethod
-from ..fitters import wls, NumpyFitter, DuckDBFitter, FitterResult
-from ..formula_parser import cast_if_boolean, needs_quoting, quote_identifier, _make_sql_safe_name
+from ..core.demean import demean, _convert_to_int
+from .base import DuckEstimator, SEMethod
+from ..core.fitters import wls, NumpyFitter, DuckDBFitter, FitterResult
+from ..utils.formula_parser import cast_if_boolean, needs_quoting, quote_identifier, _make_sql_safe_name
 
 # Import from refactored modules - Single Responsibility Principle
-from .results import RegressionResults, FirstStageResults
-from .mixins import (
-    SQLBuilderMixin, BootstrapExecutor,
+from ..core.results import RegressionResults, FirstStageResults
+from ..core.vcov import (
+    BootstrapExecutor,
     _bootstrap_iteration_iid, _bootstrap_iteration_cluster
 )
-from .name_utils import build_coef_name_lists
+from ..utils.name_utils import build_coef_name_lists
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Base Linear Model
 # ============================================================================
 
-class DuckLinearModel(DuckEstimator, SQLBuilderMixin):
+class DuckLinearModel(DuckEstimator):
     """Base class for single-stage linear models (OLS, Mundlak).
     
     This class handles:
@@ -134,20 +135,7 @@ class DuckLinearModel(DuckEstimator, SQLBuilderMixin):
     # Shared utilities
     # -------------------------------------------------------------------------
 
-    def _get_boolean_columns(self) -> set:
-        """Detect BOOLEAN columns in source table (cached)"""
-        if self._boolean_cols is not None:
-            return self._boolean_cols
-        
-        all_columns = set(self.formula.get_source_columns_for_null_check())
-        cols_sql = ', '.join(f"'{col}'" for col in all_columns)
-        
-        query = f"""
-        SELECT column_name FROM (DESCRIBE SELECT * FROM {self.table_name})
-        WHERE column_name IN ({cols_sql}) AND column_type = 'BOOLEAN'
-        """
-        self._boolean_cols = set(self.conn.execute(query).fetchdf()['column_name'].tolist())
-        return self._boolean_cols
+
 
     def _get_cluster_col_for_vcov(self) -> Optional[str]:
         """Get cluster column name for vcov computation. Subclasses may override."""
@@ -462,7 +450,7 @@ class DuckLinearModel(DuckEstimator, SQLBuilderMixin):
         Returns:
             Dictionary with model specification, results, and metadata
         """
-        from .results import ModelSummary
+        from ..core.results import ModelSummary
         return ModelSummary.from_estimator(self).to_dict()
     
     def summary_df(self) -> pd.DataFrame:
@@ -474,7 +462,7 @@ class DuckLinearModel(DuckEstimator, SQLBuilderMixin):
     def print_summary(self, precision: int = 4):
         """Print formatted results to console using unified formatter."""
         if self.results:
-            from .summary import print_summary as fmt_print
+            from ..utils.summary import print_summary as fmt_print
             fmt_print(self.results, precision=precision)
         else:
             print("No results available. Call fit() first.")
@@ -482,6 +470,6 @@ class DuckLinearModel(DuckEstimator, SQLBuilderMixin):
     def to_tidy_df(self) -> pd.DataFrame:
         """Get results as a tidy DataFrame using unified formatter."""
         if self.results:
-            from .summary import to_tidy_df as fmt_tidy
+            from ..utils.summary import to_tidy_df as fmt_tidy
             return fmt_tidy(self.results)
         return pd.DataFrame()

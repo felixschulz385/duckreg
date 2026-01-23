@@ -37,19 +37,25 @@ import pandas as pd
 import logging
 from typing import Tuple, Optional, List, Dict, Any
 
-from ..formula_parser import cast_if_boolean, quote_identifier
-from ..fitters import wls, NumpyFitter, DuckDBFitter
-from ..duckreg import DuckEstimator
+from ..utils.formula_parser import cast_if_boolean, quote_identifier
+from ..core.fitters import wls, NumpyFitter, DuckDBFitter
+from .base import DuckEstimator
 
 # Import from refactored modules - following DRY principle
-from .results import RegressionResults, FirstStageResults
-from .mixins import MundlakMixin, SQLBuilderMixin
-from .name_utils import build_coef_name_lists, build_first_stage_coef_names
+from ..core.results import RegressionResults, FirstStageResults
+from ..core.vcov import BootstrapExecutor, _bootstrap_iteration_iid, _bootstrap_iteration_cluster
+from ..core.sql_builders import (
+    get_boolean_columns,
+    build_x_cols_for_duckdb,
+    build_z_cols_for_duckdb,
+    build_residual_x_cols_for_duckdb
+)
+from ..utils.name_utils import build_coef_name_lists, build_first_stage_coef_names
 
 logger = logging.getLogger(__name__)
 
 
-class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
+class Duck2SLS(DuckEstimator):
     """Two-Stage Least Squares (2SLS) / Instrumental Variables estimator.
     
     This estimator handles IV regression with:
@@ -386,15 +392,7 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
         ).fetchone()[0]
         self.n_compressed_rows = self.n_obs
 
-    def _get_boolean_columns(self) -> set:
-        """Get boolean columns from source table"""
-        all_cols = set(self.formula.get_source_columns_for_null_check())
-        cols_sql = ', '.join(f"'{c}'" for c in all_cols)
-        query = f"""
-        SELECT column_name FROM (DESCRIBE SELECT * FROM {self.table_name})
-        WHERE column_name IN ({cols_sql}) AND column_type = 'BOOLEAN'
-        """
-        return set(self.conn.execute(query).fetchdf()['column_name'].tolist())
+
 
     def _build_where_clause(self) -> str:
         """Build WHERE clause"""
@@ -559,7 +557,8 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
     
     def _get_x_cols_for_duckdb(self) -> List[str]:
         """Get x column names for second stage DuckDB fitter"""
-        return self.build_x_cols_for_duckdb(
+        return build_x_cols_for_duckdb(
+            formula=self.formula,
             fe_method=self.fe_method,
             fe_cols=self.fe_cols,
             is_iv=True,
@@ -608,7 +607,8 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
         Returns:
             List of column names in same order as x_cols, but with actual endogenous
         """
-        return self.build_residual_x_cols_for_duckdb(
+        return build_residual_x_cols_for_duckdb(
+            formula=self.formula,
             fe_method=self.fe_method,
             fe_cols=self.fe_cols,
             endogenous_vars=self.endogenous_vars
@@ -617,6 +617,11 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
     # =========================================================================
     # First Stage
     # =========================================================================
+    
+    def compute_mundlak_means(self, df: pd.DataFrame, cov_cols: List[str]) -> Tuple[np.ndarray, List[str]]:
+        """Compute group means for Mundlak device."""
+        from ..core.sql_builders import compute_mundlak_means_numpy
+        return compute_mundlak_means_numpy(df, cov_cols, self.fe_cols, self.formula)
     
     def _run_first_stages(self):
         """Run first-stage regressions for all endogenous variables"""
@@ -735,7 +740,8 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
     
     def _get_first_stage_x_cols(self) -> List[str]:
         """Get x column names for first stage regression"""
-        return self.build_z_cols_for_duckdb(
+        return build_z_cols_for_duckdb(
+            formula=self.formula,
             fe_method=self.fe_method,
             fe_cols=self.fe_cols,
             endogenous_vars=self.endogenous_vars
@@ -1093,7 +1099,7 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
         Returns:
             Dictionary with model specification, results, first stages, and metadata
         """
-        from .results import ModelSummary
+        from ..core.results import ModelSummary
         return ModelSummary.from_estimator(self).to_dict()
     
     def summary_df(self) -> pd.DataFrame:
@@ -1108,12 +1114,12 @@ class Duck2SLS(DuckEstimator, MundlakMixin, SQLBuilderMixin):
     
     def print_summary(self, precision: int = 4, include_diagnostics: bool = True):
         """Print formatted 2SLS results to console using unified formatter."""
-        from .summary import print_summary as fmt_print
+        from ..utils.summary import print_summary as fmt_print
         fmt_print(self.summary(), precision=precision, include_diagnostics=include_diagnostics)
     
     def to_tidy_df(self) -> pd.DataFrame:
         """Get results as a tidy DataFrame using unified formatter."""
-        from .summary import to_tidy_df as fmt_tidy
+        from ..utils.summary import to_tidy_df as fmt_tidy
         if self.results:
             return fmt_tidy(self.results)
         return pd.DataFrame()

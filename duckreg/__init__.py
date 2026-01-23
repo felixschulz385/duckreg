@@ -3,8 +3,9 @@
 """
 
 from ._version import __version__, get_version, get_version_info
-from .duckreg import compressed_ols, DuckReg, SEMethod, FEMethod
-from .fitters import (
+from .duckreg import compressed_ols, DuckReg, SEMethod
+from .utils.api import FEMethod
+from .core.fitters import (
     wls, 
     wls_duckdb, 
     ridge_closed_form, 
@@ -15,7 +16,7 @@ from .fitters import (
     FitterResult,
 )
 from .estimators import DuckRegression, DuckMundlak, DuckDoubleDemeaning
-from .estimators.results import RegressionResults, FirstStageResults, ModelSummary
+from .core.results import RegressionResults, FirstStageResults, ModelSummary
 
 __all__ = [
     # Version

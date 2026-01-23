@@ -1,84 +1,25 @@
+"""High-level API for compressed OLS regression.
+
+This module provides the main entry point for users to run compressed OLS regressions
+with support for fixed effects, instrumental variables, and various standard error methods.
+It handles formula parsing, data source resolution, and estimator selection.
+"""
 import os
 import sys
 import logging
-from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional, Dict, Any, List
-import hashlib
+from typing import Optional
 
-import duckdb
-import numpy as np
 import pandas as pd
 
 from .core.vcov import parse_vcov_specification, parse_cluster_vars, VcovTypeNotSupportedError
+from .estimators.base import DuckEstimator, SEMethod
+from .utils.api import FEMethod, _resolve_table_name, _resolve_db_path
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================================
-# Constants (centralized for all modules)
-# ============================================================================
-
-class SEMethod:
-    """Standard error computation methods"""
-    IID = "iid"
-    HC1 = "HC1"
-    CRV1 = "CRV1"
-    BS = "BS"
-    NONE = "none"
-
-
-class FEMethod:
-    """Fixed effects handling methods"""
-    MUNDLAK = "mundlak"
-    DEMEAN = "demean"
-    AUTO = "auto"
-
-
-# ============================================================================
-# File Format Configuration
-# ============================================================================
-
-_FILE_READERS = {
-    ".parquet": "read_parquet",
-    ".csv": "read_csv",
-    ".parquet.gz": "read_parquet",
-}
-
-
-# ============================================================================
-# Data Source Utilities
-# ============================================================================
-
-
-
-def _resolve_table_name(data_path: Path) -> str:
-    """Create DuckDB table reference from data path"""
-    if data_path.is_file():
-        suffix = data_path.suffix.lower()
-        if suffix not in _FILE_READERS:
-            raise ValueError(f"Unsupported file format: {suffix}. Supported: {list(_FILE_READERS.keys())}")
-        return f"{_FILE_READERS[suffix]}('{data_path}')"
-    elif data_path.is_dir():
-        return f"read_parquet('{data_path}/**/*.parquet')"
-    raise ValueError(f"Data path not found: {data_path}")
-
-
-def _resolve_db_path(data: str, cache_dir: Optional[str], db_name: Optional[str]) -> str:
-    """Resolve database path from inputs"""
-    if db_name is not None:
-        db_path = Path(db_name)
-        db_path.parent.mkdir(exist_ok=True, parents=True)
-        return str(db_path)
-    
-    data_path = Path(data).resolve()
-    cache_dir = Path(cache_dir) if cache_dir else (
-        data_path.parent if data_path.is_file() else data_path
-    ) / ".duckreg"
-    
-    cache_dir.mkdir(exist_ok=True, parents=True)
-    data_hash = hashlib.md5(str(data_path).encode()).hexdigest()[:8]
-    return str(cache_dir / f"duckreg_{data_hash}.db")
+# Backward compatibility - re-export from base
+DuckReg = DuckEstimator
 
 
 # ============================================================================
@@ -101,7 +42,13 @@ def compressed_ols(
     fitter: str = "numpy",
     **kwargs
 ) -> "DuckEstimator":
-    """High-level API for compressed OLS regression with lfe-style formula
+    """High-level API for compressed OLS regression with lfe-style formula.
+    
+    Orchestrates the entire regression workflow:
+    1. Parse the lfe-style formula to extract outcomes, covariates, FE, IV, and clusters
+    2. Resolve data source and database paths
+    3. Select appropriate estimator based on model type (OLS, IV, or Mundlak)
+    4. Fit the model and compute standard errors
     
     Args:
         formula: Regression formula in format "y ~ x1 + x2 | fe1 + fe2 | endog (inst1 + inst2) | cluster"
@@ -120,33 +67,41 @@ def compressed_ols(
         **kwargs: Additional arguments passed to estimator
     
     Returns:
-        Fitted estimator object
+        Fitted estimator object with results
     """
     logger.debug(f"=== compressed_ols START ===")
     
+    # Import estimator classes and formula parser
     from .estimators import DuckRegression, DuckMundlak, Duck2SLS
-    from .formula_parser import FormulaParser
+    from .utils.formula_parser import FormulaParser
     
+    # Parse the lfe-style formula to extract model components
     parsed_formula = FormulaParser().parse(formula)
-    fe_cols = parsed_formula.get_fe_names()
-    has_iv = parsed_formula.has_instruments()
+    fe_cols = parsed_formula.get_fe_names()  # Fixed effect column names
+    has_iv = parsed_formula.has_instruments()  # Does model have instrumental variables?
     
     logger.debug(f"Parsed: outcomes={parsed_formula.get_outcome_names()}, "
                  f"covariates={parsed_formula.get_covariate_names()}, "
                  f"fe={fe_cols}, cluster={parsed_formula.cluster}, "
                  f"has_iv={has_iv}, fitter={fitter}")
     
-    # Setup paths
+    # Resolve data paths: determine DuckDB database location and table reference
+    # _resolve_db_path creates a cache database based on data path hash if db_name not specified
+    # _resolve_table_name converts file path to appropriate DuckDB read function
     resolved_db = _resolve_db_path(data, cache_dir, db_name)
     table_name = _resolve_table_name(Path(data).resolve())
     
-    # Resolve fe_method for 2SLS
+    # Resolve fixed effects method for 2SLS
+    # For IV models, default to demeaning if AUTO is specified
     resolved_fe_method = fe_method
     if fe_method == FEMethod.AUTO:
         resolved_fe_method = FEMethod.DEMEAN
     
-    # Determine estimator class
+    # Select appropriate estimator class based on model type
+    # IV models use Duck2SLS (2-stage least squares)
+    # OLS models use either DuckMundlak (with Mundlak approach for FE) or DuckRegression
     if has_iv:
+        # Instrumental variables: use 2SLS
         estimator = Duck2SLS(
             db_name=resolved_db,
             table_name=table_name,
@@ -162,6 +117,9 @@ def compressed_ols(
             **kwargs
         )
     else:
+        # OLS regression: choose between Mundlak or simple demeaning approach
+        # Mundlak approach: absorb FE by demeaning with group means of all covariates
+        # This enables consistent estimation with correlated random effects
         use_mundlak = bool(fe_cols) and fe_method == FEMethod.MUNDLAK
         if fe_cols and fe_method not in (FEMethod.MUNDLAK, FEMethod.DEMEAN, FEMethod.AUTO):
             raise ValueError(f"fe_method must be '{FEMethod.MUNDLAK}' or '{FEMethod.DEMEAN}'")
@@ -181,184 +139,10 @@ def compressed_ols(
             **kwargs
         )
     
+    # Fit the model (triggers data preparation, compression, estimation, and SE computation)
     estimator.fit(se_method=se_method)
     
     logger.debug(f"=== compressed_ols END ===")
     return estimator
 
 
-# ============================================================================
-# Base Estimator Class
-# ============================================================================
-
-class DuckEstimator(ABC):
-    """Abstract base class for all DuckDB-based estimators.
-    
-    This provides the minimal interface that all estimators must implement,
-    plus shared DuckDB connection management.
-    """
-    
-    def __init__(
-        self,
-        db_name: str,
-        table_name: str,
-        seed: int,
-        n_bootstraps: int = 0,
-        fitter: str = "numpy",
-        keep_connection_open: bool = False,
-        round_strata: int = None,
-        duckdb_kwargs: dict = None,
-    ):
-        logger.debug(f"DuckEstimator.__init__: db={db_name}, table={table_name}")
-        
-        self.db_name = db_name
-        self.table_name = table_name
-        self.n_bootstraps = n_bootstraps
-        self.seed = seed
-        self.fitter = fitter
-        self.keep_connection_open = keep_connection_open
-        self.round_strata = round_strata
-        self.duckdb_kwargs = duckdb_kwargs
-        
-        # State
-        self.conn: Optional[duckdb.DuckDBPyConnection] = None
-        self.rng: Optional[np.random.Generator] = None
-        self.point_estimate: Optional[np.ndarray] = None
-        self.vcov: Optional[np.ndarray] = None
-        self.se: Optional[str] = None
-        self.coef_names_: Optional[List[str]] = None
-        self.n_obs: Optional[int] = None
-        
-        self._init_connection()
-
-    def _init_connection(self):
-        """Initialize DuckDB connection and RNG"""
-        self.conn = duckdb.connect(self.db_name)
-        self._apply_duckdb_config(self.duckdb_kwargs)
-        self.rng = np.random.default_rng(self.seed)
-
-    def _apply_duckdb_config(self, config: Optional[Dict[str, Any]]):
-        """Apply DuckDB configuration settings"""
-        if config:
-            for key, value in config.items():
-                self.conn.execute(f"SET {key} = '{value}'")
-
-    def fit(self, se_method: str = SEMethod.IID):
-        """Main fitting method - orchestrates the estimation pipeline.
-        
-        Subclasses should not override this; override the individual steps instead.
-        """
-        logger.debug(f"fit() START with se_method={se_method}")
-        
-        # Step 1: Prepare data (create tables, run first stages for IV, etc.)
-        self.prepare_data()
-        
-        # Step 2: Compress data for efficient estimation
-        self.compress_data()
-        
-        # Step 3: Estimate coefficients
-        self.point_estimate = self.estimate()
-        
-        # Step 4: Compute standard errors
-        self._compute_standard_errors(se_method)
-        
-        # Cleanup
-        if not self.keep_connection_open:
-            self.conn.close()
-        
-        logger.debug(f"fit() END")
-
-    def _compute_standard_errors(self, se_method: str):
-        """Dispatch standard error computation based on method"""
-        if se_method == SEMethod.BS:
-            if self.n_bootstraps > 0:
-                logger.debug("Computing bootstrap standard errors")
-                self.vcov = self.bootstrap()
-                self.se = "bootstrap"
-        elif se_method in (SEMethod.IID, SEMethod.HC1, SEMethod.CRV1):
-            logger.debug(f"Computing {se_method} standard errors")
-            self.fit_vcov(se_method=se_method)
-        elif se_method == SEMethod.NONE:
-            logger.debug("Skipping standard error computation")
-        else:
-            logger.warning(f"Unknown se_method '{se_method}'")
-
-    # -------------------------------------------------------------------------
-    # Abstract methods - must be implemented by subclasses
-    # -------------------------------------------------------------------------
-
-    @abstractmethod
-    def prepare_data(self):
-        """Prepare data tables for estimation.
-        
-        This may include:
-        - Creating design matrices
-        - Running first-stage regressions (for IV)
-        - Computing Mundlak means (for Mundlak approach)
-        """
-        pass
-
-    @abstractmethod
-    def compress_data(self):
-        """Compress data for efficient estimation.
-        
-        Creates aggregated views/tables with sufficient statistics.
-        """
-        pass
-
-    @abstractmethod
-    def estimate(self) -> np.ndarray:
-        """Estimate model coefficients.
-        
-        Returns:
-            Array of coefficient estimates
-        """
-        pass
-
-    @abstractmethod
-    def fit_vcov(self, se_method: str = SEMethod.HC1):
-        """Compute variance-covariance matrix."""
-        pass
-
-    @abstractmethod
-    def bootstrap(self) -> np.ndarray:
-        """Compute variance-covariance matrix via bootstrap.
-        
-        Returns:
-            Variance-covariance matrix
-        """
-        pass
-
-    # -------------------------------------------------------------------------
-    # Common utility methods
-    # -------------------------------------------------------------------------
-
-    def _get_table_columns(self, table_name: str) -> set:
-        """Get column names from a table"""
-        return set(
-            self.conn.execute(f"SELECT column_name FROM (DESCRIBE {table_name})")
-            .fetchdf()['column_name'].tolist()
-        )
-
-    def _build_where_clause(self, user_subset: Optional[str] = None) -> str:
-        """Build WHERE clause with NULL checks and optional user subset"""
-        if hasattr(self, 'formula'):
-            return self.formula.get_where_clause_sql(user_subset)
-        return f"WHERE ({user_subset})" if user_subset else ""
-
-    def summary(self) -> Dict[str, Any]:
-        """Provide results summary. Subclasses should override for richer output."""
-        return {
-            "point_estimate": self.point_estimate,
-            "coef_names": self.coef_names_,
-            "n_obs": self.n_obs,
-            "se_type": self.se,
-        }
-
-
-# ============================================================================
-# Backward compatibility alias
-# ============================================================================
-
-# Keep DuckReg as an alias for backward compatibility
-DuckReg = DuckEstimator

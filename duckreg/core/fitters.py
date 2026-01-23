@@ -47,15 +47,15 @@ from dataclasses import dataclass, field
 
 import duckdb
 
-from .core.linalg import safe_solve, safe_inv
-from .core.vcov import (
+from .linalg import safe_solve, safe_inv
+from .vcov import (
     SSCConfig,
     VcovContext,
     compute_iid_vcov,
     compute_hetero_vcov,
     compute_cluster_vcov,
 )
-from .core import (
+from . import (
     compute_sufficient_stats_numpy,
     compute_sufficient_stats_sql,
     compute_residual_aggregates_numpy,
@@ -716,7 +716,7 @@ class DuckDBFitter(BaseFitter):
         tZZinv = None
         tZX = None
         if is_iv and z_cols is not None:
-            from .core.residual_aggregates import compute_cross_sufficient_stats_sql
+            from .residual_aggregates import compute_cross_sufficient_stats_sql
             
             iv_stats = compute_cross_sufficient_stats_sql(
                 conn=self.conn,

@@ -1067,6 +1067,147 @@ def compute_cluster_scores(
 
 
 # ============================================================================
+# Bootstrap Utilities
+# ============================================================================
+
+def _bootstrap_iteration_iid(args: Tuple) -> Tuple[np.ndarray, float]:
+    """Single bootstrap iteration for IID bootstrap.
+    
+    Parameters
+    ----------
+    args : Tuple
+        (b, X, y, n, n_rows, seed) where:
+        - b: iteration number
+        - X: design matrix
+        - y: outcome
+        - n: weights
+        - n_rows: number of rows
+        - seed: random seed
+        
+    Returns
+    -------
+    Tuple[np.ndarray, float]
+        (coefficients, total weight)
+    """
+    from ..core.fitters import wls
+    
+    b, X, y, n, n_rows, seed = args
+    rng = np.random.default_rng(seed)
+    
+    resampled_indices = rng.choice(n_rows, size=n_rows, replace=True)
+    row_counts = np.bincount(resampled_indices, minlength=n_rows)
+    n_boot = n * row_counts
+    
+    return wls(X, y, n_boot).flatten(), n_boot.sum()
+
+
+def _bootstrap_iteration_cluster(args: Tuple) -> Tuple[np.ndarray, float]:
+    """Single bootstrap iteration for cluster bootstrap.
+    
+    Parameters
+    ----------
+    args : Tuple
+        (b, X, y, n, group_idx, n_unique_groups, seed) where:
+        - b: iteration number
+        - X: design matrix
+        - y: outcome
+        - n: weights
+        - group_idx: cluster group indices
+        - n_unique_groups: number of unique clusters
+        - seed: random seed
+        
+    Returns
+    -------
+    Tuple[np.ndarray, float]
+        (coefficients, total weight)
+    """
+    from ..core.fitters import wls
+    
+    b, X, y, n, group_idx, n_unique_groups, seed = args
+    rng = np.random.default_rng(seed)
+    
+    resampled_group_ids = rng.choice(n_unique_groups, size=n_unique_groups, replace=True)
+    bootstrap_scale = np.bincount(resampled_group_ids, minlength=n_unique_groups)
+    n_boot = n * bootstrap_scale[group_idx]
+    
+    return wls(X, y, n_boot).flatten(), n_boot.sum()
+
+
+class BootstrapExecutor:
+    """Encapsulates bootstrap execution logic.
+    
+    Manages parallel and sequential execution of bootstrap iterations
+    with proper seed management for reproducibility.
+    
+    Parameters
+    ----------
+    n_bootstraps : int
+        Number of bootstrap iterations
+    n_jobs : int
+        Number of parallel jobs (1 for sequential)
+    rng : np.random.Generator
+        Random number generator for seed generation
+    """
+    
+    def __init__(self, n_bootstraps: int, n_jobs: int, rng: np.random.Generator):
+        self.n_bootstraps = n_bootstraps
+        self.n_jobs = n_jobs
+        self.seeds = rng.integers(0, 2**31, size=n_bootstraps)
+    
+    def execute(self, iteration_func, base_args: Tuple, 
+                args_builder=None) -> Tuple[np.ndarray, np.ndarray]:
+        """Execute bootstrap iterations and return (coefficients, sizes).
+        
+        Parameters
+        ----------
+        iteration_func : callable
+            Function to call for each iteration
+        base_args : Tuple
+            Base arguments to pass to iteration_func
+        args_builder : callable, optional
+            Function to build args from (b, seed), defaults to appending seed
+            
+        Returns
+        -------
+        Tuple[np.ndarray, np.ndarray]
+            (bootstrap coefficients, bootstrap sizes)
+        """
+        if args_builder is None:
+            args_builder = lambda b, seed: base_args + (seed,)
+        
+        args_list = [(b,) + args_builder(b, self.seeds[b]) for b in range(self.n_bootstraps)]
+        
+        runner = self._run_sequential if self.n_jobs == 1 else self._run_parallel
+        return runner(iteration_func, args_list)
+    
+    def _run_sequential(self, iteration_func, args_list) -> Tuple[np.ndarray, np.ndarray]:
+        """Run bootstrap sequentially with progress bar."""
+        try:
+            from tqdm import tqdm
+            print(f"Starting bootstrap with {self.n_bootstraps} iterations (sequential)")
+            results = [iteration_func(args) for args in tqdm(args_list)]
+        except ImportError:
+            results = [iteration_func(args) for args in args_list]
+        return self._parse_results(results)
+    
+    def _run_parallel(self, iteration_func, args_list) -> Tuple[np.ndarray, np.ndarray]:
+        """Run bootstrap in parallel using joblib."""
+        from joblib import Parallel, delayed
+        
+        print(f"Starting bootstrap with {self.n_bootstraps} iterations ({self.n_jobs} jobs)")
+        results = Parallel(n_jobs=self.n_jobs, verbose=10)(
+            delayed(iteration_func)(args) for args in args_list
+        )
+        return self._parse_results(results)
+    
+    def _parse_results(self, results) -> Tuple[np.ndarray, np.ndarray]:
+        """Parse results into coefficient and size arrays."""
+        boot_coefs = np.array([r[0] for r in results])
+        boot_sizes = np.array([r[1] for r in results])
+        return boot_coefs, boot_sizes
+
+
+# ============================================================================
 # Public API Exports
 # ============================================================================
 
@@ -1093,6 +1234,11 @@ __all__ = [
     # Helper functions
     'sandwich_from_meat',
     'compute_cluster_scores',
+    
+    # Bootstrap utilities
+    'BootstrapExecutor',
+    '_bootstrap_iteration_iid',
+    '_bootstrap_iteration_cluster',
     
     # Legacy functions (pyfixest-style, less commonly used)
     'vcov_iid',

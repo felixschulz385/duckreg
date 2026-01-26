@@ -25,6 +25,7 @@ class DuckRegression(DuckLinearModel):
     def __init__(self, rowid_col: str = "rowid", **kwargs):
         super().__init__(**kwargs)
         self.rowid_col = rowid_col
+        self.n_rows_dropped_singletons = 0
         # Use raw names for internal logic
         self.strata_cols = self.covariates + self.fe_cols
         

@@ -40,6 +40,7 @@ def compressed_ols(
     n_jobs: int = 1,
     se_method: str = SEMethod.HC1,
     fitter: str = "numpy",
+    remove_singletons: bool = True,
     **kwargs
 ) -> "DuckEstimator":
     """High-level API for compressed OLS regression with lfe-style formula.
@@ -64,6 +65,7 @@ def compressed_ols(
         n_jobs: Number of parallel jobs for bootstrap
         se_method: Method for computing standard errors ('iid', 'HC1', 'CRV1', 'BS', or 'none')
         fitter: Estimation method ('numpy' for in-memory, 'duckdb' for out-of-core)
+        remove_singletons: If True, remove observations from singleton FE groups (default=True)
         **kwargs: Additional arguments passed to estimator
     
     Returns:
@@ -114,6 +116,7 @@ def compressed_ols(
             n_jobs=n_jobs,
             fitter=fitter,
             fe_method=resolved_fe_method,
+            remove_singletons=remove_singletons,
             **kwargs
         )
     else:
@@ -136,6 +139,7 @@ def compressed_ols(
             duckdb_kwargs=duckdb_kwargs,
             n_jobs=n_jobs,
             fitter=fitter,
+            remove_singletons=remove_singletons,
             **kwargs
         )
     

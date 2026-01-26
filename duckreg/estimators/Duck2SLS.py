@@ -101,6 +101,7 @@ class Duck2SLS(DuckEstimator):
         n_jobs: int = 1,
         fitter: str = "numpy",
         fe_method: str = "mundlak",
+        remove_singletons: bool = True,
         **kwargs,
     ):
         super().__init__(
@@ -111,6 +112,7 @@ class Duck2SLS(DuckEstimator):
             round_strata=round_strata,
             duckdb_kwargs=duckdb_kwargs,
             fitter=fitter,
+            remove_singletons=remove_singletons,
             **kwargs,
         )
         
@@ -137,6 +139,7 @@ class Duck2SLS(DuckEstimator):
         self._first_stage_results: Dict[str, FirstStageResults] = {}
         self._results: Optional[RegressionResults] = None
         self.n_compressed_rows: Optional[int] = None
+        self.n_rows_dropped_singletons: int = 0
         
         # Design matrices (populated during estimation)
         self._y: Optional[np.ndarray] = None
@@ -387,10 +390,53 @@ class Duck2SLS(DuckEstimator):
         {self._build_where_clause()}
         """)
         
+        # Remove singleton FE observations if requested
+        self._remove_singleton_fe_observations()
+        
         self.n_obs = self.conn.execute(
             f"SELECT COUNT(*) FROM {self._DATA_TABLE}"
         ).fetchone()[0]
         self.n_compressed_rows = self.n_obs
+
+    def _remove_singleton_fe_observations(self):
+        """Remove observations from singleton FE groups if remove_singletons=True.
+        
+        A singleton group is one with exactly one observation. These observations
+        are perfectly predicted by FE dummies and cause issues in estimation.
+        Uses QUALIFY clause for efficient single-pass filtering.
+        """
+        if not self.remove_singletons or not self.fe_cols:
+            return
+        
+        logger.debug(f"Removing singleton FE observations from {len(self.fe_cols)} FE groups")
+        
+        # Build QUALIFY conditions - check each FE separately (AND condition)
+        # An observation is a singleton if it's alone in ANY of the FE dimensions
+        qualify_conditions = []
+        for fe_col_name in self.fe_cols:
+            # Get FE SQL name
+            fe_var = self.formula.get_fe_by_name(fe_col_name)
+            mfe = self.formula.get_merged_fe_by_name(fe_col_name) if hasattr(self.formula, 'get_merged_fe_by_name') else None
+            fe_sql_name = fe_var.sql_name if fe_var else (mfe.sql_name if mfe else fe_col_name)
+            qualify_conditions.append(f"count(*) OVER (PARTITION BY {fe_sql_name}) > 1")
+        
+        if not qualify_conditions:
+            return
+        
+        # Recreate table with singletons filtered out
+        qualify_clause = f"QUALIFY {' AND '.join(qualify_conditions)}"
+        
+        self.conn.execute(f"""
+        CREATE OR REPLACE TABLE {self._DATA_TABLE} AS
+        SELECT * FROM {self._DATA_TABLE}
+        {qualify_clause}
+        """)
+        
+        remaining_obs = self.conn.execute(
+            f"SELECT COUNT(*) FROM {self._DATA_TABLE}"
+        ).fetchone()[0]
+        logger.debug(f"IV data after singleton removal: {remaining_obs} observations")
+
 
 
 

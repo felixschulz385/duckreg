@@ -1,9 +1,12 @@
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+import logging
 
 from .base import DuckReg
 from ..core.fitters import wls
+
+logger = logging.getLogger(__name__)
 
 
 class DuckDoubleDemeaning(DuckReg):
@@ -20,6 +23,7 @@ class DuckDoubleDemeaning(DuckReg):
         cluster_col: str = None,
         duckdb_kwargs: dict = None,
         variable_casts: dict = None,
+        remove_singletons: bool = True,
         **kwargs,
     ):
         super().__init__(
@@ -29,25 +33,59 @@ class DuckDoubleDemeaning(DuckReg):
             n_bootstraps=n_bootstraps,
             duckdb_kwargs=duckdb_kwargs,
             variable_casts=variable_casts,
+            remove_singletons=remove_singletons,
             **kwargs,
         )
         self.outcome_var = outcome_var
         self.treatment_var = treatment_var
         self.fe_cols = fe_cols
         self.cluster_col = cluster_col
+        self.n_rows_dropped_singletons = 0
 
     def prepare_data(self):
+        # Filter singletons using QUALIFY if requested
+        if self.remove_singletons and self.fe_cols:
+            # Get rows before removal
+            rows_before = self.conn.execute(
+                f"SELECT COUNT(*) FROM {self.table_name}"
+            ).fetchone()[0]
+            
+            # Build QUALIFY conditions - check each FE separately
+            qualify_conditions = [
+                f"count(*) OVER (PARTITION BY {fe_col}) > 1"
+                for fe_col in self.fe_cols
+            ]
+            qualify_clause = f"QUALIFY {' AND '.join(qualify_conditions)}"
+            
+            # Create temporary table without singletons using QUALIFY
+            self.conn.execute(f"""
+            CREATE TEMP TABLE data_no_singletons AS
+            SELECT * FROM {self.table_name}
+            {qualify_clause}
+            """)
+            
+            rows_after = self.conn.execute(
+                f"SELECT COUNT(*) FROM data_no_singletons"
+            ).fetchone()[0]
+            
+            self.n_rows_dropped_singletons = rows_before - rows_after
+            logger.debug(f"Filtered singleton observations: {self.n_rows_dropped_singletons} rows removed "
+                        f"({rows_before} → {rows_after} rows)")
+            source_table = "data_no_singletons"
+        else:
+            source_table = self.table_name
+        
         self.conn.execute(f"""
         CREATE TEMP TABLE overall_mean AS
         SELECT AVG({self._cast_col(self.treatment_var)}) AS mean_{self.treatment_var}
-        FROM {self.table_name}
+        FROM {source_table}
         """)
 
         for i, fe_col in enumerate(self.fe_cols):
             self.conn.execute(f"""
             CREATE TEMP TABLE fe_{i}_means AS
             SELECT {self._cast_col(fe_col)} AS {fe_col}, AVG({self._cast_col(self.treatment_var)}) AS mean_{self.treatment_var}_fe{i}
-            FROM {self.table_name}
+            FROM {source_table}
             GROUP BY {self._cast_col(fe_col)}
             """)
 
@@ -58,7 +96,7 @@ class DuckDoubleDemeaning(DuckReg):
         self.conn.execute(f"""
         CREATE TEMP TABLE multi_demeaned AS
         SELECT {", ".join([f"t.{fe_col}" for fe_col in self.fe_cols])}, t.{self.outcome_var}, {demean_formula} AS ddot_{self.treatment_var}
-        FROM {self.table_name} t {" ".join(join_clauses)} CROSS JOIN overall_mean om
+        FROM {source_table} t {" ".join(join_clauses)} CROSS JOIN overall_mean om
         """)
 
     def compress_data(self):
@@ -113,6 +151,7 @@ class DuckDoubleDemeaning(DuckReg):
             "coef_names": getattr(self, 'coef_names_', None),
             "n_obs": getattr(self, 'n_obs', None),
             "n_obs_compressed": len(self.df_compressed) if hasattr(self, 'df_compressed') else None,
+            "n_rows_dropped_singletons": self.n_rows_dropped_singletons,
             "estimator_type": "DuckDoubleDemeaning",
             "fe_method": "double_demean",
             "outcome_var": self.outcome_var,

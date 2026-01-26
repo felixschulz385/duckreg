@@ -40,6 +40,10 @@ class DuckMundlak(DuckLinearModel):
     _CLUSTER_ALIAS = "__cluster__"
     _DESIGN_MATRIX_TABLE = "design_matrix"
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.n_rows_dropped_singletons = 0
+
     # -------------------------------------------------------------------------
     # Overrides for Mundlak-specific behavior
     # -------------------------------------------------------------------------
@@ -105,6 +109,9 @@ class DuckMundlak(DuckLinearModel):
         {self._build_where_clause(self.subset)}
         """)
         
+        # Remove singleton FEs if requested
+        self._remove_singleton_observations()
+        
         self._add_fe_averages()
         
         cols = self._get_design_matrix_columns()
@@ -115,6 +122,55 @@ class DuckMundlak(DuckLinearModel):
         return self.conn.execute(
             f"SELECT column_name FROM (DESCRIBE {self._DESIGN_MATRIX_TABLE})"
         ).fetchdf()['column_name'].tolist()
+
+    def _remove_singleton_observations(self):
+        """Remove observations from singleton FE groups if remove_singletons=True.
+        
+        A singleton group is one with exactly one observation. These observations
+        are perfectly predicted by FE dummies and cause issues in estimation.
+        Uses QUALIFY clause for efficient single-pass filtering.
+        """
+        if not self.remove_singletons or not self.fe_cols:
+            return
+        
+        logger.debug(f"Removing singleton FE observations from {len(self.fe_cols)} FE groups")
+        
+        # Get rows before removal
+        rows_before = self.conn.execute(
+            f"SELECT COUNT(*) FROM {self._DESIGN_MATRIX_TABLE}"
+        ).fetchone()[0]
+        
+        # Get FE SQL names
+        fe_sql_names = []
+        for fe_col_name in self.fe_cols:
+            fe_var = self.formula.get_fe_by_name(fe_col_name)
+            mfe = self.formula.get_merged_fe_by_name(fe_col_name)
+            fe_sql_name = fe_var.sql_name if fe_var else (mfe.sql_name if mfe else fe_col_name)
+            fe_sql_names.append(fe_sql_name)
+        
+        # Build QUALIFY clause - check each FE separately (AND condition)
+        # An observation is removed if it's alone in ANY of the FE dimensions
+        qualify_conditions = [
+            f"count(*) OVER (PARTITION BY {fe_sql}) > 1"
+            for fe_sql in fe_sql_names
+        ]
+        qualify_clause = f"QUALIFY {' AND '.join(qualify_conditions)}"
+        
+        # Recreate table with singletons filtered out
+        self.conn.execute(f"""
+        CREATE OR REPLACE TABLE {self._DESIGN_MATRIX_TABLE} AS
+        SELECT * FROM {self._DESIGN_MATRIX_TABLE}
+        {qualify_clause}
+        """)
+        
+        rows_after = self.conn.execute(
+            f"SELECT COUNT(*) FROM {self._DESIGN_MATRIX_TABLE}"
+        ).fetchone()[0]
+        
+        self.n_rows_dropped_singletons = rows_before - rows_after
+        logger.debug(f"Design matrix after singleton removal: {rows_after} observations "
+                    f"({self.n_rows_dropped_singletons} singletons removed)")
+
 
     def _add_fe_averages(self):
         """Add FE-level averages for Mundlak device (excluding intercept)"""

@@ -9,7 +9,7 @@ Version history:
 - 0.2.0: Initial versioning system
 """
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 # Git commit hash (populated during build/install if available)
 __git_commit__ = None

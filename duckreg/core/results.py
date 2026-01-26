@@ -420,6 +420,7 @@ class ModelSummary:
     # Sample information
     n_obs: Optional[int] = None
     n_compressed: Optional[int] = None
+    n_rows_dropped_singletons: Optional[int] = None
     
     # Results
     coefficients: Optional[Dict[str, Any]] = None
@@ -469,6 +470,7 @@ class ModelSummary:
             "sample_info": {
                 "n_obs": self.n_obs,
                 "n_compressed": self.n_compressed,
+                "n_rows_dropped_singletons": self.n_rows_dropped_singletons,
                 "compression_ratio": self.compression_ratio,
             },
             "coefficients": self.coefficients,
@@ -509,6 +511,7 @@ class ModelSummary:
             "fe_method": getattr(estimator, 'fe_method', None),
             "n_obs": getattr(estimator, 'n_obs', None),
             "n_compressed": getattr(estimator, 'n_compressed_rows', None),
+            "n_rows_dropped_singletons": getattr(estimator, 'n_rows_dropped_singletons', None),
         }
         
         # Coefficients

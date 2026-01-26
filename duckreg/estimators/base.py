@@ -35,6 +35,7 @@ class DuckEstimator(ABC):
         keep_connection_open: bool = False,
         round_strata: int = None,
         duckdb_kwargs: dict = None,
+        remove_singletons: bool = True,
     ):
         logger.debug(f"DuckEstimator.__init__: db={db_name}, table={table_name}")
         
@@ -46,6 +47,7 @@ class DuckEstimator(ABC):
         self.keep_connection_open = keep_connection_open
         self.round_strata = round_strata
         self.duckdb_kwargs = duckdb_kwargs
+        self.remove_singletons = remove_singletons
         
         # State
         self.conn: Optional[duckdb.DuckDBPyConnection] = None
@@ -55,6 +57,7 @@ class DuckEstimator(ABC):
         self.se: Optional[str] = None
         self.coef_names_: Optional[List[str]] = None
         self.n_obs: Optional[int] = None
+        self.n_rows_dropped_singletons: int = 0
         
         self._init_connection()
 
@@ -186,6 +189,25 @@ class DuckEstimator(ABC):
         if hasattr(self, 'formula'):
             return self.formula.get_where_clause_sql(user_subset)
         return f"WHERE ({user_subset})" if user_subset else ""
+
+    def _build_qualify_singleton_filter(self, fe_col_sql_names: List[str]) -> str:
+        """Build QUALIFY clause to exclude singleton groups from multiple FE columns.
+        
+        Uses window functions for efficiency - single pass filter vs multiple DELETE statements.
+        A singleton group is one with exactly one observation.
+        
+        Args:
+            fe_col_sql_names: List of SQL names of fixed effects columns
+            
+        Returns:
+            QUALIFY clause excluding singletons (empty string if remove_singletons=False)
+        """
+        if not self.remove_singletons or not fe_col_sql_names:
+            return ""
+        
+        # Build window function for all FE columns
+        partition_clause = ', '.join(fe_col_sql_names)
+        return f"QUALIFY count(*) OVER (PARTITION BY {partition_clause}) > 1"
 
     def summary(self) -> Dict[str, Any]:
         """Provide results summary. Subclasses should override for richer output."""

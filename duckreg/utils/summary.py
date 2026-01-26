@@ -95,7 +95,11 @@ def format_model_summary(
         
         n_obs = sample_info.get('n_obs')
         if n_obs is not None:
-            lines.append(f"Observations: {n_obs:,}")
+            lines.append(f"Observations (final): {n_obs:,}")
+        
+        n_rows_dropped = sample_info.get('n_rows_dropped_singletons')
+        if n_rows_dropped and n_rows_dropped > 0:
+            lines.append(f"Rows dropped (singletons): {n_rows_dropped:,}")
         
         n_compressed = sample_info.get('n_compressed')
         if n_compressed is not None:

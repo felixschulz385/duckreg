@@ -65,6 +65,7 @@ class DuckLinearModel(DuckEstimator):
         subset: str = None,
         n_jobs: int = 1,
         fitter: str = "numpy",
+        remove_singletons: bool = True,
         **kwargs,
     ):
         if formula is None:
@@ -78,6 +79,7 @@ class DuckLinearModel(DuckEstimator):
             round_strata=round_strata,
             duckdb_kwargs=duckdb_kwargs,
             fitter=fitter,
+            remove_singletons=remove_singletons,
             **kwargs,
         )
         

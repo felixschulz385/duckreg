@@ -12,8 +12,7 @@ import os
 from pathlib import Path
 
 from duckreg import compressed_ols
-from duckreg.estimators import DuckMundlak, Duck2SLS
-from duckreg.estimators.DuckDoubleDemeaning import DuckDoubleDemeaning
+from duckreg.estimators import DuckFE, Duck2SLS
 from duckreg.utils.formula_parser import FormulaParser
 
 
@@ -78,7 +77,7 @@ def temp_data_file(data_with_singletons):
 
 
 class TestSingletonRemovalMundlak:
-    """Test singleton removal for DuckMundlak estimator."""
+    """Test singleton removal for FE estimator (mundlak method)."""
     
     def test_removes_singletons_by_default(self, temp_data_file, data_with_singletons):
         """Test that singletons are removed by default (remove_singletons=True)."""
@@ -263,7 +262,7 @@ class TestQualifyClauseGeneration:
     def test_qualify_single_fe(self, temp_data_file):
         """Test QUALIFY clause with single FE column."""
         formula = FormulaParser().parse("y ~ x | firm_id")
-        model = DuckMundlak(
+        model = DuckFE(
             db_name=":memory:",
             table_name=f"read_parquet('{temp_data_file}')",
             formula=formula,
@@ -280,7 +279,7 @@ class TestQualifyClauseGeneration:
     def test_qualify_multiple_fe(self, temp_data_file):
         """Test QUALIFY clause with multiple FE columns."""
         formula = FormulaParser().parse("y ~ x | firm_id + year")
-        model = DuckMundlak(
+        model = DuckFE(
             db_name=":memory:",
             table_name=f"read_parquet('{temp_data_file}')",
             formula=formula,
@@ -299,7 +298,7 @@ class TestQualifyClauseGeneration:
     def test_qualify_disabled(self, temp_data_file):
         """Test that QUALIFY clause is empty when remove_singletons=False."""
         formula = FormulaParser().parse("y ~ x | firm_id")
-        model = DuckMundlak(
+        model = DuckFE(
             db_name=":memory:",
             table_name=f"read_parquet('{temp_data_file}')",
             formula=formula,
@@ -315,8 +314,8 @@ class TestQualifyClauseGeneration:
 class TestModelSummaryIntegration:
     """Test that n_rows_dropped_singletons flows through ModelSummary class."""
     
-    def test_model_summary_tracks_dropped_rows_mundlak(self, data_with_singletons):
-        """Test ModelSummary properly captures n_rows_dropped_singletons from Mundlak."""
+    def test_model_summary_tracks_dropped_rows(self, data_with_singletons):
+        """Test ModelSummary properly captures n_rows_dropped_singletons from DuckFE."""
         from duckreg.core.results import ModelSummary
         
         df = pd.DataFrame(data_with_singletons)
@@ -329,7 +328,7 @@ class TestModelSummaryIntegration:
             df.to_parquet(temp_file)
             
             formula = FormulaParser().parse("y ~ x | firm_id")
-            model = DuckMundlak(
+            model = DuckFE(
                 db_name=":memory:",
                 table_name=f"read_parquet('{temp_file}')",
                 formula=formula,
@@ -364,7 +363,7 @@ class TestModelSummaryIntegration:
             df.to_parquet(temp_file)
             
             formula = FormulaParser().parse("y ~ x | firm_id")
-            model = DuckMundlak(
+            model = DuckFE(
                 db_name=":memory:",
                 table_name=f"read_parquet('{temp_file}')",
                 formula=formula,
@@ -399,7 +398,7 @@ class TestModelSummaryIntegration:
             df.to_parquet(temp_file)
             
             formula = FormulaParser().parse("y ~ x | firm_id")
-            model = DuckMundlak(
+            model = DuckFE(
                 db_name=":memory:",
                 table_name=f"read_parquet('{temp_file}')",
                 formula=formula,

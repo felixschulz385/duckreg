@@ -223,6 +223,8 @@ def compute_vcov_dispatch(
     ssc_dict: Optional[Dict[str, Any]] = None,
     k_fe: int = 0,
     n_fe: int = 0,
+    k_fe_nested: int = 0,
+    n_fe_fully_nested: int = 0,
     Z: Optional[np.ndarray] = None,
     is_iv: bool = False,
     alpha: float = DEFAULT_ALPHA
@@ -311,7 +313,10 @@ def compute_vcov_dispatch(
             is_iv=is_iv
         )
         
-        context = VcovContext(N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe)
+        context = VcovContext(
+            N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
+            k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested
+        )
         ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict else None
         vcov, vcov_meta = compute_cluster_vcov(
             bread=XtX_inv,
@@ -340,7 +345,10 @@ def compute_vcov_dispatch(
             is_iv=is_iv
         )
         
-        context = VcovContext(N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe)
+        context = VcovContext(
+            N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
+            k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested
+        )
         ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict else None
         vcov, vcov_meta = compute_iid_vcov(
             bread=XtX_inv,
@@ -513,6 +521,8 @@ class NumpyFitter(BaseFitter):
         ssc_dict: Optional[Dict[str, Any]] = None,
         k_fe: int = 0,
         n_fe: int = 0,
+        k_fe_nested: int = 0,
+        n_fe_fully_nested: int = 0,
         existing_result: Optional[FitterResult] = None,
         Z: Optional[np.ndarray] = None,
         is_iv: bool = False,
@@ -576,6 +586,8 @@ class NumpyFitter(BaseFitter):
             ssc_dict=ssc_dict,
             k_fe=k_fe,
             n_fe=n_fe,
+            k_fe_nested=k_fe_nested,
+            n_fe_fully_nested=n_fe_fully_nested,
             Z=Z,
             is_iv=is_iv,
             alpha=self.alpha
@@ -670,6 +682,8 @@ class DuckDBFitter(BaseFitter):
         ssc_dict: Optional[Dict[str, Any]] = None,
         k_fe: int = 0,
         n_fe: int = 0,
+        k_fe_nested: int = 0,
+        n_fe_fully_nested: int = 0,
         existing_result: Optional[FitterResult] = None,
         z_cols: Optional[List[str]] = None,
         is_iv: bool = False
@@ -751,7 +765,10 @@ class DuckDBFitter(BaseFitter):
                 is_iv=is_iv
             )
             
-            context = VcovContext(N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe)
+            context = VcovContext(
+                N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
+                k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested
+            )
             ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict else None
             vcov, vcov_meta = compute_cluster_vcov(
                 bread=XtX_inv,
@@ -775,7 +792,10 @@ class DuckDBFitter(BaseFitter):
                       compute_rss=True
                   )['rss'])
             
-            context = VcovContext(N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe)
+            context = VcovContext(
+                N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
+                k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested
+            )
             ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict else None
             vcov, vcov_meta = compute_iid_vcov(
                 bread=XtX_inv, rss=rss, context=context, ssc_config=ssc_config,

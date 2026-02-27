@@ -8,6 +8,8 @@ dist/*
 *.ipynb_checkpoints
 .vscode/*
 *.log
+**/log
+benchmarks/results
 *.bbl
 *.bcf
 *.fls

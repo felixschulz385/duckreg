@@ -209,6 +209,49 @@ class DuckEstimator(ABC):
         partition_clause = ', '.join(fe_col_sql_names)
         return f"QUALIFY count(*) OVER (PARTITION BY {partition_clause}) > 1"
 
+    def _remove_singleton_observations(self, table_name: str, fe_col_sql_names: List[str]):
+        """Remove observations from singleton FE groups if remove_singletons=True.
+        
+        Strategy:
+        Uses ANTI JOIN to exclude observations from singleton groups (groups with < 2 obs).
+        Processes each FE dimension sequentially since removing singletons in one dimension
+        can create new singletons in another dimension.
+        
+        An observation is removed if it belongs to a singleton group in ANY FE dimension.
+        
+        Args:
+            table_name: Name of the table to filter
+            fe_col_sql_names: List of SQL names of fixed effects columns
+        """
+        if not self.remove_singletons or not fe_col_sql_names:
+            return
+        
+        logger.debug(f"Removing singleton FE observations from {len(fe_col_sql_names)} FE groups")
+        
+        rows_before = self.conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        
+        # Process each FE dimension sequentially
+        for fe_sql in fe_col_sql_names:
+            # Use ANTI JOIN to exclude singleton groups directly
+            self.conn.execute(f"""
+            CREATE OR REPLACE TABLE {table_name} AS
+            SELECT *
+            FROM {table_name}
+            ANTI JOIN (
+                SELECT {fe_sql}
+                FROM {table_name}
+                GROUP BY {fe_sql}
+                HAVING COUNT(*) < 2
+            ) singletons
+            USING ({fe_sql})
+            """)
+        
+        rows_after = self.conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        self.n_rows_dropped_singletons = rows_before - rows_after
+        
+        logger.debug(f"After singleton removal: {rows_after} observations "
+                    f"({self.n_rows_dropped_singletons} rows removed)")
+
     def summary(self) -> Dict[str, Any]:
         """Provide results summary. Subclasses should override for richer output."""
         return {

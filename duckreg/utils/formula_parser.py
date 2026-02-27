@@ -801,7 +801,10 @@ class FormulaParser:
                     name=merged_name,
                     sql_name=merged_sql_name,
                     components=components,
-                    use_numeric_merge=(len(components) == 2)
+                    # Default to VARCHAR (safe).  Call resolve_numeric_merge()
+                    # with a live DuckDB connection to upgrade 2-component merged
+                    # FEs whose columns are actually integer types.
+                    use_numeric_merge=False,
                 ))
             else:
                 fixed_effects.append(self._parse_single_variable(term, VariableRole.FIXED_EFFECT))
@@ -887,6 +890,109 @@ class FormulaParser:
         
         return endogenous, instruments
     
+    @staticmethod
+    def resolve_numeric_merge(formula: "Formula", conn, table_name: str) -> "Formula":
+        """Return a *new* Formula with ``use_numeric_merge`` set correctly.
+
+        For each :class:`MergedFixedEffect` with exactly two components, query
+        ``table_name`` to determine whether every component column is an
+        integer type.  If so, set ``use_numeric_merge=True`` on that object
+        and emit a WARNING if any component value could cause the packed
+        expression ``a * 1_000_000_000 + b`` to overflow BIGINT.
+
+        Non-2-component merged FEs are left unchanged (VARCHAR concatenation).
+
+        Parameters
+        ----------
+        formula : Formula
+            Parsed formula (output of :meth:`parse`).
+        conn : duckdb.DuckDBPyConnection
+            Active DuckDB connection used to inspect column types and ranges.
+        table_name : str
+            Source table/view against which the formula is evaluated.
+
+        Returns
+        -------
+        Formula
+            A new (frozen) Formula with updated ``merged_fes`` tuple.
+        """
+        from dataclasses import replace as _dc_replace
+
+        if not formula.merged_fes:
+            return formula
+
+        # Integer type families recognised as safe for the BIGINT merge path.
+        _NUMERIC_TYPES = {
+            'INTEGER', 'INT', 'SIGNED', 'INT4', 'INT2', 'INT1',
+            'BIGINT', 'INT8', 'LONG',
+            'SMALLINT', 'SHORT',
+            'TINYINT', 'INT1',
+            'HUGEINT', 'INT16',
+            'UBIGINT', 'UINTEGER', 'UINT4', 'USMALLINT', 'UTINYINT',
+            'UHUGEINT',
+        }
+        _OVERFLOW_THRESHOLD = 1_000_000_000  # multiplier used in get_sql_expression
+
+        # Get column types from the source table in one round-trip.
+        try:
+            type_rows = conn.execute(f"DESCRIBE {table_name}").fetchall()
+            # DESCRIBE returns (column_name, column_type, ...).  Normalise by
+            # stripping any parameterisation (e.g. "DECIMAL(10,2)" → "DECIMAL").
+            col_type: Dict[str, str] = {
+                row[0]: row[1].upper().split("(")[0].strip()
+                for row in type_rows
+            }
+        except Exception as exc:
+            logger.debug(f"resolve_numeric_merge: could not DESCRIBE {table_name}: {exc}")
+            return formula  # safe fallback — keep VARCHAR
+
+        new_mfes: List["MergedFixedEffect"] = []
+        for mfe in formula.merged_fes:
+            if len(mfe.components) != 2:
+                new_mfes.append(mfe)
+                continue
+
+            # Check that every component column is an integer type.
+            all_numeric = all(
+                col_type.get(comp.name, "") in _NUMERIC_TYPES
+                for comp in mfe.components
+            )
+
+            if not all_numeric:
+                new_mfes.append(mfe)
+                continue
+
+            # Check for overflow risk on a row sample (~50 k rows).
+            use_numeric = True
+            for comp in mfe.components:
+                try:
+                    row = conn.execute(
+                        f"SELECT MAX(ABS(CAST({comp.name} AS BIGINT))) "
+                        f"FROM (SELECT {comp.name} FROM {table_name} "
+                        f"USING SAMPLE 50000 ROWS) _s"
+                    ).fetchone()
+                    max_abs = row[0] if row and row[0] is not None else 0
+                    if max_abs >= _OVERFLOW_THRESHOLD:
+                        logger.warning(
+                            f"Merged FE component '{comp.name}' has estimated "
+                            f"MAX(ABS)={max_abs:,} \u2265 {_OVERFLOW_THRESHOLD:,}. "
+                            f"Numeric merge expression may overflow BIGINT for merged FE "
+                            f"'{mfe.name}'. Falling back to VARCHAR merge."
+                        )
+                        use_numeric = False
+                        break
+                except Exception as exc:
+                    logger.debug(
+                        f"resolve_numeric_merge: overflow check failed for "
+                        f"'{comp.name}': {exc} — using VARCHAR merge."
+                    )
+                    use_numeric = False
+                    break
+
+            new_mfes.append(_dc_replace(mfe, use_numeric_merge=use_numeric))
+
+        return _dc_replace(formula, merged_fes=tuple(new_mfes))
+
     def _find_instrument_paren_start(self, iv_string: str) -> int:
         """Find the opening parenthesis that starts the instrument list.
         

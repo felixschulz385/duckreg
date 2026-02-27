@@ -1,92 +1,91 @@
 """
 Two-Stage Least Squares (2SLS) / Instrumental Variables Estimator
 
-This module provides a self-contained 2SLS estimator that computes correct 
-standard errors using residuals from actual endogenous variables.
+Refactored to use the same FETransformer architecture as DuckFE.  Fixed-effect
+absorption in both stages is delegated to MundlakTransformer (or, for the
+special case of no fixed effects, the stage is simply a plain OLS).
 
-Key Design Principles:
-1. Self-contained: Does not delegate to sub-estimators to avoid state conflicts
-2. Direct computation: Builds design matrices directly in Python/numpy or SQL
-3. Correct SEs: Uses actual endogenous values for residual computation
-4. IV-adjusted sandwich: Applies proper IV correction to the meat matrix
-5. Mundlak device: Handles FEs by including group means as regressors
+Pipeline
+--------
+1. ``prepare_data()``:  build ``_iv_staging`` from the source table using the
+   same formula-helper pattern as DuckFE, plus a ``_row_idx`` column for
+   reliable row-level joins between the transformer's ``design_matrix`` and the
+   staging table.
 
-Standard Error Computation:
-    The second-stage standard errors use the IV-adjusted sandwich estimator:
-    
+2. ``compress_data()`` (= first + second stage setup):
+
+   a. For each endogenous variable, run ``MundlakTransformer`` on
+      ``_iv_staging`` with ``covariate_cols = exog + instruments``
+      (Mundlak path), **or** demean all variables once up front via
+      ``IterativeDemeanTransformer`` (demean path).
+
+   b. Run ``MundlakTransformer`` on the updated ``_iv_staging`` with
+      ``covariate_cols = exog + fitted_endog + instruments`` (all three so that
+      both X-extra and Z-extra Mundlak means are available).  Create a
+      compressed view (DuckDB path) or fetch numpy arrays directly.
+
+Standard Error Computation
+--------------------------
+Second-stage SEs use the IV-adjusted sandwich estimator::
+
     V = Bread @ Meat_IV @ Bread
-    
-    where:
-        Bread = (X'P_Z X)^{-1}  (inverse Hessian)
-        Meat_IV = (X'Z)(Z'Z)^{-1} Omega (Z'Z)^{-1} (Z'X)  (IV-adjusted meat)
-        Omega = X' diag(e²w) X  (inner meat from scores using actual X)
-        Z = instrument matrix (intercept + exogenous + instruments + FE means)
-    
-    This ensures correct inference for instrumental variable estimation, accounting
-    for the first-stage prediction uncertainty through the instrument projection.
 
-Out-of-Core Processing:
-    When using fitter='duckdb', all computations are done in SQL without loading
-    full data into memory. First stage coefficients are computed via sufficient
-    statistics, fitted values are computed in SQL, and second stage uses the
-    DuckDBFitter with pre-computed residuals for correct 2SLS standard errors.
+where::
+
+    Bread   = (X̂'X̂)⁻¹
+    Meat_IV = (X̂'Z)(Z'Z)⁻¹ Ω (Z'Z)⁻¹ (Z'X̂)
+    Ω       = X'diag(e²w)X  (inner meat, evaluated at *actual* X)
+    X̂      = design matrix with fitted endogenous
+    Z       = instrument matrix (intercept + exog + instruments + FE controls)
 """
+
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import logging
-from typing import Tuple, Optional, List, Dict, Any
 
-from ..utils.formula_parser import cast_if_boolean, quote_identifier
-from ..core.fitters import wls, NumpyFitter, DuckDBFitter
 from .base import DuckEstimator
-
-# Import from refactored modules - following DRY principle
+from ..core.transformers import MundlakTransformer, IterativeDemeanTransformer, AutoFETransformer
+from ..core.fitters import NumpyFitter, DuckDBFitter
 from ..core.results import RegressionResults, FirstStageResults
-from ..core.vcov import BootstrapExecutor, _bootstrap_iteration_iid, _bootstrap_iteration_cluster
-from ..core.sql_builders import (
-    get_boolean_columns,
-    build_x_cols_for_duckdb,
-    build_z_cols_for_duckdb,
-    build_residual_x_cols_for_duckdb
-)
+from ..utils.formula_parser import cast_if_boolean, quote_identifier
 from ..utils.name_utils import build_coef_name_lists, build_first_stage_coef_names
 
 logger = logging.getLogger(__name__)
 
 
 class Duck2SLS(DuckEstimator):
-    """Two-Stage Least Squares (2SLS) / Instrumental Variables estimator.
-    
-    This estimator handles IV regression with:
-    - Multiple endogenous variables
-    - Fixed effects via Mundlak device
-    - Cluster-robust and HC1 standard errors
-    - Correct 2SLS standard errors using actual (not fitted) residuals
-    
-    The standard error formula uses residuals e = y - X_actual * β where X_actual
-    contains the actual endogenous variables, not the fitted values from the
-    first stage. This is the correct approach for 2SLS.
-    
-    Out-of-Core Processing:
-        With fitter='duckdb', all computations are done in SQL:
-        - First stage: DuckDBFitter computes sufficient statistics in SQL
-        - Fitted values: Computed via SQL UPDATE statements
-        - Second stage: DuckDBFitter with pre-computed residuals
-        - Mundlak means: Computed via SQL GROUP BY
-        
-        This allows estimation on datasets larger than available memory.
-    
-    Estimation Pipeline:
-    1. Create data table with all variables
-    2. Run first stage for each endogenous variable (add Mundlak means in SQL)
-    3. Add fitted values columns via SQL
-    4. Estimate second stage coefficients 
-    5. Compute residuals using actual endogenous and compute vcov
+    """Two-Stage Least Squares estimator using transformer-based FE absorption.
+
+    Fixed effects are absorbed via the Mundlak device: group-means of
+    covariates and instruments are added as explicit regressors.  The
+    transformer handles FE profiling (fixed vs. asymptotic), Wooldridge
+    correction for unbalanced panels, and all column bookkeeping.
+
+    Parameters
+    ----------
+    db_name, table_name, formula
+        Standard DuckEstimator / formula arguments.
+    method : str
+        FE absorption strategy.  ``'mundlak'`` (default) adds within-group
+        means of all covariates and instruments.  ``'demean'`` absorbs FEs via
+        iterative demeaning (MAP) and runs both stages without an intercept.
+    fe_types, cardinality_threshold, singleton_threshold, max_fixed_fe_levels
+        Forwarded to :class:`MundlakTransformer` for FE classification
+        (``method='mundlak'`` only).
+    max_iterations, tolerance
+        Forwarded to :class:`IterativeDemeanTransformer` for MAP convergence
+        (``method='demean'`` only).
+    fitter : {'numpy', 'duckdb'}
+        Estimation backend.  Note: when ``method='demean'``, the numpy
+        backend is always used regardless of this setting.
     """
-    
-    _DATA_TABLE = "iv_data"
+
+    _STAGING_TABLE   = "_iv_staging"
     _COMPRESSED_VIEW = "iv_compressed"
+    _CLUSTER_ALIAS   = "__cluster__"
+    _DEMEANED_STAGING = "_demeaned_staging"
     
     def __init__(
         self,
@@ -100,8 +99,20 @@ class Duck2SLS(DuckEstimator):
         subset: str = None,
         n_jobs: int = 1,
         fitter: str = "numpy",
-        fe_method: str = "mundlak",
+        method: str = "mundlak",
+        # backward-compat alias
+        fe_method: str = None,
+        # Transformer tuning (forwarded to MundlakTransformer)
+        fe_types: Optional[Dict[str, str]] = None,
+        cardinality_threshold: int = 50,
+        singleton_threshold: float = 0.1,
+        max_fixed_fe_levels: int = 100,
         remove_singletons: bool = True,
+        # IterativeDemeanTransformer tuning (used when method='demean')
+        max_iterations: int = 1000,
+        tolerance: float = 1e-8,
+        # AutoFETransformer tuning (used when method='auto_fe')
+        auto_fe_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         super().__init__(
@@ -115,170 +126,914 @@ class Duck2SLS(DuckEstimator):
             remove_singletons=remove_singletons,
             **kwargs,
         )
-        
+
         self.formula = formula
-        self.n_jobs = n_jobs
-        self.subset = subset
-        self.fe_method = fe_method
-        
-        # Extract from formula
-        self.outcome_vars = formula.get_outcome_names()
-        self.fe_cols = formula.get_fe_names()
-        self.cluster_col = formula.cluster.name if formula.cluster else None
-        
-        # IV-specific
+        self.n_jobs  = n_jobs
+        self.subset  = subset
+        self.method  = fe_method or method   # fe_method kept for compat
+
+        if self.method not in ("mundlak", "demean", "auto_fe"):
+            raise ValueError(
+                f"Duck2SLS: unsupported method '{self.method}'.  "
+                "Valid options are 'mundlak', 'demean', and 'auto_fe'."
+            )
+
+        self.max_iterations = max_iterations
+        self.tolerance      = tolerance
+        self.auto_fe_kwargs: Dict[str, Any] = auto_fe_kwargs or {}
+
+        # Transformer tuning
+        self.fe_types              = fe_types or {}
+        self.cardinality_threshold = cardinality_threshold
+        self.singleton_threshold   = singleton_threshold
+        self.max_fixed_fe_levels   = max_fixed_fe_levels
+
+        # Formula extractions
+        self.outcome_vars    = formula.get_outcome_names()
+        self.fe_cols         = formula.get_fe_names()
+        self.cluster_col     = formula.cluster.name if formula.cluster else None
         self.endogenous_vars = formula.get_endogenous_display_names()
         self.instrument_vars = formula.get_instrument_display_names()
-        self.exogenous_vars = [
-            var.display_name for var in formula.covariates 
-            if not var.is_intercept() and var.display_name not in self.endogenous_vars
+        self.exogenous_vars  = [
+            v.display_name for v in formula.covariates
+            if not v.is_intercept() and v.display_name not in
+            formula.get_endogenous_display_names()
         ]
-        self._has_intercept = any(var.is_intercept() for var in formula.covariates)
-        
-        # Storage
+
+        # Internal state
         self._first_stage_results: Dict[str, FirstStageResults] = {}
         self._results: Optional[RegressionResults] = None
         self.n_compressed_rows: Optional[int] = None
         self.n_rows_dropped_singletons: int = 0
-        
-        # Design matrices (populated during estimation)
-        self._y: Optional[np.ndarray] = None
-        self._X_fitted: Optional[np.ndarray] = None
-        self._X_actual: Optional[np.ndarray] = None
-        self._Z: Optional[np.ndarray] = None  # Instrument matrix for IV SE correction
-        self._weights: Optional[np.ndarray] = None
+
+        # Second-stage transformer and cached SQL name lists
+        self._ss_transformer:   Optional[MundlakTransformer] = None
+        self._ss_result_table:  Optional[str]                = None
+        self._exog_sql:         Optional[List[str]]          = None
+        self._fitted_endog_sql: Optional[List[str]]          = None
+        self._actual_endog_sql: Optional[List[str]]          = None
+        self._outcome_sql:      Optional[List[str]]          = None
+        self._inst_sql:         Optional[List[str]]          = None
+        self._fitter_result     = None
+
+        # Demean-path state
+        self._demean_transformer:   Optional[IterativeDemeanTransformer] = None
+        self._demean_result_table:  Optional[str]                        = None
+        self._df_correction:        int                                  = 0
+
+        # Numpy-path arrays
+        self._y:           Optional[np.ndarray] = None
+        self._X_fitted:    Optional[np.ndarray] = None
+        self._X_actual:    Optional[np.ndarray] = None
+        self._Z:           Optional[np.ndarray] = None
+        self._weights:     Optional[np.ndarray] = None
         self._cluster_ids: Optional[np.ndarray] = None
-        
-        logger.debug(f"Duck2SLS: endogenous={self.endogenous_vars}, "
-                    f"instruments={self.instrument_vars}, "
-                    f"exogenous={self.exogenous_vars}, fe_method={fe_method}")
+
+        logger.debug(
+            f"Duck2SLS: endogenous={self.endogenous_vars}, "
+            f"instruments={self.instrument_vars}, method={self.method}"
+        )
 
     # =========================================================================
     # Properties
     # =========================================================================
-    
+
     @property
     def first_stage(self) -> Dict[str, FirstStageResults]:
-        """Get first stage results for all endogenous variables"""
         return self._first_stage_results
-    
+
     @property
     def results(self) -> Optional[RegressionResults]:
-        """Get regression results as RegressionResults object"""
         if self._results is not None:
             return self._results
         if self.point_estimate is None:
             return None
         self._results = RegressionResults(
             coefficients=self.point_estimate,
-            coef_names=getattr(self, 'coef_names_', []),
-            vcov=getattr(self, 'vcov', None),
-            n_obs=getattr(self, 'n_obs', None),
+            coef_names=getattr(self, "coef_names_", []),
+            vcov=getattr(self, "vcov", None),
+            n_obs=getattr(self, "n_obs", None),
             n_compressed=self.n_compressed_rows,
-            se_type=getattr(self, 'se', None),
+            se_type=getattr(self, "se", None),
         )
         return self._results
-    
+
     def get_first_stage_f_stats(self) -> Dict[str, Optional[float]]:
-        """Get F-statistics for all first stages"""
-        return {endog: fs.f_statistic for endog, fs in self._first_stage_results.items()}
-    
+        """Get F-statistics for all first stages."""
+        return {e: fs.f_statistic for e, fs in self._first_stage_results.items()}
+
     def has_weak_instruments(self) -> bool:
-        """Check if any first stage has weak instruments (F < 10)"""
+        """Check if any first stage has weak instruments (F < 10)."""
         return any(
-            fs.is_weak_instrument for fs in self._first_stage_results.values() 
+            fs.is_weak_instrument
+            for fs in self._first_stage_results.values()
             if fs.is_weak_instrument is not None
         )
 
     # =========================================================================
-    # Main Pipeline (implements DuckEstimator interface)
+    # Transformer factory  (mirrors DuckFE._make_transformer)
     # =========================================================================
-    
+
+    def _resolve_fe_sql_names(self) -> List[str]:
+        """Resolve FE logical names to SQL-safe names via formula metadata."""
+        result = []
+        for fe_name in self.fe_cols:
+            fe_var = self.formula.get_fe_by_name(fe_name)
+            mfe    = self.formula.get_merged_fe_by_name(fe_name)
+            result.append(
+                fe_var.sql_name if fe_var
+                else (mfe.sql_name if mfe else fe_name)
+            )
+        return result
+
+    def _make_transformer(
+        self,
+        covariate_cols: List[str],
+        source_table: str,
+        cluster_col: Optional[str],
+    ):
+        """Instantiate the appropriate FE transformer for *source_table*.
+
+        Returns :class:`MundlakTransformer` for ``method='mundlak'`` and
+        :class:`IterativeDemeanTransformer` for ``method='demean'``.
+        The *covariate_cols* argument is used only for the Mundlak variant;
+        the demean variant receives only FE / cluster / convergence settings.
+        """
+        fe_sql = self._resolve_fe_sql_names() if self.fe_cols else []
+        if self.method == "demean":
+            return IterativeDemeanTransformer(
+                conn=self.conn,
+                table_name=source_table,
+                fe_cols=fe_sql,
+                cluster_col=cluster_col,
+                remove_singletons=False,   # singletons already handled in prepare_data
+                max_iterations=self.max_iterations,
+                tolerance=self.tolerance,
+            )
+        if self.method == "auto_fe":
+            return AutoFETransformer(
+                conn=self.conn,
+                table_name=source_table,
+                fe_cols=fe_sql,
+                cluster_col=cluster_col,
+                covariate_cols=covariate_cols,
+                remove_singletons=False,
+                fe_types=self.fe_types,
+                cardinality_threshold=self.cardinality_threshold,
+                singleton_threshold=self.singleton_threshold,
+                max_fixed_fe_levels=self.max_fixed_fe_levels,
+                max_iterations=self.max_iterations,
+                tolerance=self.tolerance,
+                **self.auto_fe_kwargs,
+            )
+        return MundlakTransformer(
+            conn=self.conn,
+            table_name=source_table,
+            fe_cols=fe_sql,
+            cluster_col=cluster_col,
+            covariate_cols=covariate_cols,
+            remove_singletons=False,   # singletons already handled in prepare_data
+            fe_types=self.fe_types,
+            cardinality_threshold=self.cardinality_threshold,
+            singleton_threshold=self.singleton_threshold,
+            max_fixed_fe_levels=self.max_fixed_fe_levels,
+        )
+
+    # =========================================================================
+    # Estimation pipeline  (DuckEstimator interface)
+    # =========================================================================
+
     def prepare_data(self):
-        """Create data table with all needed columns"""
-        self._create_data_table()
-        if self.fe_cols and self.fe_method == "mundlak":
-            self._add_mundlak_means_sql()
-    
+        """Build the staging table using formula helpers (mirrors DuckFE.prepare_data).
+
+        Adds a ``_row_idx`` column (ROW_NUMBER) so that the transformer's
+        ``design_matrix`` can be joined back to the staging table after first-stage
+        fitted values have been computed.
+        """
+        boolean_cols  = self._get_boolean_columns()
+        unit_col      = self.fe_cols[0] if self.fe_cols else None
+        cluster_alias = self._CLUSTER_ALIAS if self.cluster_col else None
+
+        select_parts = []
+
+        fe_sql = self.formula.get_fe_select_sql(boolean_cols)
+        if fe_sql:
+            select_parts.append(fe_sql)
+
+        outcomes_sql = self.formula.get_outcomes_select_sql(unit_col, "year", boolean_cols)
+        if outcomes_sql:
+            select_parts.append(outcomes_sql)
+
+        # Exogenous covariates (exclude intercept and endogenous)
+        for var in self.formula.covariates:
+            if var.is_intercept() or var.display_name in self.endogenous_vars:
+                continue
+            expr = var.get_sql_expression(unit_col, "year")
+            expr = cast_if_boolean(expr, var.name, boolean_cols)
+            select_parts.append(f"{expr} AS {var.sql_name}")
+
+        endog_sql = self.formula.get_endogenous_select_sql(unit_col, "year", boolean_cols)
+        if endog_sql:
+            select_parts.append(endog_sql)
+
+        inst_sql = self.formula.get_instruments_select_sql(unit_col, "year", boolean_cols)
+        if inst_sql:
+            select_parts.append(inst_sql)
+
+        cluster_sql = self.formula.get_cluster_select_sql(
+            boolean_cols, cluster_alias, unit_col
+        )
+        if cluster_sql:
+            select_parts.append(cluster_sql)
+
+        # Row index for reliable joins between design_matrix and staging table
+        select_parts.append("ROW_NUMBER() OVER () AS _row_idx")
+
+        self.conn.execute(f"""
+        CREATE OR REPLACE TABLE {self._STAGING_TABLE} AS
+        SELECT {', '.join(p for p in select_parts if p)}
+        FROM {self.table_name}
+        {self._build_where_clause(self.subset)}
+        """)
+
+        self._remove_singleton_fe_observations()
+
+        self.n_obs = self.conn.execute(
+            f"SELECT COUNT(*) FROM {self._STAGING_TABLE}"
+        ).fetchone()[0]
+        self.n_compressed_rows = self.n_obs
+
     def compress_data(self):
-        """Run first stages and prepare for second stage estimation"""
-        self._run_first_stages()
-        if self.fitter == "numpy":
-            self._build_design_matrices()
+        """Run first stages then prepare the second-stage working table."""
+        if self.method == "demean":
+            self._demean_all_variables()
+            self._run_first_stages_demean()
+            self._setup_second_stage_demean()
         else:
-            self._create_second_stage_view()
-    
+            self._run_first_stages()
+            self._setup_second_stage()
+
     def estimate(self) -> np.ndarray:
-        """Estimate coefficients using fitted endogenous values"""
+        """Estimate second-stage coefficients."""
         if self.fitter == "duckdb":
+            if self.method == "demean":
+                return self._estimate_duckdb_demean()
             return self._estimate_duckdb()
         return self._estimate_numpy()
-    
+
+    # =========================================================================
+    # First stage
+    # =========================================================================
+
+    def _run_first_stages(self):
+        """Run one first-stage regression per endogenous variable."""
+        for endog_var in self.endogenous_vars:
+            logger.debug(f"Duck2SLS: running first stage for {endog_var}")
+            fs_result = self._run_single_first_stage(endog_var)
+            self._first_stage_results[endog_var] = fs_result
+            logger.debug(f"  F-stat={fs_result.f_statistic}")
+
+    def _run_single_first_stage(self, endog_var: str) -> FirstStageResults:
+        """Run one first-stage OLS via MundlakTransformer."""
+        endog_var_obj = next(
+            v for v in self.formula.endogenous if v.display_name == endog_var
+        )
+        exog_sql    = self._get_exog_sql()
+        inst_sql    = self._get_inst_sql()
+        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+
+        # Transformer: adds Mundlak means of exog + instruments
+        transformer = self._make_transformer(
+            covariate_cols=exog_sql + inst_sql,
+            source_table=self._STAGING_TABLE,
+            cluster_col=cluster_col,
+        )
+        # Include _row_idx so we can join results back to the staging table
+        variables    = [endog_var_obj.sql_name, "_row_idx"] + exog_sql + inst_sql
+        result_table = transformer.fit_transform(variables, where_clause="")
+
+        x_sql = exog_sql + inst_sql + transformer.extra_regressors
+        y_sql = endog_var_obj.sql_name
+
+        # For MAP/hybrid paths the transformer stores columns as resid_v instead
+        # of v.  Materialise a normalised table with original-name columns so
+        # _ols_numpy/_ols_duckdb and _add_fitted_column can access y_sql/x_sql
+        # directly.  transform_query() is identity for Mundlak, so this is a
+        # no-op for that path and safe to do unconditionally.
+        _FS_NORM = "_fs_first_stage_norm"
+        all_vars_to_rename = variables + transformer.extra_regressors
+        rename_expr = transformer.transform_query(all_vars_to_rename)
+        cluster_part = f", {cluster_col}" if cluster_col else ""
+        self.conn.execute(f"""
+            CREATE OR REPLACE TEMP TABLE {_FS_NORM} AS
+            SELECT {rename_expr}{cluster_part}
+            FROM {result_table}
+        """)
+        result_table = _FS_NORM
+
+        # Fit OLS on design_matrix
+        if self.fitter == "duckdb":
+            coefs, vcov, vcov_meta, n = self._ols_duckdb(
+                result_table, x_sql, y_sql, cluster_col
+            )
+        else:
+            coefs, vcov, vcov_meta, n = self._ols_numpy(
+                result_table, x_sql, y_sql, cluster_col
+            )
+
+        # Copy fitted values back to staging table via _row_idx join
+        self._add_fitted_column(
+            design_table=result_table,
+            endog_sql=endog_var_obj.sql_name,
+            x_sql=x_sql,
+            coefs=coefs,
+        )
+
+        coef_names = self._build_fs_display_names(exog_sql, inst_sql, transformer)
+
+        reg_results = RegressionResults(
+            coefficients=coefs.reshape(-1, 1),
+            coef_names=coef_names,
+            vcov=vcov,
+            n_obs=n,
+            se_type=vcov_meta.get("vcov_type_detail", "HC1"),
+        )
+        return FirstStageResults(
+            endog_var=endog_var,
+            results=reg_results,
+            instrument_names=self.instrument_vars,
+        )
+
+    # =========================================================================
+    # Demean path: FE absorption via iterative demeaning
+    # =========================================================================
+
+    def _demean_all_variables(self) -> str:
+        """Absorb fixed effects via :class:`IterativeDemeanTransformer` (method='demean').
+
+        Runs the transformer once on the union of outcomes, exogenous
+        regressors, endogenous variables, and instruments.  The result is
+        stored in the ``demeaned_data`` temp table.  A renaming view
+        ``_demeaned_staging`` is created so that downstream SQL uses the
+        original column names (``resid_v AS v``).
+
+        Sets ``self._demean_transformer``, ``self._demean_result_table``, and
+        ``self._df_correction`` (total absorbed FE levels).
+
+        Returns
+        -------
+        str
+            Name of the renaming view (``"_demeaned_staging"``).
+        """
+        exog_sql         = self._get_exog_sql()
+        actual_endog_sql = [v.sql_name for v in self.formula.endogenous]
+        outcome_sql      = [v.sql_name for v in self.formula.outcomes]
+        inst_sql         = self._get_inst_sql()
+        cluster_col      = self._CLUSTER_ALIAS if self.cluster_col else None
+
+        variables = outcome_sql + exog_sql + actual_endog_sql + inst_sql
+
+        transformer = IterativeDemeanTransformer(
+            conn=self.conn,
+            table_name=self._STAGING_TABLE,
+            fe_cols=self._resolve_fe_sql_names() if self.fe_cols else [],
+            cluster_col=cluster_col,
+            remove_singletons=False,   # singletons already handled in prepare_data
+            max_iterations=self.max_iterations,
+            tolerance=self.tolerance,
+        )
+        self._demean_result_table = transformer.fit_transform(variables, where_clause="")
+        self._demean_transformer  = transformer
+        self._df_correction       = transformer.df_correction
+
+        # Build a renaming view so downstream SQL uses original column names
+        rename_fragment = transformer.transform_query(variables)
+        fe_sql_names    = self._resolve_fe_sql_names()
+        select_parts    = []
+        if fe_sql_names:
+            select_parts.append(", ".join(fe_sql_names))
+        if cluster_col:
+            select_parts.append(cluster_col)
+        select_parts.append(rename_fragment)
+
+        self.conn.execute(f"""
+        CREATE OR REPLACE VIEW {self._DEMEANED_STAGING} AS
+        SELECT {', '.join(select_parts)}
+        FROM {self._demean_result_table}
+        """)
+
+        logger.debug(
+            f"_demean_all_variables: {len(variables)} variable(s) demeaned, "
+            f"df_correction={self._df_correction}"
+        )
+        return self._DEMEANED_STAGING
+
+    def _run_first_stages_demean(self):
+        """Run first stages as plain OLS on the pre-demeaned table (no intercept).
+
+        FEs are already absorbed by :meth:`_demean_all_variables`; no
+        transformer is needed here.  Fitted values are written back to the
+        underlying ``demeaned_data`` table so they can be exposed via the
+        ``_demeaned_staging`` view after it is rebuilt in
+        :meth:`_setup_second_stage_demean`.
+        """
+        exog_sql    = self._get_exog_sql()
+        inst_sql    = self._get_inst_sql()
+        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+        x_sql       = exog_sql + inst_sql
+
+        for endog_var in self.endogenous_vars:
+            endog_var_obj = next(
+                v for v in self.formula.endogenous if v.display_name == endog_var
+            )
+            if self.fitter == "duckdb":
+                coefs, vcov, meta, n = self._ols_duckdb_no_intercept(
+                    self._DEMEANED_STAGING, x_sql, endog_var_obj.sql_name, cluster_col
+                )
+            else:
+                df = self.conn.execute(
+                    f"SELECT * FROM {self._DEMEANED_STAGING}"
+                ).fetchdf().dropna()
+                n   = len(df)
+                ids = (
+                    df[cluster_col].values
+                    if cluster_col and cluster_col in df.columns
+                    else None
+                )
+                X = df[x_sql].values if x_sql else np.empty((n, 0))
+                y = df[endog_var_obj.sql_name].values.reshape(-1, 1)
+                w = np.ones(n)
+                np_fitter = NumpyFitter(alpha=1e-8, se_type="stata")
+                fit    = np_fitter.fit(X=X, y=y, weights=w, coef_names=x_sql)
+                vcov, meta, _ = np_fitter.fit_vcov(
+                    X=X, y=y, weights=w,
+                    coefficients=fit.coefficients,
+                    cluster_ids=ids,
+                    existing_result=fit,
+                )
+                coefs = fit.coefficients.flatten()
+
+            self._add_fitted_column_demean(
+                endog_sql=endog_var_obj.sql_name,
+                x_sql=x_sql,
+                coefs=coefs,
+            )
+
+            reg_results = RegressionResults(
+                coefficients=coefs.reshape(-1, 1),
+                coef_names=x_sql,
+                vcov=vcov,
+                n_obs=n,
+                se_type=meta.get("vcov_type_detail", "HC1"),
+            )
+            self._first_stage_results[endog_var] = FirstStageResults(
+                endog_var=endog_var,
+                results=reg_results,
+                instrument_names=self.instrument_vars,
+            )
+            logger.debug(
+                f"Demean first stage '{endog_var}': "
+                f"F-stat={self._first_stage_results[endog_var].f_statistic}"
+            )
+
+    # =========================================================================
+    # Second stage setup
+    # =========================================================================
+
+    def _setup_second_stage(self):
+        """Run second-stage MundlakTransformer and prepare for estimation."""
+        exog_sql         = self._get_exog_sql()
+        fitted_endog_sql = [f"fitted_{v.sql_name}" for v in self.formula.endogenous]
+        actual_endog_sql = [v.sql_name for v in self.formula.endogenous]
+        outcome_sql      = [v.sql_name for v in self.formula.outcomes]
+        inst_sql         = self._get_inst_sql()
+        cluster_col      = self._CLUSTER_ALIAS if self.cluster_col else None
+
+        # Cache for downstream helpers
+        self._exog_sql         = exog_sql
+        self._fitted_endog_sql = fitted_endog_sql
+        self._actual_endog_sql = actual_endog_sql
+        self._outcome_sql      = outcome_sql
+        self._inst_sql         = inst_sql
+
+        # covariate_cols covers exog + fitted_endog + inst so extra_regressors
+        # contain Mundlak means for all three sets of columns
+        self._ss_transformer = self._make_transformer(
+            covariate_cols=exog_sql + fitted_endog_sql + inst_sql,
+            source_table=self._STAGING_TABLE,
+            cluster_col=cluster_col,
+        )
+
+        # Include _row_idx, actual endogenous (for residuals), instruments (for Z)
+        variables = (
+            outcome_sql
+            + exog_sql
+            + fitted_endog_sql
+            + actual_endog_sql
+            + inst_sql
+            + ["_row_idx"]
+        )
+        self._ss_result_table = self._ss_transformer.fit_transform(
+            variables, where_clause=""
+        )
+        logger.debug(
+            f"Second-stage design_matrix: n_obs={self._ss_transformer.n_obs}, "
+            f"extra_regressors={self._ss_transformer.extra_regressors}"
+        )
+
+        if self.fitter == "duckdb":
+            self._create_compressed_view()
+        else:
+            self._build_numpy_arrays()
+
+    def _create_compressed_view(self):
+        """Create the compressed view for DuckDB-path estimation."""
+        extra       = self._ss_transformer.extra_regressors
+        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+
+        # Group-by columns: X cols + instruments (for Z) + extra Mundlak cols
+        group_cols = (
+            self._exog_sql
+            + self._fitted_endog_sql
+            + self._inst_sql
+            + extra
+            + ([cluster_col] if cluster_col else [])
+        )
+
+        agg_parts = ["COUNT(*) AS count"]
+        for sql_name in self._outcome_sql:
+            agg_parts.append(f"SUM({sql_name}) AS sum_{sql_name}")
+            agg_parts.append(f"SUM({sql_name} * {sql_name}) AS sum_{sql_name}_sq")
+        # Aggregate actual endogenous for residual computation;
+        # expose cell mean as the original column name for residual_x_cols.
+        for sql_name in self._actual_endog_sql:
+            agg_parts.append(f"SUM({sql_name}) AS sum_{sql_name}")
+            agg_parts.append(f"SUM({sql_name} * {sql_name}) AS sum_{sql_name}_sq")
+            agg_parts.append(f"SUM({sql_name}) / NULLIF(COUNT(*), 0) AS {sql_name}")
+
+        group_by = ", ".join(group_cols)
+        self.conn.execute(f"""
+        CREATE OR REPLACE VIEW {self._COMPRESSED_VIEW} AS
+        SELECT {group_by}, {', '.join(agg_parts)}
+        FROM {self._ss_result_table}
+        GROUP BY {group_by}
+        """)
+
+        result = self.conn.execute(
+            f"SELECT SUM(count), COUNT(*) FROM {self._COMPRESSED_VIEW}"
+        ).fetchone()
+        self.n_obs             = int(result[0]) if result[0] else 0
+        self.n_compressed_rows = int(result[1]) if result[1] else 0
+
+    def _setup_second_stage_demean(self):
+        """Rebuild the demeaned staging view (with fitted columns) and populate
+        numpy arrays for second-stage estimation (demean path)."""
+        exog_sql         = self._get_exog_sql()
+        fitted_endog_sql = [f"fitted_{v.sql_name}" for v in self.formula.endogenous]
+        actual_endog_sql = [v.sql_name for v in self.formula.endogenous]
+        outcome_sql      = [v.sql_name for v in self.formula.outcomes]
+        inst_sql         = self._get_inst_sql()
+        cluster_col      = self._CLUSTER_ALIAS if self.cluster_col else None
+
+        # Cache for downstream helpers
+        self._exog_sql         = exog_sql
+        self._fitted_endog_sql = fitted_endog_sql
+        self._actual_endog_sql = actual_endog_sql
+        self._outcome_sql      = outcome_sql
+        self._inst_sql         = inst_sql
+
+        # Rebuild _demeaned_staging to include the fitted endogenous columns
+        # that were added to demeaned_data by _run_first_stages_demean.
+        demean_vars     = outcome_sql + exog_sql + actual_endog_sql + inst_sql
+        rename_fragment = self._demean_transformer.transform_query(demean_vars)
+        fe_sql_names    = self._resolve_fe_sql_names()
+        select_parts    = []
+        if fe_sql_names:
+            select_parts.append(", ".join(fe_sql_names))
+        if cluster_col:
+            select_parts.append(cluster_col)
+        select_parts.append(rename_fragment)
+        # Expose fitted columns directly (not resid_-prefixed)
+        for fc in fitted_endog_sql:
+            select_parts.append(fc)
+
+        self.conn.execute(f"""
+        CREATE OR REPLACE VIEW {self._DEMEANED_STAGING} AS
+        SELECT {', '.join(select_parts)}
+        FROM {self._demean_result_table}
+        """)
+
+        self._ss_result_table = self._DEMEANED_STAGING
+        # No transformer needed for second stage; set to None so mundlak helpers
+        # that check extra_regressors are not called accidentally.
+        self._ss_transformer  = None
+
+        if self.fitter == "duckdb":
+            # Create a lightweight helper view that adds a constant weight column
+            # and squared-outcome column so DuckDBFitter can operate OOC.
+            outcome_col = self._outcome_sql[0]
+            self.conn.execute(f"""
+            CREATE OR REPLACE VIEW {self._DEMEANED_STAGING}_fit AS
+            SELECT *, 1 AS count, {outcome_col} * {outcome_col} AS {outcome_col}_sq
+            FROM {self._DEMEANED_STAGING}
+            """)
+            logger.debug("Created demeaned fit view for DuckDB second stage.")
+        else:
+            self._build_numpy_arrays_demean()
+
+    def _estimate_duckdb_demean(self) -> np.ndarray:
+        """Estimate second-stage coefficients via DuckDB (demean path, no intercept)."""
+        x_sql       = self._exog_sql + self._fitted_endog_sql
+        y_col       = self._outcome_sql[0]
+        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+        view        = f"{self._DEMEANED_STAGING}_fit"
+
+        duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type="stata")
+        self._fitter_result = duckdb_fitter.fit(
+            table_name=view,
+            x_cols=x_sql,
+            y_col=y_col,
+            weight_col="count",
+            add_intercept=False,
+            cluster_col=cluster_col,
+        )
+
+        sql_to_display = {v.sql_name: v.display_name for v in self.formula.covariates}
+        sql_to_display.update(
+            {v.sql_name: v.display_name for v in self.formula.endogenous}
+        )
+        names = []
+        for sql in self._exog_sql:
+            names.append(sql_to_display.get(sql, sql))
+        for sql in self._fitted_endog_sql:
+            base = sql[len("fitted_"):] if sql.startswith("fitted_") else sql
+            names.append(sql_to_display.get(base, base))
+        self.coef_names_     = names
+        self._coef_sql_names = x_sql
+        self.n_obs           = self._fitter_result.n_obs
+        return self._fitter_result.coefficients
+
+    def _fit_vcov_duckdb_demean(self, se_method: str = "HC1"):
+        """Compute IV vcov via DuckDB for the demean path (no intercept)."""
+        if (
+            self._fitter_result is not None
+            and self._fitter_result.vcov is not None
+        ):
+            self.vcov        = self._fitter_result.vcov
+            self.se          = self._fitter_result.se_type
+            self._n_clusters = self._fitter_result.n_clusters
+            self._results    = None
+            return
+
+        x_sql       = self._exog_sql + self._fitted_endog_sql
+        residual_x  = self._exog_sql + self._actual_endog_sql
+        z_cols      = self._exog_sql + self._inst_sql
+        y_col       = self._outcome_sql[0]
+        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+        view        = f"{self._DEMEANED_STAGING}_fit"
+
+        duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type=se_method)
+        vcov, vcov_meta, _ = duckdb_fitter.fit_vcov(
+            table_name=view,
+            x_cols=x_sql,
+            y_col=y_col,
+            weight_col="count",
+            add_intercept=False,
+            coefficients=self.point_estimate,
+            cluster_col=cluster_col,
+            vcov_type=se_method if se_method != "CRV1" else "HC1",
+            residual_x_cols=residual_x,
+            z_cols=z_cols,
+            is_iv=True,
+            k_fe=self._df_correction,
+        )
+        self.vcov        = vcov
+        self.se          = vcov_meta["vcov_type_detail"]
+        self._n_clusters = vcov_meta.get("n_clusters")
+        self._results    = None
+
+    def _ols_duckdb_no_intercept(
+        self,
+        table: str,
+        x_sql: List[str],
+        y_sql: str,
+        cluster_col: Optional[str],
+    ) -> Tuple[np.ndarray, np.ndarray, dict, int]:
+        """Fit OLS via DuckDBFitter without an intercept (for pre-demeaned data)."""
+        self.conn.execute(
+            f"CREATE OR REPLACE VIEW _fs_demean_view AS "
+            f"SELECT *, 1 AS count FROM {table}"
+        )
+        fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type="stata")
+        fit    = fitter.fit(
+            table_name="_fs_demean_view",
+            x_cols=x_sql,
+            y_col=y_sql,
+            weight_col="count",
+            add_intercept=False,
+            cluster_col=cluster_col,
+        )
+        vcov, meta, _ = fitter.fit_vcov(
+            table_name="_fs_demean_view",
+            x_cols=x_sql,
+            y_col=y_sql,
+            weight_col="count",
+            add_intercept=False,
+            cluster_col=cluster_col,
+            coefficients=fit.coefficients,
+            existing_result=fit,
+        )
+        return fit.coefficients.flatten(), vcov, meta, fit.n_obs
+
+    def _add_fitted_column_demean(
+        self,
+        endog_sql: str,
+        x_sql: List[str],
+        coefs: np.ndarray,
+    ):
+        """Write first-stage fitted values into *_demean_result_table* and refresh view.
+
+        Coefficients are ordered as [*x_sql] (no intercept term).
+        The ``_DEMEANED_STAGING`` view is recreated after the column is added
+        so it exposes the new ``fitted_`` column to downstream queries.
+        """
+        fitted_col   = f"fitted_{endog_sql}"
+        resid_prefix = "resid_"
+
+        if x_sql:
+            expr_parts = [
+                f"({float(coefs[i])} * {quote_identifier(resid_prefix + col)})"
+                for i, col in enumerate(x_sql)
+            ]
+            fitted_expr = " + ".join(expr_parts)
+        else:
+            fitted_expr = "0.0"
+
+        self.conn.execute(
+            f"ALTER TABLE {self._demean_result_table} "
+            f"ADD COLUMN {quote_identifier(fitted_col)} DOUBLE"
+        )
+        self.conn.execute(
+            f"UPDATE {self._demean_result_table} "
+            f"SET {quote_identifier(fitted_col)} = {fitted_expr}"
+        )
+        logger.debug(f"Added column '{fitted_col}' to demeaned result table.")
+
+    def _build_numpy_arrays_demean(self):
+        """Fetch the demeaned staging view and build numpy arrays (no intercept).
+
+        Since all variables are already within-demeaned, the intercept is
+        suppressed throughout (X_fitted, X_actual, and Z have no ones column).
+        The DOF correction from :attr:`_df_correction` accounts for the
+        absorbed FE levels in downstream vcov computations.
+        """
+        df = self.conn.execute(
+            f"SELECT * FROM {self._ss_result_table}"
+        ).fetchdf().dropna()
+        n           = len(df)
+        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+
+        # Outcome
+        self._y = df[self._outcome_sql[0]].values.reshape(-1, 1)
+
+        # X_fitted: exog + fitted_endog  (no intercept)
+        x_fitted_cols  = self._exog_sql + self._fitted_endog_sql
+        self._X_fitted = df[x_fitted_cols].values
+
+        # X_actual: exog + actual_endog  (no intercept, for residual sandwich)
+        x_actual_cols  = self._exog_sql + self._actual_endog_sql
+        self._X_actual = df[x_actual_cols].values
+
+        # Z: exog + instruments  (no intercept)
+        z_cols   = self._exog_sql + self._inst_sql
+        self._Z  = df[z_cols].values
+
+        self._weights = np.ones(n)
+        self.n_obs    = n
+
+        # Coefficient names (no 'Intercept')
+        sql_to_display = {v.sql_name: v.display_name for v in self.formula.covariates}
+        sql_to_display.update(
+            {v.sql_name: v.display_name for v in self.formula.endogenous}
+        )
+        names = []
+        for sql in self._exog_sql:
+            names.append(sql_to_display.get(sql, sql))
+        for sql in self._fitted_endog_sql:
+            base = sql[len("fitted_"):] if sql.startswith("fitted_") else sql
+            names.append(sql_to_display.get(base, base))
+        self.coef_names_     = names
+        self._coef_sql_names = x_fitted_cols
+
+        self._cluster_ids = (
+            df[cluster_col].values
+            if cluster_col and cluster_col in df.columns
+            else None
+        )
+
+        logger.debug(
+            f"_build_numpy_arrays_demean: n={n}, "
+            f"X_fitted.shape={self._X_fitted.shape}, "
+            f"Z.shape={self._Z.shape}, df_correction={self._df_correction}"
+        )
+
+    def _build_numpy_arrays(self):
+        """Fetch design_matrix and build numpy arrays for estimation."""
+        df = self.conn.execute(
+            f"SELECT * FROM {self._ss_result_table}"
+        ).fetchdf().dropna()
+        n = len(df)
+
+        extra       = self._ss_transformer.extra_regressors
+        x_extra     = self._x_extra(extra)
+        z_extra     = self._z_extra(extra)
+        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+
+        # Outcome
+        self._y = df[self._outcome_sql[0]].values.reshape(-1, 1)
+
+        # X_fitted: intercept + exog + fitted_endog + x_extra
+        x_fitted_cols    = self._exog_sql + self._fitted_endog_sql + x_extra
+        self._X_fitted   = np.c_[np.ones(n), df[x_fitted_cols].values]
+
+        # X_actual: same layout but with actual endogenous (for residuals)
+        x_actual_cols    = self._exog_sql + self._actual_endog_sql + x_extra
+        self._X_actual   = np.c_[np.ones(n), df[x_actual_cols].values]
+
+        # Z: intercept + exog + instruments + z_extra
+        z_cols   = self._exog_sql + self._inst_sql + z_extra
+        self._Z  = np.c_[np.ones(n), df[z_cols].values]
+
+        self._weights = np.ones(n)
+        self.n_obs    = n
+
+        # Coefficient names
+        self.coef_names_     = self._build_second_stage_coef_names(x_extra)
+        self._coef_sql_names = ["Intercept"] + x_fitted_cols
+
+        self._cluster_ids = (
+            df[cluster_col].values
+            if cluster_col and cluster_col in df.columns
+            else None
+        )
+
+    # =========================================================================
+    # Estimation
+    # =========================================================================
+
     def _estimate_numpy(self) -> np.ndarray:
-        """Estimate using in-memory numpy WLS with NumpyFitter"""
         if self._X_fitted is None:
-            raise ValueError("Must call compress_data() before estimate()")
-        
+            raise RuntimeError("compress_data() must be called before estimate()")
         fitter = NumpyFitter(alpha=1e-8, se_type="stata")
         result = fitter.fit(
             X=self._X_fitted,
             y=self._y,
             weights=self._weights,
-            coef_names=self.coef_names_
+            coef_names=self.coef_names_,
         )
-        
         return result.coefficients
-    
+
     def _estimate_duckdb(self) -> np.ndarray:
-        """Estimate using DuckDB sufficient statistics (out-of-core)"""
-        x_cols = self._get_x_cols_for_duckdb()
-        residual_x_cols = self._get_actual_x_cols_for_duckdb()
-        y_col = self._get_y_col_for_duckdb()
-        
+        extra       = self._ss_transformer.extra_regressors
+        x_extra     = self._x_extra(extra)
+        x_sql       = self._exog_sql + self._fitted_endog_sql + x_extra
+        residual_x  = self._exog_sql + self._actual_endog_sql + x_extra
+        y_col       = f"sum_{self._outcome_sql[0]}"
+        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+
         duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type="stata")
         self._fitter_result = duckdb_fitter.fit(
             table_name=self._COMPRESSED_VIEW,
-            x_cols=x_cols,
+            x_cols=x_sql,
             y_col=y_col,
             weight_col="count",
             add_intercept=True,
-            cluster_col=self.cluster_col if self.cluster_col else None,
-            residual_x_cols=residual_x_cols
+            cluster_col=cluster_col,
+            residual_x_cols=residual_x,
         )
-        
-        self.coef_names_ = self._build_coef_names_for_duckdb()
-        self._coef_sql_names = self._build_coef_sql_names_for_duckdb()
+
+        self.coef_names_     = self._build_second_stage_coef_names(x_extra)
+        self._coef_sql_names = ["Intercept"] + x_sql
         return self._fitter_result.coefficients
-    
+
+    # =========================================================================
+    # Variance-covariance
+    # =========================================================================
+
     def fit_vcov(self, se_method: str = "HC1"):
-        """Compute vcov with correct 2SLS formula using actual residuals.
-        
-        Args:
-            se_method: Type of standard errors ('iid', 'HC1', 'CRV1')
-        """
+        """Compute vcov with correct 2SLS formula using actual residuals."""
         if self.fitter == "duckdb":
-            self._fit_vcov_duckdb(se_method=se_method)
+            if self.method == "demean":
+                self._fit_vcov_duckdb_demean(se_method)
+            else:
+                self._fit_vcov_duckdb(se_method)
         else:
-            self._fit_vcov_numpy(se_method=se_method)
-    
+            self._fit_vcov_numpy(se_method)
+
     def _fit_vcov_numpy(self, se_method: str = "HC1"):
-        """Compute vcov using numpy (in-memory) with 2SLS-specific logic.
-        
-        For IV/2SLS, we need:
-        1. Bread matrix (X_fitted' X_fitted)^{-1}
-        2. Residuals from actual endogenous: e = y - X_actual @ β
-        3. IV cross-products using X_fitted and Z
-        4. Scores using Z and residuals: scores = Z * e
-        """
         if self._X_actual is None or self._X_fitted is None or self._Z is None:
-            raise ValueError("Must call compress_data() before fit_vcov()")
-        
-        # Use NumpyFitter with 2SLS-specific parameters:
-        # - X = X_fitted (for bread matrix and IV cross-products)
-        # - residual_X = X_actual (for residual computation)
-        # - Z = instruments (for IV correction)
+            raise RuntimeError("compress_data() must be called before fit_vcov()")
         fitter = NumpyFitter(alpha=1e-8, se_type=se_method)
-        
         vcov, vcov_meta, _ = fitter.fit_vcov(
             X=self._X_fitted,
             y=self._y,
@@ -288,881 +1043,278 @@ class Duck2SLS(DuckEstimator):
             vcov_type=se_method if se_method != "CRV1" else "HC1",
             Z=self._Z,
             is_iv=True,
-            residual_X=self._X_actual  # Use actual endogenous for residuals
+            residual_X=self._X_actual,
         )
-        
-        self.vcov = vcov
-        self.se = vcov_meta['vcov_type_detail']
-        self._n_clusters = vcov_meta.get('n_clusters')
-        self._results = None
-    
+        self.vcov        = vcov
+        self.se          = vcov_meta["vcov_type_detail"]
+        self._n_clusters = vcov_meta.get("n_clusters")
+        self._results    = None
+
     def _fit_vcov_duckdb(self, se_method: str = "HC1"):
-        """Compute vcov using DuckDB with unified vcov helpers"""
-        if self._fitter_result is not None and self._fitter_result.vcov is not None:
-            self.vcov = self._fitter_result.vcov
-            self.se = self._fitter_result.se_type
+        if (
+            self._fitter_result is not None
+            and self._fitter_result.vcov is not None
+        ):
+            self.vcov        = self._fitter_result.vcov
+            self.se          = self._fitter_result.se_type
             self._n_clusters = self._fitter_result.n_clusters
-            self._results = None
+            self._results    = None
             return
-        
-        # Compute using fitter
-        x_cols = self._get_x_cols_for_duckdb()
-        residual_x_cols = self._get_actual_x_cols_for_duckdb()
-        y_col = self._get_y_col_for_duckdb()
-        z_cols = self._get_z_cols_for_duckdb()
-        
+
+        extra      = self._ss_transformer.extra_regressors
+        x_extra    = self._x_extra(extra)
+        z_extra    = self._z_extra(extra)
+        x_sql      = self._exog_sql + self._fitted_endog_sql + x_extra
+        residual_x = self._exog_sql + self._actual_endog_sql + x_extra
+        y_col      = f"sum_{self._outcome_sql[0]}"
+        z_cols     = self._exog_sql + self._inst_sql + z_extra
+        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+
         duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type=se_method)
         vcov, vcov_meta, _ = duckdb_fitter.fit_vcov(
             table_name=self._COMPRESSED_VIEW,
-            x_cols=x_cols,
+            x_cols=x_sql,
             y_col=y_col,
             weight_col="count",
             add_intercept=True,
             coefficients=self.point_estimate,
-            cluster_col=self.cluster_col if self.cluster_col else None,
+            cluster_col=cluster_col,
             vcov_type=se_method if se_method != "CRV1" else "HC1",
-            residual_x_cols=residual_x_cols,
+            residual_x_cols=residual_x,
             z_cols=z_cols,
-            is_iv=True
+            is_iv=True,
         )
-        
-        self.vcov = vcov
-        self.se = vcov_meta['vcov_type_detail']
-        self._n_clusters = vcov_meta.get('n_clusters')
-        self._results = None
-    
+        self.vcov        = vcov
+        self.se          = vcov_meta["vcov_type_detail"]
+        self._n_clusters = vcov_meta.get("n_clusters")
+        self._results    = None
+
     def bootstrap(self) -> np.ndarray:
-        """Bootstrap not yet implemented for 2SLS"""
-        logger.warning("Bootstrap for 2SLS not implemented, using analytical SEs")
+        logger.warning("Bootstrap for 2SLS is not yet implemented; using analytical SEs.")
         self.fit_vcov()
         return self.vcov
 
     # =========================================================================
-    # Data Preparation
+    # OLS helpers used inside the first-stage loop
     # =========================================================================
-    
-    def _create_data_table(self):
-        """Create table with all variables needed for IV estimation"""
-        boolean_cols = self._get_boolean_columns()
-        unit_col = self.fe_cols[0] if self.fe_cols else None
-        
-        select_parts = []
-        
-        # Outcomes
-        for var in self.formula.outcomes:
-            expr = var.get_sql_expression(unit_col, 'year')
-            expr = cast_if_boolean(expr, var.name, boolean_cols)
-            select_parts.append(f"{expr} AS {var.sql_name}")
-        
-        # Exogenous covariates
-        for var in self.formula.covariates:
-            if var.is_intercept() or var.display_name in self.endogenous_vars:
-                continue
-            expr = var.get_sql_expression(unit_col, 'year')
-            expr = cast_if_boolean(expr, var.name, boolean_cols)
-            select_parts.append(f"{expr} AS {var.sql_name}")
-        
-        # Endogenous variables
-        for var in self.formula.endogenous:
-            expr = var.get_sql_expression(unit_col, 'year')
-            expr = cast_if_boolean(expr, var.name, boolean_cols)
-            select_parts.append(f"{expr} AS {var.sql_name}")
-        
-        # Instruments
-        for var in self.formula.instruments:
-            expr = var.get_sql_expression(unit_col, 'year')
-            expr = cast_if_boolean(expr, var.name, boolean_cols)
-            select_parts.append(f"{expr} AS {var.sql_name}")
-        
-        # Fixed effects
-        fe_sql = self.formula.get_fe_select_sql(boolean_cols)
-        if fe_sql:
-            select_parts.append(fe_sql)
-        
-        # Cluster
-        if self.cluster_col:
-            select_parts.append(quote_identifier(self.cluster_col))
-        
+
+    def _ols_duckdb(
+        self,
+        table: str,
+        x_sql: List[str],
+        y_sql: str,
+        cluster_col: Optional[str],
+    ) -> Tuple[np.ndarray, np.ndarray, dict, int]:
+        """Fit OLS via DuckDBFitter on *table* using column lists."""
+        self.conn.execute(
+            f"CREATE OR REPLACE VIEW _fs_view AS SELECT *, 1 AS count FROM {table}"
+        )
+        fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type="stata")
+        fit    = fitter.fit(
+            table_name="_fs_view",
+            x_cols=x_sql,
+            y_col=y_sql,
+            weight_col="count",
+            add_intercept=True,
+            cluster_col=cluster_col,
+        )
+        vcov, meta, _ = fitter.fit_vcov(
+            table_name="_fs_view",
+            x_cols=x_sql,
+            y_col=y_sql,
+            weight_col="count",
+            add_intercept=True,
+            cluster_col=cluster_col,
+            coefficients=fit.coefficients,
+            existing_result=fit,
+        )
+        return fit.coefficients.flatten(), vcov, meta, fit.n_obs
+
+    def _ols_numpy(
+        self,
+        table: str,
+        x_sql: List[str],
+        y_sql: str,
+        cluster_col: Optional[str],
+    ) -> Tuple[np.ndarray, np.ndarray, dict, int]:
+        """Fit OLS via NumpyFitter on *table* using column lists."""
+        df  = self.conn.execute(f"SELECT * FROM {table}").fetchdf().dropna()
+        n   = len(df)
+        y   = df[y_sql].values.reshape(-1, 1)
+        X   = np.c_[np.ones(n), df[x_sql].values]
+        w   = np.ones(n)
+        ids = (
+            df[cluster_col].values
+            if cluster_col and cluster_col in df.columns
+            else None
+        )
+        fitter = NumpyFitter(alpha=1e-8, se_type="stata")
+        fit    = fitter.fit(X=X, y=y, weights=w, coef_names=["Intercept"] + x_sql)
+        vcov, meta, _ = fitter.fit_vcov(
+            X=X, y=y, weights=w,
+            coefficients=fit.coefficients,
+            cluster_ids=ids,
+            existing_result=fit,
+        )
+        return fit.coefficients.flatten(), vcov, meta, n
+
+    # =========================================================================
+    # Fitted-value transfer  (design_matrix → staging table)
+    # =========================================================================
+
+    def _add_fitted_column(
+        self,
+        design_table: str,
+        endog_sql: str,
+        x_sql: List[str],
+        coefs: np.ndarray,
+    ):
+        """Compute fitted values in *design_table* and copy back to staging.
+
+        Both tables carry a ``_row_idx`` column that acts as the join key.
+        Coefficients are ordered as [intercept, *x_sql].
+        """
+        fitted_col = f"fitted_{endog_sql}"
+
+        # intercept term + Σ coef_i * col_i
+        expr_parts = [str(float(coefs[0]))]
+        for i, col in enumerate(x_sql):
+            expr_parts.append(f"({float(coefs[i + 1])} * {quote_identifier(col)})")
+        fitted_expr = " + ".join(expr_parts)
+
+        self.conn.execute(
+            f"ALTER TABLE {design_table} "
+            f"ADD COLUMN {quote_identifier(fitted_col)} DOUBLE"
+        )
+        self.conn.execute(
+            f"UPDATE {design_table} "
+            f"SET {quote_identifier(fitted_col)} = {fitted_expr}"
+        )
+
+        # Recreate staging table with the new fitted column appended
         self.conn.execute(f"""
-        CREATE OR REPLACE TABLE {self._DATA_TABLE} AS
-        SELECT {', '.join(select_parts)}
-        FROM {self.table_name}
-        {self._build_where_clause()}
+        CREATE OR REPLACE TABLE {self._STAGING_TABLE} AS
+        SELECT s.*, d.{quote_identifier(fitted_col)}
+        FROM {self._STAGING_TABLE} s
+        JOIN {design_table} d ON s._row_idx = d._row_idx
         """)
-        
-        # Remove singleton FE observations if requested
-        self._remove_singleton_fe_observations()
-        
-        self.n_obs = self.conn.execute(
-            f"SELECT COUNT(*) FROM {self._DATA_TABLE}"
-        ).fetchone()[0]
-        self.n_compressed_rows = self.n_obs
+        logger.debug(f"Added fitted column '{fitted_col}' to staging table.")
+
+    # =========================================================================
+    # Singleton removal
+    # =========================================================================
 
     def _remove_singleton_fe_observations(self):
-        """Remove observations from singleton FE groups if remove_singletons=True.
-        
-        A singleton group is one with exactly one observation. These observations
-        are perfectly predicted by FE dummies and cause issues in estimation.
-        Uses QUALIFY clause for efficient single-pass filtering.
-        """
         if not self.remove_singletons or not self.fe_cols:
             return
-        
-        logger.debug(f"Removing singleton FE observations from {len(self.fe_cols)} FE groups")
-        
-        # Build QUALIFY conditions - check each FE separately (AND condition)
-        # An observation is a singleton if it's alone in ANY of the FE dimensions
-        qualify_conditions = []
-        for fe_col_name in self.fe_cols:
-            # Get FE SQL name
-            fe_var = self.formula.get_fe_by_name(fe_col_name)
-            mfe = self.formula.get_merged_fe_by_name(fe_col_name) if hasattr(self.formula, 'get_merged_fe_by_name') else None
-            fe_sql_name = fe_var.sql_name if fe_var else (mfe.sql_name if mfe else fe_col_name)
-            qualify_conditions.append(f"count(*) OVER (PARTITION BY {fe_sql_name}) > 1")
-        
-        if not qualify_conditions:
-            return
-        
-        # Recreate table with singletons filtered out
-        qualify_clause = f"QUALIFY {' AND '.join(qualify_conditions)}"
-        
-        self.conn.execute(f"""
-        CREATE OR REPLACE TABLE {self._DATA_TABLE} AS
-        SELECT * FROM {self._DATA_TABLE}
-        {qualify_clause}
-        """)
-        
-        remaining_obs = self.conn.execute(
-            f"SELECT COUNT(*) FROM {self._DATA_TABLE}"
-        ).fetchone()[0]
-        logger.debug(f"IV data after singleton removal: {remaining_obs} observations")
-
-
-
-
-    def _build_where_clause(self) -> str:
-        """Build WHERE clause"""
-        return self.formula.get_where_clause_sql(self.subset)
-
-    def _get_table_columns(self, table_name: str) -> set:
-        """Get column names from a table"""
-        return set(
-            self.conn.execute(f"SELECT column_name FROM (DESCRIBE {table_name})")
-            .fetchdf()['column_name'].tolist()
-        )
-    
-    def _add_mundlak_means_sql(self):
-        """Add Mundlak group means columns to data table via SQL.
-        
-        This computes FE-level averages of covariates and instruments
-        and adds them as columns, allowing DuckDB fitter to work out-of-core.
-        """
-        from ..core.sql_builders import build_add_mundlak_means_sql
-        
-        # Get columns to compute means for
-        mean_cols = []
-        for var in self.formula.covariates:
-            if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                mean_cols.append(var.sql_name)
-        for var in self.formula.instruments:
-            mean_cols.append(var.sql_name)
-        
-        if not mean_cols:
-            return
-        
-        # Add mean columns for each FE
-        for i, fe_col_name in enumerate(self.fe_cols):
-            fe_var = self.formula.get_fe_by_name(fe_col_name)
-            mfe = self.formula.get_merged_fe_by_name(fe_col_name)
-            fe_sql_name = fe_var.sql_name if fe_var else (mfe.sql_name if mfe else fe_col_name)
-            
-            # Use centralized SQL builder
-            sql = build_add_mundlak_means_sql(
-                table_name=self._DATA_TABLE,
-                var_sql_names=mean_cols,
-                fe_col_sql_name=fe_sql_name,
-                fe_index=i
-            )
-            self.conn.execute(sql)
-        
-        logger.debug(f"Added Mundlak mean columns for {len(self.fe_cols)} FEs")
-    
-    def _create_second_stage_view(self):
-        """Create compressed view for second stage estimation (DuckDB fitter).
-        
-        Groups by fitted endogenous + exogenous + instruments + Mundlak means and
-        aggregates outcome AND actual endogenous for residual computation.
-        """
-        # Build the compression query
-        outcome_var = self.formula.outcomes[0]
-        
-        # Columns to group by
-        group_cols = []
-        select_cols = []
-        agg_cols = []  # Columns that need aggregation
-        
-        # Exogenous covariates
-        for var in self.formula.covariates:
-            if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                group_cols.append(var.sql_name)
-                select_cols.append(var.sql_name)
-        
-        # Instruments (needed for IV vcov computation)
-        for var in self.formula.instruments:
-            group_cols.append(var.sql_name)
-            select_cols.append(var.sql_name)
-        
-        # Fitted endogenous (group by fitted)
-        for var in self.formula.endogenous:
-            fitted_col = f"fitted_{var.sql_name}"
-            group_cols.append(fitted_col)
-            select_cols.append(fitted_col)
-            # Aggregate ACTUAL endogenous for residual computation (key for 2SLS)
-            agg_cols.append(f"SUM({var.sql_name}) as sum_{var.sql_name}")
-        
-        # Mundlak means
-        if self.fe_cols and self.fe_method == "mundlak":
-            for var in self.formula.covariates:
-                if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                    for i in range(len(self.fe_cols)):
-                        col = f"avg_{var.sql_name}_fe{i}"
-                        group_cols.append(col)
-                        select_cols.append(col)
-            # Mundlak means for instruments
-            for var in self.formula.instruments:
-                for i in range(len(self.fe_cols)):
-                    col = f"avg_{var.sql_name}_fe{i}"
-                    group_cols.append(col)
-                    select_cols.append(col)
-            # Also add Mundlak means for fitted endogenous
-            for var in self.formula.endogenous:
-                for i in range(len(self.fe_cols)):
-                    col = f"avg_fitted_{var.sql_name}_fe{i}"
-                    group_cols.append(col)
-                    select_cols.append(col)
-        
-        # Cluster column
-        if self.cluster_col:
-            group_cols.append(self.cluster_col)
-            select_cols.append(self.cluster_col)
-        
-        # First add Mundlak means for fitted endogenous if needed
-        if self.fe_cols and self.fe_method == "mundlak":
-            self._add_fitted_mundlak_means_sql()
-        
-        # Build aggregation query
-        group_by_sql = ", ".join(group_cols) if group_cols else "1"
-        select_sql = ", ".join(select_cols) if select_cols else "1 AS dummy"
-        
-        # Add outcome aggregation (including sum_y_sq for exact variance computation)
-        agg_cols.append("COUNT(*) as count")
-        agg_cols.append(f"SUM({outcome_var.sql_name}) as sum_{outcome_var.sql_name}")
-        agg_cols.append(f"SUM(({outcome_var.sql_name}) * ({outcome_var.sql_name})) as sum_{outcome_var.sql_name}_sq")
-        agg_sql = ", ".join(agg_cols)
-        
-        self.conn.execute(f"""
-        CREATE OR REPLACE VIEW {self._COMPRESSED_VIEW} AS
-        SELECT {select_sql},
-               {agg_sql}
-        FROM {self._DATA_TABLE}
-        GROUP BY {group_by_sql}
-        """)
-        
-        # Update observation counts
-        result = self.conn.execute(f"""
-            SELECT SUM(count) as n_obs, COUNT(*) as n_compressed 
-            FROM {self._COMPRESSED_VIEW}
-        """).fetchone()
-        self.n_obs = int(result[0]) if result[0] else 0
-        self.n_compressed_rows = int(result[1]) if result[1] else 0
-        
-        logger.debug(f"Created second stage view: {self.n_obs} obs, {self.n_compressed_rows} compressed")
-    
-    def _add_fitted_mundlak_means_sql(self):
-        """Add Mundlak means for fitted endogenous variables"""
-        from ..core.sql_builders import build_add_fitted_mundlak_means_sql
-        
-        if not self.formula.endogenous:
-            return
-        
-        fitted_var_sql_names = [var.sql_name for var in self.formula.endogenous]
-        
-        for i, fe_col_name in enumerate(self.fe_cols):
-            fe_var = self.formula.get_fe_by_name(fe_col_name)
-            mfe = self.formula.get_merged_fe_by_name(fe_col_name)
-            fe_sql_name = fe_var.sql_name if fe_var else (mfe.sql_name if mfe else fe_col_name)
-            
-            # Use centralized SQL builder
-            sql = build_add_fitted_mundlak_means_sql(
-                table_name=self._DATA_TABLE,
-                fitted_var_sql_names=fitted_var_sql_names,
-                fe_col_sql_name=fe_sql_name,
-                fe_index=i
-            )
-            self.conn.execute(sql)
-    
-    def _get_x_cols_for_duckdb(self) -> List[str]:
-        """Get x column names for second stage DuckDB fitter"""
-        return build_x_cols_for_duckdb(
-            formula=self.formula,
-            fe_method=self.fe_method,
-            fe_cols=self.fe_cols,
-            is_iv=True,
-            endogenous_vars=self.endogenous_vars
-        )
-    
-    def _get_y_col_for_duckdb(self) -> str:
-        """Get y column name for second stage DuckDB fitter"""
-        outcome_var = self.formula.outcomes[0]
-        return f"sum_{outcome_var.sql_name}"
-    
-    def _build_coef_names_for_duckdb(self) -> List[str]:
-        """Build coefficient names for DuckDB fitter results"""
-        display_names, _ = build_coef_name_lists(
-            formula=self.formula,
-            fe_method=self.fe_method,
-            include_intercept=True,
-            fe_cols=self.fe_cols,
-            is_iv=True,
-            endogenous_vars=self.endogenous_vars
-        )
-        return display_names
-    
-    def _build_coef_sql_names_for_duckdb(self) -> List[str]:
-        """Build SQL-safe coefficient names parallel to coef_names_"""
-        _, sql_names = build_coef_name_lists(
-            formula=self.formula,
-            fe_method=self.fe_method,
-            include_intercept=True,
-            fe_cols=self.fe_cols,
-            is_iv=True,
-            endogenous_vars=self.endogenous_vars
-        )
-        return sql_names
-    
-    def _get_actual_x_cols_for_duckdb(self) -> List[str]:
-        """Get x column names using ACTUAL endogenous (not fitted) for residual computation.
-        
-        This is the key difference for 2SLS: residuals should use actual endogenous values,
-        not fitted ones. The order must match _get_x_cols_for_duckdb() so coefficients
-        align correctly when computing residuals.
-        
-        For compressed data where actual values are aggregated as sum_{var.sql_name},
-        the DuckDBFitter will automatically divide by count when computing residuals.
-        
-        Returns:
-            List of column names in same order as x_cols, but with actual endogenous
-        """
-        return build_residual_x_cols_for_duckdb(
-            formula=self.formula,
-            fe_method=self.fe_method,
-            fe_cols=self.fe_cols,
-            endogenous_vars=self.endogenous_vars
-        )
+        fe_sql_names = self._resolve_fe_sql_names()
+        if fe_sql_names:
+            self._remove_singleton_observations(self._STAGING_TABLE, fe_sql_names)
 
     # =========================================================================
-    # First Stage
+    # Column name helpers
     # =========================================================================
-    
-    def compute_mundlak_means(self, df: pd.DataFrame, cov_cols: List[str]) -> Tuple[np.ndarray, List[str]]:
-        """Compute group means for Mundlak device."""
-        from ..core.sql_builders import compute_mundlak_means_numpy
-        return compute_mundlak_means_numpy(df, cov_cols, self.fe_cols, self.formula)
-    
-    def _run_first_stages(self):
-        """Run first-stage regressions for all endogenous variables"""
-        for endog_var in self.endogenous_vars:
-            logger.debug(f"Running first stage for {endog_var}")
-            if self.fitter == "duckdb":
-                fs_result = self._run_single_first_stage_duckdb(endog_var)
-            else:
-                fs_result = self._run_single_first_stage_numpy(endog_var)
-            self._first_stage_results[endog_var] = fs_result
-            self._add_fitted_column(fs_result)
-            logger.debug(f"First stage for {endog_var}: F-stat={fs_result.f_statistic}")
-    
-    def _run_single_first_stage_numpy(self, endog_var: str) -> FirstStageResults:
-        """Run first-stage regression using numpy (in-memory)"""
-        endog_var_obj = next(
-            (v for v in self.formula.endogenous if v.display_name == endog_var), None
+
+    def _get_exog_sql(self) -> List[str]:
+        """SQL names of exogenous (non-intercept, non-endogenous) covariates."""
+        return [
+            v.sql_name for v in self.formula.covariates
+            if not v.is_intercept() and v.display_name not in self.endogenous_vars
+        ]
+
+    def _get_inst_sql(self) -> List[str]:
+        """SQL names of instruments."""
+        return [v.sql_name for v in self.formula.instruments]
+
+    def _x_extra(self, extra: List[str]) -> List[str]:
+        """Subset of *extra_regressors* for the second-stage X matrix.
+
+        Keeps Mundlak means of exog and fitted endogenous; excludes means of
+        instruments (those belong in Z only).  Fixed-FE dummies and dummy-means
+        are kept in both X and Z.
+        """
+        inst_prefixes = {f"avg_{s}_fe" for s in (self._inst_sql or [])}
+        return [
+            col for col in extra
+            if not any(col.startswith(p) for p in inst_prefixes)
+        ]
+
+    def _z_extra(self, extra: List[str]) -> List[str]:
+        """Subset of *extra_regressors* for the instrument matrix Z.
+
+        Keeps Mundlak means of exog and instruments; excludes means of fitted
+        endogenous (those belong in X only).  Fixed-FE dummies and dummy-means
+        are kept.
+        """
+        fitted_prefixes = {f"avg_{s}_fe" for s in (self._fitted_endog_sql or [])}
+        return [
+            col for col in extra
+            if not any(col.startswith(p) for p in fitted_prefixes)
+        ]
+
+    def _build_fs_display_names(
+        self,
+        exog_sql: List[str],
+        inst_sql: List[str],
+        transformer: MundlakTransformer,
+    ) -> List[str]:
+        """Human-readable coefficient names for first-stage output."""
+        sql_to_display = {v.sql_name: v.display_name for v in self.formula.covariates}
+        sql_to_display.update(
+            {v.sql_name: v.display_name for v in self.formula.instruments}
         )
-        if endog_var_obj is None:
-            raise ValueError(f"Endogenous variable not found: {endog_var}")
-        
-        df = self._fetch_first_stage_data()
-        y_fs, X_fs, coef_names_fs = self._build_first_stage_matrices(df, endog_var_obj.sql_name)
-        weights = np.ones(len(df))
-        cluster_ids = df[self.cluster_col].values if self.cluster_col and self.cluster_col in df.columns else None
-        
-        coefs = wls(X_fs, y_fs, weights)
-        
-        fitter = NumpyFitter(alpha=1e-8, se_type="stata")
-        result = fitter.fit(
-            X=X_fs, y=y_fs, weights=weights,
-            coef_names=coef_names_fs,
-            cluster_ids=cluster_ids
+        names = ["Intercept"]
+        for sql in exog_sql:
+            names.append(sql_to_display.get(sql, sql))
+        for sql in inst_sql:
+            names.append(sql_to_display.get(sql, sql))
+        names.extend(transformer.extra_regressors)
+        return names
+
+    def _build_second_stage_coef_names(self, x_extra: List[str]) -> List[str]:
+        """Human-readable coefficient names for second-stage output."""
+        sql_to_display = {v.sql_name: v.display_name for v in self.formula.covariates}
+        sql_to_display.update(
+            {v.sql_name: v.display_name for v in self.formula.endogenous}
         )
-        
-        # Compute vcov separately
-        vcov, vcov_meta, _ = fitter.fit_vcov(
-            X=X_fs, y=y_fs, weights=weights,
-            coefficients=result.coefficients,
-            cluster_ids=cluster_ids,
-            existing_result=result
-        )
-        
-        reg_results = RegressionResults(
-            coefficients=coefs,
-            coef_names=coef_names_fs,
-            vcov=vcov,
-            n_obs=len(df),
-            se_type=vcov_meta.get('vcov_type_detail', 'HC1'),
-        )
-        
-        return FirstStageResults(
-            endog_var=endog_var,
-            results=reg_results,
-            instrument_names=self.instrument_vars,
-        )
-    
-    def _run_single_first_stage_duckdb(self, endog_var: str) -> FirstStageResults:
-        """Run first-stage regression using DuckDB (out-of-core)"""
-        endog_var_obj = next(
-            (v for v in self.formula.endogenous if v.display_name == endog_var), None
-        )
-        if endog_var_obj is None:
-            raise ValueError(f"Endogenous variable not found: {endog_var}")
-        
-        # Get column names for first stage
-        x_cols = self._get_first_stage_x_cols()
-        y_col = endog_var_obj.sql_name
-        
-        # Create first stage view (uncompressed data, need to add sum_y_sq column)
-        # For uncompressed data: sum_y_sq = y * y (each row is one observation)
-        self.conn.execute(f"""
-        CREATE OR REPLACE VIEW first_stage_view AS
-        SELECT *, 1 as count, ({y_col}) * ({y_col}) AS {y_col}_sq
-        FROM {self._DATA_TABLE}
-        WHERE {y_col} IS NOT NULL
-        """)
-        
-        duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type="stata")
-        result = duckdb_fitter.fit(
-            table_name="first_stage_view",
-            x_cols=x_cols,
-            y_col=y_col,
-            weight_col="count",
-            add_intercept=True,
-            cluster_col=self.cluster_col if self.cluster_col else None
-        )
-        
-        # Compute vcov separately
-        vcov, vcov_meta, _ = duckdb_fitter.fit_vcov(
-            table_name="first_stage_view",
-            x_cols=x_cols,
-            y_col=y_col,
-            weight_col="count",
-            add_intercept=True,
-            cluster_col=self.cluster_col if self.cluster_col else None,
-            coefficients=result.coefficients,
-            existing_result=result
-        )
-        
-        coef_names_fs = self._build_first_stage_coef_names()
-        
-        reg_results = RegressionResults(
-            coefficients=result.coefficients,
-            coef_names=coef_names_fs,
-            vcov=vcov,
-            n_obs=result.n_obs,
-            se_type=vcov_meta.get('vcov_type_detail', 'HC1'),
-        )
-        
-        return FirstStageResults(
-            endog_var=endog_var,
-            results=reg_results,
-            instrument_names=self.instrument_vars,
-        )
-    
-    def _get_first_stage_x_cols(self) -> List[str]:
-        """Get x column names for first stage regression"""
-        return build_z_cols_for_duckdb(
-            formula=self.formula,
-            fe_method=self.fe_method,
-            fe_cols=self.fe_cols,
-            endogenous_vars=self.endogenous_vars
-        )
-    
-    def _build_first_stage_coef_names(self) -> List[str]:
-        """Build coefficient names for first stage using centralized utility"""
-        return build_first_stage_coef_names(
-            formula=self.formula,
-            fe_method=self.fe_method,
-            fe_cols=self.fe_cols
-        )
-        
-    def _build_first_stage_coef_names(self) -> List[str]:
-        """Build coefficient names for first stage"""
-        coef_names = ['Intercept']
-        
-        # Exogenous covariates
-        for var in self.formula.covariates:
-            if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                coef_names.append(var.display_name)
-        
-        # Instruments
-        for var in self.formula.instruments:
-            coef_names.append(var.display_name)
-        
-        # Mundlak means
-        if self.fe_cols and self.fe_method == "mundlak":
-            for var in self.formula.covariates:
-                if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                    for i in range(len(self.fe_cols)):
-                        coef_names.append(f"avg_{var.display_name}_fe{i}")
-            for var in self.formula.instruments:
-                for i in range(len(self.fe_cols)):
-                    coef_names.append(f"avg_{var.display_name}_fe{i}")
-        
-        return coef_names
-    
-    def _fetch_first_stage_data(self) -> pd.DataFrame:
-        """Fetch data for first stage (numpy fitter only)"""
-        return self.conn.execute(f"SELECT * FROM {self._DATA_TABLE}").fetchdf().dropna()
-    
-    def _build_first_stage_matrices(
-        self, df: pd.DataFrame, endog_sql_name: str
-    ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-        """Build y and X matrices for first stage with Mundlak device"""
-        y = df[endog_sql_name].values.reshape(-1, 1)
-        
-        X_parts = [np.ones((len(df), 1))]
-        coef_names = ['Intercept']
-        
-        # Exogenous covariates
-        exog_cols = []
-        for var in self.formula.covariates:
-            if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                if var.sql_name in df.columns:
-                    exog_cols.append(var.sql_name)
-                    coef_names.append(var.display_name)
-        
-        # Instruments
-        inst_cols = []
-        for var in self.formula.instruments:
-            if var.sql_name in df.columns:
-                inst_cols.append(var.sql_name)
-                coef_names.append(var.display_name)
-        
-        if exog_cols:
-            X_parts.append(df[exog_cols].values)
-        if inst_cols:
-            X_parts.append(df[inst_cols].values)
-        
-        # Mundlak means for FEs - uses MundlakMixin.compute_mundlak_means
-        if self.fe_cols and self.fe_method == "mundlak":
-            all_cov_cols = exog_cols + inst_cols
-            if all_cov_cols:
-                X_mundlak, names_mundlak = self.compute_mundlak_means(df, all_cov_cols)
-                if X_mundlak.shape[1] > 0:
-                    X_parts.append(X_mundlak)
-                    coef_names.extend(names_mundlak)
-        
-        X = np.hstack(X_parts)
-        return y, X, coef_names
-    
-    def _add_fitted_column(self, fs_result: FirstStageResults):
-        """Add fitted values column to data table"""
-        endog_var_obj = next(
-            (v for v in self.formula.endogenous if v.display_name == fs_result.endog_var), None
-        )
-        if endog_var_obj is None:
-            return
-        
-        fitted_col = f"fitted_{endog_var_obj.sql_name}"
-        available_cols = self._get_table_columns(self._DATA_TABLE)
-        
-        # Build fitted expression including Mundlak means if they exist in table
-        expr_parts = []
-        for name, coef in zip(fs_result.coef_names, fs_result.coefficients.flatten()):
-            if name == 'Intercept':
-                expr_parts.append(f"{coef}")
-            elif name.startswith('avg_') and '_fe' in name:
-                # Mundlak means - use sql column name directly (avg_{sql_name}_fe{i})
-                # Need to convert display name to sql name in the avg_ pattern
-                parts = name.split('_')
-                if len(parts) >= 3:
-                    # Extract fe index and find the variable
-                    fe_suffix = parts[-1]  # e.g., "fe0"
-                    display_var_name = '_'.join(parts[1:-1])  # middle part is the display name
-                    sql_col_name = None
-                    for var in self.formula.covariates:
-                        if var.display_name == display_var_name:
-                            sql_col_name = f"avg_{var.sql_name}_{fe_suffix}"
-                            break
-                    if sql_col_name is None:
-                        for var in self.formula.instruments:
-                            if var.display_name == display_var_name:
-                                sql_col_name = f"avg_{var.sql_name}_{fe_suffix}"
-                                break
-                    if sql_col_name and sql_col_name in available_cols:
-                        expr_parts.append(f"({coef} * {quote_identifier(sql_col_name)})")
-            else:
-                sql_name = self.formula.get_sql_name_for_display(name)
-                if sql_name and sql_name in available_cols:
-                    expr_parts.append(f"({coef} * {quote_identifier(sql_name)})")
-        
-        fitted_expr = " + ".join(expr_parts) if expr_parts else "0"
-        
-        self.conn.execute(f"""
-        ALTER TABLE {self._DATA_TABLE} ADD COLUMN {quote_identifier(fitted_col)} DOUBLE
-        """)
-        self.conn.execute(f"""
-        UPDATE {self._DATA_TABLE} SET {quote_identifier(fitted_col)} = {fitted_expr}
-        """)
-        
-        logger.debug(f"Added fitted values column: {fitted_col}")
+        names = ["Intercept"]
+        for sql in (self._exog_sql or []):
+            names.append(sql_to_display.get(sql, sql))
+        for sql in (self._fitted_endog_sql or []):
+            base = sql[len("fitted_"):] if sql.startswith("fitted_") else sql
+            names.append(sql_to_display.get(base, base))
+        names.extend(x_extra)
+        return names
 
     # =========================================================================
-    # Second Stage Design Matrices
+    # WHERE clause
     # =========================================================================
-    
-    def _build_design_matrices(self):
-        """Build design matrices for second stage estimation"""
-        df = self._fetch_second_stage_data()
-        
-        # Outcome (raw values, not aggregated - Duck2SLS uses uncompressed data)
-        outcome_var = self.formula.outcomes[0]
-        self._y = df[outcome_var.sql_name].values.reshape(-1, 1)
-        
-        # Build common X (exogenous + Mundlak means)
-        X_common, coef_names, coef_names_sql = self._build_common_X(df)
-        
-        # Build endogenous columns
-        X_endog_fitted, X_endog_actual, endog_names, endog_names_sql = self._build_endogenous_X(df)
-        
-        self._X_fitted = np.hstack([X_common, X_endog_fitted])
-        self._X_actual = np.hstack([X_common, X_endog_actual])
-        
-        # Build instrument matrix Z (exogenous + instruments + Mundlak means)
-        self._Z = self._build_instrument_matrix(df)
-        
-        self.coef_names_ = coef_names + endog_names
-        self._coef_sql_names = coef_names_sql + endog_names_sql
-        # Unit weights for uncompressed data
-        self._weights = np.ones(len(df))
-        
-        if self.cluster_col and self.cluster_col in df.columns:
-            self._cluster_ids = df[self.cluster_col].values
-        else:
-            self._cluster_ids = None
-    
-    def _fetch_second_stage_data(self) -> pd.DataFrame:
-        """Fetch data for second stage"""
-        return self.conn.execute(f"SELECT * FROM {self._DATA_TABLE}").fetchdf().dropna()
-    
-    def _build_endogenous_X(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
-        """Build endogenous part of design matrix (both fitted and actual).
-        
-        Returns:
-            Tuple of (X_fitted array, X_actual array, display names, SQL names)
-        """
-        X_fitted_parts = []
-        X_actual_parts = []
-        endog_names = []
-        endog_sql_names = []
-        
-        for var in self.formula.endogenous:
-            fitted_col = f"fitted_{var.sql_name}"
-            actual_col = var.sql_name
-            
-            if fitted_col in df.columns and actual_col in df.columns:
-                X_fitted_parts.append(df[fitted_col].values.reshape(-1, 1))
-                X_actual_parts.append(df[actual_col].values.reshape(-1, 1))
-                endog_names.append(var.display_name)
-                endog_sql_names.append(var.sql_name)
-            else:
-                logger.warning(f"Missing fitted or actual column for {var.display_name}")
-        
-        if X_fitted_parts:
-            return (np.hstack(X_fitted_parts), np.hstack(X_actual_parts), 
-                    endog_names, endog_sql_names)
-        
-        # Return empty arrays if no endogenous variables found
-        n_rows = len(df)
-        return (np.zeros((n_rows, 0)), np.zeros((n_rows, 0)), [], [])
-    
-    def _build_common_X(self, df: pd.DataFrame) -> Tuple[np.ndarray, List[str], List[str]]:
-        """Build exogenous part of design matrix
-        
-        Returns:
-            Tuple of (X array, display names, SQL names)
-        """
-        X_parts = []
-        coef_names = []
-        coef_sql_names = []
-        
-        # Intercept
-        if self._has_intercept or not self.fe_cols:
-            X_parts.append(np.ones((len(df), 1)))
-            coef_names.append('Intercept')
-            coef_sql_names.append('Intercept')
-        
-        # Exogenous covariates
-        exog_cols = []
-        exog_names = []
-        exog_sql_names = []
-        for var in self.formula.covariates:
-            if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                if var.sql_name in df.columns:
-                    exog_cols.append(var.sql_name)
-                    exog_names.append(var.display_name)
-                    exog_sql_names.append(var.sql_name)
-        
-        if exog_cols:
-            X_parts.append(df[exog_cols].values)
-            coef_names.extend(exog_names)
-            coef_sql_names.extend(exog_sql_names)
-        
-        # Mundlak means - uses MundlakMixin.compute_mundlak_means
-        # NOTE: Only includes covariates and fitted endogenous, NOT instruments
-        if self.fe_cols and self.fe_method == "mundlak":
-            # Get fitted endogenous column names
-            fitted_cols = []
-            for var in self.formula.endogenous:
-                fc = f"fitted_{var.sql_name}"
-                if fc in df.columns:
-                    fitted_cols.append(fc)
-            
-            # Only group means of exogenous covariates and fitted endogenous (no instruments)
-            all_cov_cols = exog_cols + fitted_cols
-            if all_cov_cols:
-                X_mundlak, names_mundlak = self.compute_mundlak_means(df, all_cov_cols)
-                if X_mundlak.shape[1] > 0:
-                    X_parts.append(X_mundlak)
-                    coef_names.extend(names_mundlak)
-                    # Mundlak names are already SQL-safe (avg_{sql_col}_fe{i})
-                    coef_sql_names.extend(names_mundlak)
-        
-        if X_parts:
-            return np.hstack(X_parts), coef_names, coef_sql_names
-        return np.ones((len(df), 1)), ['Intercept'], ['Intercept']
-    
-    def _build_instrument_matrix(self, df: pd.DataFrame) -> np.ndarray:
-        """Build instrument matrix Z for IV standard error correction.
-        
-        Z consists of:
-        1. Intercept
-        2. Exogenous covariates
-        3. Instruments
-        4. Mundlak means (if applicable)
-        """
-        Z_parts = []
-        
-        # Intercept
-        Z_parts.append(np.ones((len(df), 1)))
-        
-        # Exogenous covariates
-        for var in self.formula.covariates:
-            if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                if var.sql_name in df.columns:
-                    Z_parts.append(df[var.sql_name].values.reshape(-1, 1))
-        
-        # Instruments
-        for var in self.formula.instruments:
-            if var.sql_name in df.columns:
-                Z_parts.append(df[var.sql_name].values.reshape(-1, 1))
-        
-        # Mundlak means (if added)
-        if self.fe_cols and self.fe_method == "mundlak":
-            # Exogenous variable means
-            for var in self.formula.covariates:
-                if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                    for i in range(len(self.fe_cols)):
-                        col = f"avg_{var.sql_name}_fe{i}"
-                        if col in df.columns:
-                            Z_parts.append(df[col].values.reshape(-1, 1))
-            
-            # Instrument means
-            for var in self.formula.instruments:
-                for i in range(len(self.fe_cols)):
-                    col = f"avg_{var.sql_name}_fe{i}"
-                    if col in df.columns:
-                        Z_parts.append(df[col].values.reshape(-1, 1))
-        
-        return np.hstack(Z_parts)
 
-    def _get_z_cols_for_duckdb(self) -> List[str]:
-        """Get instrument column names for DuckDB vcov computation.
-        
-        Z consists of:
-        - Exogenous covariates (same as X)
-        - Instruments (not in X)
-        - Mundlak means for both exogenous and instruments
-        
-        This matches the in-memory Z matrix construction in _build_instrument_matrix.
-        """
-        z_cols = []
-        
-        # Exogenous covariates
-        for var in self.formula.covariates:
-            if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                z_cols.append(var.sql_name)
-        
-        # Instruments
-        for var in self.formula.instruments:
-            z_cols.append(var.sql_name)
-        
-        # Mundlak means (if added)
-        if self.fe_cols and self.fe_method == "mundlak":
-            # Exogenous variable means
-            for var in self.formula.covariates:
-                if not var.is_intercept() and var.display_name not in self.endogenous_vars:
-                    for i in range(len(self.fe_cols)):
-                        z_cols.append(f"avg_{var.sql_name}_fe{i}")
-            
-            # Instrument means
-            for var in self.formula.instruments:
-                for i in range(len(self.fe_cols)):
-                    z_cols.append(f"avg_{var.sql_name}_fe{i}")
-        
-        return z_cols
+    def _build_where_clause(self, user_subset: Optional[str] = None) -> str:
+        return self.formula.get_where_clause_sql(user_subset)
 
     # =========================================================================
-    # Summary
+    # Summary / output
     # =========================================================================
-    
+
     def summary(self) -> Dict[str, Any]:
-        """Provide comprehensive and exhaustive 2SLS results summary.
-        
-        Returns a dictionary containing all information needed to:
-        - Reconstruct the analysis
-        - Track provenance (version, timestamp)
-        - Identify results from buggy versions
-        
-        Uses the standardized ModelSummary structure for consistency.
-        
-        Returns:
-            Dictionary with model specification, results, first stages, and metadata
-        """
         from ..core.results import ModelSummary
         return ModelSummary.from_estimator(self).to_dict()
-    
+
     def summary_df(self) -> pd.DataFrame:
-        """Get results as a DataFrame (wide format with index).
-        
-        Returns:
-            DataFrame with coefficient estimates and statistics as rows indexed by variable names
-        """
         if self.results is None:
             return pd.DataFrame()
         return self.results.to_dataframe()
-    
+
     def print_summary(self, precision: int = 4, include_diagnostics: bool = True):
         """Print formatted 2SLS results to console using unified formatter."""
         from ..utils.summary import print_summary as fmt_print
-        fmt_print(self.summary(), precision=precision, include_diagnostics=include_diagnostics)
-    
+        fmt_print(
+            self.summary(),
+            precision=precision,
+            include_diagnostics=include_diagnostics,
+        )
+
     def to_tidy_df(self) -> pd.DataFrame:
         """Get results as a tidy DataFrame using unified formatter."""
         from ..utils.summary import to_tidy_df as fmt_tidy

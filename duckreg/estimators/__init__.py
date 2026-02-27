@@ -37,11 +37,10 @@ from .DuckLinearModel import DuckLinearModel
 
 # Concrete estimators
 from .DuckRegression import DuckRegression
-from .DuckMundlak import DuckMundlak
 from .Duck2SLS import Duck2SLS
-from .DuckDoubleDemeaning import DuckDoubleDemeaning
 from .DuckMundlakEventStudy import DuckMundlakEventStudy
 from .DuckRidge import DuckRidge
+from .DuckFE import DuckFE
 
 __all__ = [
     # Base classes
@@ -63,9 +62,8 @@ __all__ = [
     'DuckLinearModel',
     # Estimators
     'DuckRegression',
-    'DuckMundlak',
     'Duck2SLS',
-    'DuckDoubleDemeaning',
     'DuckMundlakEventStudy',
     'DuckRidge',
+    'DuckFE',
 ]

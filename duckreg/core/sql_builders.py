@@ -17,6 +17,7 @@ API Design Principles:
 - Column ordering is explicit and documented
 """
 
+import re
 import numpy as np
 import pandas as pd
 import logging
@@ -1192,6 +1193,287 @@ JOIN (
 
 
 # ============================================================================
+# SECTION 6: FE Classification and Unbalanced Panel Support
+# ============================================================================
+
+def profile_fe_column(
+    conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+    fe_col_sql_name: str
+) -> Dict[str, Any]:
+    """Profile a fixed effect column to determine if it's fixed or asymptotic.
+    
+    Computes metadata for classification heuristic:
+    - cardinality: number of unique levels
+    - singleton_share: proportion of levels with only 1 observation
+    - avg_obs_per_level: mean observations per level
+    - median_obs_per_level: median observations per level
+    
+    Parameters
+    ----------
+    conn : DuckDBPyConnection
+        Active database connection
+    table_name : str
+        Name of table (will be quoted if needed)
+    fe_col_sql_name : str
+        SQL-safe name of FE column (will be quoted if needed)
+        
+    Returns
+    -------
+    Dict[str, Any]
+        Profiling metadata with keys: 'cardinality', 'singleton_share',
+        'avg_obs_per_level', 'median_obs_per_level', 'total_obs'
+        
+    Examples
+    --------
+    >>> profile = profile_fe_column(conn, 'data', 'firm_id')
+    >>> profile['cardinality']
+    100
+    """
+    from ..utils.formula_parser import quote_identifier
+    
+    quoted_table = quote_identifier(table_name)
+    quoted_fe_col = quote_identifier(fe_col_sql_name)
+    
+    query = f"""
+    WITH fe_counts AS (
+        SELECT {quoted_fe_col}, COUNT(*) as n_obs
+        FROM {quoted_table}
+        GROUP BY {quoted_fe_col}
+    )
+    SELECT
+        COUNT(DISTINCT {quoted_fe_col}) as cardinality,
+        SUM(CASE WHEN n_obs = 1 THEN 1 ELSE 0 END)::FLOAT / COUNT(*) as singleton_share,
+        AVG(n_obs) as avg_obs_per_level,
+        MEDIAN(n_obs) as median_obs_per_level,
+        SUM(n_obs) as total_obs
+    FROM fe_counts
+    """
+    
+    result = conn.execute(query).fetchone()
+    
+    return {
+        'cardinality': int(result[0]),
+        'singleton_share': float(result[1]),
+        'avg_obs_per_level': float(result[2]),
+        'median_obs_per_level': float(result[3]),
+        'total_obs': int(result[4])
+    }
+
+
+def classify_fe_type(
+    profile: Dict[str, Any],
+    cardinality_threshold: int = 50,
+    singleton_threshold: float = 0.1,
+    user_override: Optional[str] = None
+) -> str:
+    """Classify FE as 'fixed' or 'asymptotic' using heuristic.
+    
+    Classification logic:
+    1. If user_override provided, use it
+    2. Else if cardinality <= threshold, classify as 'fixed'
+    3. Else if singleton_share > threshold, classify as 'fixed' (unstable)
+    4. Else if median_obs_per_level == 1, classify as 'fixed' (no pooling)
+    5. Else classify as 'asymptotic'
+    
+    Parameters
+    ----------
+    profile : Dict[str, Any]
+        Output from profile_fe_column()
+    cardinality_threshold : int, default=50
+        Max cardinality for 'fixed' classification
+    singleton_threshold : float, default=0.1
+        Max singleton share for 'asymptotic' classification
+    user_override : str, optional
+        Explicit classification ('fixed' or 'asymptotic')
+        
+    Returns
+    -------
+    str
+        Either 'fixed' or 'asymptotic'
+        
+    Examples
+    --------
+    >>> profile = {'cardinality': 10, 'singleton_share': 0.0, 
+    ...            'avg_obs_per_level': 100, 'median_obs_per_level': 100}
+    >>> classify_fe_type(profile)
+    'fixed'
+    
+    >>> profile = {'cardinality': 1000, 'singleton_share': 0.01,
+    ...            'avg_obs_per_level': 50, 'median_obs_per_level': 45}
+    >>> classify_fe_type(profile)
+    'asymptotic'
+    """
+    if user_override:
+        if user_override not in ('fixed', 'asymptotic'):
+            raise ValueError(f"user_override must be 'fixed' or 'asymptotic', got: {user_override}")
+        return user_override
+    
+    # Heuristic classification
+    if profile['cardinality'] <= cardinality_threshold:
+        return 'fixed'
+    
+    if profile['singleton_share'] > singleton_threshold:
+        return 'fixed'  # Too unstable for asymptotic treatment
+    
+    if profile['median_obs_per_level'] == 1:
+        return 'fixed'  # No pooling possible
+    
+    return 'asymptotic'
+
+
+def build_add_fixed_fe_dummy_means_sql(
+    table_name: str,
+    fixed_fe_col_sql_name: str,
+    fixed_fe_levels: List[Any],
+    asymptotic_fe_col_sql_name: str,
+    asymptotic_fe_index: int,
+    reference_level: Optional[Any] = None
+) -> str:
+    """Build SQL to add within-asymptotic-FE means of fixed-FE dummies.
+    
+    For unbalanced panels with mixed FE types, Wooldridge's correction requires
+    adding within-asymptotic-FE means of fixed-FE dummies to preserve equivalence.
+    
+    For example, if year is fixed and firm is asymptotic:
+    - For each year level (except reference), compute mean(year==level | firm)
+    - Add columns: avg_year_2020_fe0, avg_year_2021_fe0, etc.
+    
+    Parameters
+    ----------
+    table_name : str
+        Name of table to augment (will be quoted if needed)
+    fixed_fe_col_sql_name : str
+        SQL-safe name of the fixed FE column
+    fixed_fe_levels : List[Any]
+        All levels of the fixed FE (will exclude reference_level)
+    asymptotic_fe_col_sql_name : str
+        SQL-safe name of the asymptotic FE column
+    asymptotic_fe_index : int
+        Index of asymptotic FE dimension (for naming)
+    reference_level : Any, optional
+        Reference level to exclude (typically first level)
+        
+    Returns
+    -------
+    str
+        Complete SQL statement to add dummy-mean columns
+        
+    Examples
+    --------
+    >>> sql = build_add_fixed_fe_dummy_means_sql(
+    ...     'data', 'year', [2019, 2020, 2021], 'firm_id', 0, reference_level=2019
+    ... )
+    >>> 'avg_year_2020_fe0' in sql
+    True
+    """
+    from ..utils.formula_parser import quote_identifier
+    
+    if not fixed_fe_levels:
+        raise ValueError("fixed_fe_levels cannot be empty")
+    
+    quoted_table = quote_identifier(table_name)
+    quoted_fixed_fe = quote_identifier(fixed_fe_col_sql_name)
+    quoted_asymp_fe = quote_identifier(asymptotic_fe_col_sql_name)
+    
+    # Exclude reference level
+    levels_to_include = [lvl for lvl in fixed_fe_levels if lvl != reference_level]
+    
+    if not levels_to_include:
+        logger.warning(f"All levels of {fixed_fe_col_sql_name} excluded (only reference level)")
+        return f"-- No dummy means needed, only reference level"
+    
+    # Build AVG expressions for dummy means
+    # Use CASE to create dummy (0/1), then AVG within asymptotic FE
+    avg_select_parts = []
+    join_col_parts = []
+    
+    for level in levels_to_include:
+        # SQL-safe column name for this dummy mean (sanitise level to avoid dots
+        # or other characters that are invalid in unquoted SQL identifiers)
+        safe_level = re.sub(r'[^a-zA-Z0-9_]', '_', str(level))
+        col_name = f"avg_{fixed_fe_col_sql_name}_{safe_level}_fe{asymptotic_fe_index}"
+        
+        # Handle string vs numeric levels
+        if isinstance(level, str):
+            level_expr = f"'{level}'"
+        else:
+            level_expr = str(level)
+        
+        avg_expr = f"AVG(CASE WHEN {quoted_fixed_fe} = {level_expr} THEN 1.0 ELSE 0.0 END) AS {col_name}"
+        avg_select_parts.append(avg_expr)
+        join_col_parts.append(f"fe_means.{col_name}")
+    
+    avg_select = ", ".join(avg_select_parts)
+    join_cols = ", ".join(join_col_parts)
+    
+    return f"""
+CREATE OR REPLACE TABLE {quoted_table} AS
+SELECT t.*, {join_cols}
+FROM {quoted_table} t
+JOIN (
+    SELECT {quoted_asymp_fe}, {avg_select}
+    FROM {quoted_table}
+    GROUP BY {quoted_asymp_fe}
+) fe_means ON t.{quoted_asymp_fe} = fe_means.{quoted_asymp_fe}
+""".strip()
+
+
+def get_fe_unique_levels(
+    conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+    fe_col_sql_name: str,
+    max_levels: int = 1000
+) -> List[Any]:
+    """Get unique levels of a fixed effect column.
+    
+    Parameters
+    ----------
+    conn : DuckDBPyConnection
+        Active database connection
+    table_name : str
+        Name of table
+    fe_col_sql_name : str
+        SQL-safe name of FE column
+    max_levels : int, default=1000
+        Maximum levels to return (safety guard)
+        
+    Returns
+    -------
+    List[Any]
+        Sorted list of unique FE levels
+        
+    Raises
+    ------
+    ValueError
+        If number of levels exceeds max_levels
+    """
+    from ..utils.formula_parser import quote_identifier
+    
+    quoted_table = quote_identifier(table_name)
+    quoted_fe_col = quote_identifier(fe_col_sql_name)
+    
+    query = f"""
+    SELECT DISTINCT {quoted_fe_col}
+    FROM {quoted_table}
+    ORDER BY {quoted_fe_col}
+    LIMIT {max_levels + 1}
+    """
+    
+    result = conn.execute(query).fetchdf()
+    levels = result.iloc[:, 0].tolist()
+    
+    if len(levels) > max_levels:
+        raise ValueError(
+            f"FE column {fe_col_sql_name} has more than {max_levels} levels. "
+            f"This may cause column explosion. Consider reclassifying as asymptotic "
+            f"or increasing max_levels."
+        )
+    
+    return levels
+
+
+# ============================================================================
 # SECTION 5: Utility Classes and Functions
 # ============================================================================
 # Helper utilities for working with DuckDB and formulas
@@ -1512,4 +1794,10 @@ __all__ = [
     'build_z_cols_for_duckdb',
     'build_residual_x_cols_for_duckdb',
     'compute_mundlak_means_numpy',
+    
+    # Section 6: FE Classification and Unbalanced Panel Support
+    'profile_fe_column',
+    'classify_fe_type',
+    'build_add_fixed_fe_dummy_means_sql',
+    'get_fe_unique_levels',
 ]

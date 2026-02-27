@@ -495,7 +495,7 @@ class ModelSummary:
     def from_estimator(cls, estimator) -> "ModelSummary":
         """Create ModelSummary from a fitted estimator.
         
-        Works with DuckLinearModel, DuckMundlak, Duck2SLS, etc.
+        Works with DuckLinearModel, DuckFE, Duck2SLS, etc.
         """
         from .._version import __version__
         

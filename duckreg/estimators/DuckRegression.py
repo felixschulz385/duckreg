@@ -15,50 +15,56 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 class DuckRegression(DuckLinearModel):
-    """OLS with fixed effects via demeaning.
+    """Pooled OLS regression without fixed effects.
     
-    Note: When using fixed effects (fe_cols), demeaning requires loading data
-    into memory. For truly out-of-core FE handling, use DuckMundlak instead.
-    The DuckDB fitter can only be used without fixed effects in this estimator.
+    This estimator handles basic OLS regression with an intercept.
+    For fixed effects estimation, use DuckFE.
+    
+    Supports both in-memory (numpy) and out-of-core (duckdb) fitting.
     """
     
     def __init__(self, rowid_col: str = "rowid", **kwargs):
         super().__init__(**kwargs)
         self.rowid_col = rowid_col
         self.n_rows_dropped_singletons = 0
-        # Use raw names for internal logic
-        self.strata_cols = self.covariates + self.fe_cols
         
-        # Warn if using duckdb fitter with FEs (demeaning requires memory)
-        if self.fitter == "duckdb" and self.fe_cols:
-            logger.warning(
-                f"DuckRegression with fixed effects uses demeaning which requires "
-                f"loading data into memory. The 'duckdb' fitter cannot avoid memory "
-                f"loading for this case. Consider using DuckMundlak for out-of-core "
-                f"FE estimation, or use fitter='numpy' explicitly."
+        # Pooled OLS - only use covariates for stratification
+        self.strata_cols = self.covariates
+        
+        # Warn if FE columns are specified (should use different estimator)
+        if self.fe_cols:
+            raise ValueError(
+                f"DuckRegression is for pooled OLS only (no fixed effects). "
+                f"Use DuckFE for fixed effects estimation."
             )
 
     def _get_n_coefs(self) -> int:
-        n_covs = len(self.covariates) if self.fe_cols else len(self.covariates) + 1
-        return n_covs * len(self.outcome_vars)
+        # Pooled OLS always includes intercept + covariates
+        return (len(self.covariates) + 1) * len(self.outcome_vars)
+
+    def _get_vcov_fe_params(self) -> Tuple[int, int, int, int]:
+        """Return (k_fe, n_fe, k_fe_nested, n_fe_fully_nested) = (0, 0, 0, 0) for pooled OLS.
+
+        DuckRegression is purely pooled OLS with no fixed effects, so no
+        additional DOF correction is required.
+        """
+        return 0, 0, 0, 0
     
     def _build_coef_names_from_formula(self) -> List[str]:
         """Build coefficient names from formula for DuckDB fitter.
         
-        With FEs, no intercept is included (absorbed by demeaning).
-        Without FEs, intercept is included.
+        Pooled OLS always includes an intercept + covariates.
         
         Returns:
             List of display names for coefficients
         """
         from ..utils.name_utils import build_coef_name_lists
         
-        include_intercept = not bool(self.fe_cols)
         display_names, sql_names = build_coef_name_lists(
             formula=self.formula,
-            fe_method='demean',
-            include_intercept=include_intercept,
-            fe_cols=None,  # Demeaning doesn't use Mundlak means
+            fe_method=None,  # Pooled OLS, no FE
+            include_intercept=True,
+            fe_cols=None,
             is_iv=False
         )
         # Store sql_names for SQL column selection
@@ -158,7 +164,7 @@ class DuckRegression(DuckLinearModel):
         )
 
     def collect_data(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Collect and demean data"""
+        """Collect data for pooled OLS (intercept + covariates)"""
         # Use explicit column names to avoid matching _sq columns with regex
         y_cols = [f"sum_{var.sql_name}" for var in self.formula.outcomes]
         y = data[y_cols].values
@@ -167,25 +173,17 @@ class DuckRegression(DuckLinearModel):
         # Convert sum to mean for WLS (WLS will multiply by sqrt(n) internally)
         y = y / n.reshape(-1, 1)
         
-        # Use sql_names for covariates too
+        # Use sql_names for covariates
         covariate_sql_names = self.formula.get_covariate_sql_names()
         X = data[covariate_sql_names].values
 
         y = y.reshape(-1, 1) if y.ndim == 1 else y
         X = X.reshape(-1, 1) if X.ndim == 1 else X
 
-        if self.fe_cols:
-            # Use sql_names for FE columns
-            fe_sql_names = self.formula.get_fe_sql_names()
-            fe = _convert_to_int(data[fe_sql_names])
-            fe = fe.reshape(-1, 1) if fe.ndim == 1 else fe
-            y, _ = demean(x=y, flist=fe, weights=n)
-            X, _ = demean(x=X, flist=fe, weights=n)
-            # For coef_names, use display names (for output)
-            self.coef_names_ = self.formula.get_covariate_display_names()
-        else:
-            X = np.c_[np.ones(X.shape[0]), X]
-            # For coef_names, use display names (for output)
-            self.coef_names_ = ['Intercept'] + self.formula.get_covariate_display_names()
+        # Pooled OLS: Add intercept column
+        X = np.c_[np.ones(X.shape[0]), X]
+        
+        # Set coefficient names (intercept + covariates)
+        self.coef_names_ = ['Intercept'] + self.formula.get_covariate_display_names()
 
         return y, X, n

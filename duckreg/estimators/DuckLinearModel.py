@@ -1,5 +1,5 @@
 """
-Base class for linear model estimators (DuckRegression, DuckMundlak).
+Base class for linear model estimators.
 
 This module provides the shared functionality for OLS estimators that use
 either demeaning or Mundlak device for fixed effects.
@@ -66,8 +66,25 @@ class DuckLinearModel(DuckEstimator):
         n_jobs: int = 1,
         fitter: str = "numpy",
         remove_singletons: bool = True,
+        ssc_dict: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
+        """
+        Parameters
+        ----------
+        ssc_dict : dict, optional
+            Small-sample correction overrides forwarded to every analytical
+            vcov computation (iid, HC1, CRV1, …).  Recognised keys:
+
+            * ``k_adj``   – bool, default True.  Apply N/(N−k) adjustment.
+            * ``k_fixef`` – str, ``"full"`` (default) | ``"nonnested"`` | ``"none"``.
+              Controls how absorbed FE levels count toward df_k.
+            * ``G_adj``   – bool, default True.  Apply G/(G−1) cluster factor.
+            * ``G_df``    – str, ``"conventional"`` (default) | ``"min"``.
+
+            When *None* (the default), each vcov function uses its own
+            built-in defaults, which match fixest conventions.
+        """
         if formula is None:
             raise ValueError("Formula object is required")
         
@@ -86,7 +103,8 @@ class DuckLinearModel(DuckEstimator):
         self.formula = formula
         self.n_jobs = n_jobs
         self.subset = subset
-        
+        self.ssc_dict = ssc_dict
+
         # State
         self.strata_cols: List[str] = []
         self._boolean_cols: Optional[set] = None
@@ -96,6 +114,7 @@ class DuckLinearModel(DuckEstimator):
         self.agg_query: Optional[str] = None
         self.n_compressed_rows: Optional[int] = None
         self._results: Optional[RegressionResults] = None
+        self.vcov_meta: Optional[Dict[str, Any]] = None
         
         # Extract from formula
         self.outcome_vars = formula.get_outcome_names()
@@ -147,6 +166,35 @@ class DuckLinearModel(DuckEstimator):
         """Get unit column (first FE) for panel operations"""
         return self.fe_cols[0] if self.fe_cols else None
 
+    def _get_vcov_fe_params(self) -> Tuple[int, int, int, int]:
+        """Return (k_fe, n_fe, k_fe_nested, n_fe_fully_nested) for VcovContext.
+
+        Parameters
+        ----------
+        k_fe : int
+            Total number of absorbed fixed-effect levels across all FE
+            dimensions (i.e. sum of distinct-level counts per dimension).
+            Used together with ``n_fe`` to adjust :math:`N - k - G` degrees
+            of freedom inside :class:`~duckreg.core.vcov.VcovContext`.
+        n_fe : int
+            Number of FE dimensions (i.e. ``len(fe_cols)``).
+        k_fe_nested : int
+            Total FE levels in fully-nested dimensions (for nonnested SSC).
+        n_fe_fully_nested : int
+            Number of FE dimensions fully nested within another.
+
+        Default ``(0, 0, 0, 0)`` is correct for:
+
+        * :class:`DuckRegression` – no fixed effects at all.
+        * :class:`DuckFE` (Mundlak method) – FE parameters appear as explicit
+          regressors and are already counted in ``k``; no additional DOF
+          adjustment is needed.
+
+        Must be overridden for :class:`DuckFE` (iterative demean method), where
+        fixed effects are absorbed via demeaning and are *not* present in ``X``.
+        """
+        return 0, 0, 0, 0
+
     def _ensure_data_fetched(self):
         """Fetch compressed data to memory if not already done"""
         if self._data_fetched:
@@ -187,7 +235,7 @@ class DuckLinearModel(DuckEstimator):
     def collect_data(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Extract y, X, weights arrays from compressed data.
         
-        Must be implemented by subclasses (DuckRegression, DuckMundlak).
+        Must be implemented by subclasses (DuckRegression, DuckFE).
         
         Returns:
             Tuple of (y, X, weights) arrays
@@ -324,6 +372,7 @@ class DuckLinearModel(DuckEstimator):
         
         y, X, n = self.collect_data(data=self.df_compressed)
         cluster_ids = self._get_cluster_ids_from_df()
+        k_fe, n_fe, k_fe_nested, n_fe_fully_nested = self._get_vcov_fe_params()
         
         # Use NumpyFitter for vcov computation
         fitter = NumpyFitter(alpha=1e-8, se_type=se_method)
@@ -335,17 +384,34 @@ class DuckLinearModel(DuckEstimator):
             coefficients=self.point_estimate,
             cluster_ids=cluster_ids,
             vcov_type=se_method,
-            coef_names=getattr(self, 'coef_names_', None)
+            coef_names=getattr(self, 'coef_names_', None),
+            k_fe=k_fe,
+            n_fe=n_fe,
+            k_fe_nested=k_fe_nested,
+            n_fe_fully_nested=n_fe_fully_nested,
+            ssc_dict=self.ssc_dict,
         )
-        
+
         self.vcov = vcov
+        self.vcov_meta = vcov_meta
         self.se = vcov_meta.get('vcov_type_detail', se_method)
         self._results = None
-    
+
     def _fit_vcov_duckdb(self, se_method: str = "HC1"):
         """Compute vcov using DuckDB (out-of-core) backend"""
-        # If duckdb fitter already computed vcov with correct se_type, use it
-        if self._fitter_result is not None and self._fitter_result.vcov is not None:
+        # Option B fix: _get_vcov_fe_params() is called BEFORE the early-return
+        # guard so the cached result is only reused when k_fe == 0 (no FE DOF
+        # correction is needed).  When k_fe > 0 (DuckFE / iterative_demean),
+        # any vcov cached inside DuckDBFitter.fit() was built with k_fe=0 and
+        # would underestimate SEs.  Evaluating k_fe first ensures we always fall
+        # through to the full DuckDBFitter.fit_vcov() path for FE models,
+        # without touching DuckDBFitter or any other module.
+        k_fe, n_fe, k_fe_nested, n_fe_fully_nested = self._get_vcov_fe_params()
+
+        # Only reuse the fitter's cached vcov when there are no absorbed FE
+        # levels (DuckRegression / no-FE case).  For k_fe > 0 (DuckFE),
+        # always recompute via fit_vcov() so the DOF correction is applied.
+        if k_fe == 0 and self._fitter_result is not None and self._fitter_result.vcov is not None:
             if self._fitter_result.se_type == se_method or se_method in self._fitter_result.se_type:
                 self.vcov = self._fitter_result.vcov
                 self.se = self._fitter_result.se_type
@@ -357,6 +423,7 @@ class DuckLinearModel(DuckEstimator):
         y_col = self._get_y_col_for_duckdb()
         cluster_col = self._get_cluster_col_for_vcov()
         view_cols = self._get_view_columns()
+        # k_fe, n_fe, k_fe_nested, n_fe_fully_nested already resolved above
         
         duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type=se_method)
         vcov, vcov_meta, _ = duckdb_fitter.fit_vcov(
@@ -367,10 +434,16 @@ class DuckLinearModel(DuckEstimator):
             add_intercept=self._needs_intercept_for_duckdb(),
             coefficients=self.point_estimate,
             cluster_col=cluster_col if cluster_col in view_cols else None,
-            vcov_type=se_method
+            vcov_type=se_method,
+            k_fe=k_fe,
+            n_fe=n_fe,
+            k_fe_nested=k_fe_nested,
+            n_fe_fully_nested=n_fe_fully_nested,
+            ssc_dict=self.ssc_dict,
         )
-        
+
         self.vcov = vcov
+        self.vcov_meta = vcov_meta
         self.se = vcov_meta.get('vcov_type_detail', se_method)
         self._results = None
 

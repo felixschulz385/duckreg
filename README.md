@@ -1,71 +1,152 @@
-# `duckreg` : very fast out-of-memory regressions with `duckdb`
+# `duckreg` (fork) : very fast out-of-memory regressions with `duckdb`
 
-python package to run stratified/saturated regressions out-of-memory with duckdb. R users, check out [Grant McDermott's port of this package](https://github.com/grantmcdermott/duckreg). 
+> **This is a fork of [py-econometrics/duckreg](https://github.com/py-econometrics/duckreg)** with significant new features:
+> a unified high-level API, true out-of-memory fitting in DuckDB, continuous variable rounding for compression,
+> DuckDB-native iterative demeaning, 2SLS / instrumental-variables support, and full analytical standard error coverage.
 
-The package is a wrapper around the `duckdb` package and provides a simple interface to run regressions on very large datasets that do not fit in memory by reducing the data to a set of summary statistics and runs weighted least squares with frequency weights. Robust standard errors are computed from sufficient statistics, while clustered standard errors are computed using the cluster bootstrap. Methodological details and benchmarks are provided in [this](https://arxiv.org/abs/2410.09952) paper. See examples in `notebooks/introduction.ipynb`.
-
-<p align="center">
-  <img src="https://static.independent.co.uk/s3fs-public/thumbnails/image/2016/02/14/12/duck-rabbit.png" width="350">
-</p>
-
-- install
-
-```
-pip install duckreg
-```
-
-- dev install (preferably in a `venv`) with
-```
-(uv) pip install git+https://github.com/apoorvalal/duckreg.git
-```
-
-or git clone this repository and install in editable mode.
+A Python wrapper around `duckdb` that runs regressions on very large datasets that do not fit in memory.
+Data are reduced to sufficient statistics (compressed strata), and weighted least squares is run on the
+compressed representation. Robust standard errors are computed analytically from sufficient statistics;
+clustered SEs are computed via the cluster bootstrap. Methodological details and benchmarks: [arXiv 2410.09952](https://arxiv.org/abs/2410.09952).
 
 ---
 
-Currently supports the following regression specifications:
-1. `DuckRegression`: general linear regression, which compresses the data to y averages stratified by all unique values of the x variables
-2. `DuckMundlak`: One- or Two-Way Mundlak regression, which compresses the data to the following RHS and avoids the need to incorporate unit (and time FEs)
+## What's new in this fork
 
-$$
-y \sim 1, w, \bar{w}\_{i, .}, \bar{w}\_{., t}
-$$
+| Feature | Upstream | This fork |
+|---|---|---|
+| High-level `duckreg()` API | ❌ | ✅ lfe-style formula interface |
+| OOM fitting | partial (loads to memory after conversion) | ✅ stays in DuckDB throughout |
+| Continuous variable rounding | ❌ | ✅ `round_strata` parameter |
+| Iterative demeaning | ❌ | ✅ MAP algorithm in DuckDB (`DuckIterativeFE`) |
+| 2SLS / IV regression | ❌ | ✅ `Duck2SLS` estimator |
+| Analytical SE | partial (HC1 + bootstrap cluster) | ✅ iid, HC1, CRV1, BS, none |
 
-3. `DuckDoubleDemeaning`: Double demeaning regression, which compresses the data to y averages by all values of $w$ after demeaning. This also eliminates unit and time FEs
+---
 
-$$
-y \sim (W\_{it} - \bar{w}\_{i, .} - \bar{w}\_{., t} + \bar{w}\_{., .})
-$$
+## Install
 
-4. `DuckMundlakEventStudy`: Two-way mundlak with dynamic treatment effects. This incorporates treatment-cohort FEs ($\psi\_i$), time-period FEs ($\gamma\_t$) and dynamic treatment effects $\tau\_k$ given by cohort X time interactions.
+```bash
+pip install duckreg
+```
 
-$$
-y \sim \psi\_i + \gamma\_t + \sum\_{k=1}^{T} \tau\_{k} D\_i 1(t = k)
-$$
+Dev install (preferably in a `venv`):
 
-All the above regressions are run in compressed fashion with `duckdb`.
+```bash
+(uv) pip install git+https://github.com/felixschulz385/duckreg
+```
 
-Please cite the following paper if you use `duckreg` in your research: 
+Or clone and install in editable mode.
+
+---
+
+## Quickstart
+
+All models are accessible through the single `duckreg()` function using an **lfe-style formula**:
 
 ```
+"y ~ x1 + x2 | fe1 + fe2 | endog (inst1 + inst2) | cluster_var"
+  ^outcome  ^covariates  ^fixed effects  ^IV spec   ^cluster
+```
+
+```python
+from duckreg import duckreg
+
+# OLS, no fixed effects
+result = duckreg("y ~ x1 + x2", data="mydata.parquet")
+
+# Two-way FE via iterative demeaning (default for FE models)
+result = duckreg("y ~ x1 + x2 | unit + time", data="mydata.parquet")
+
+# Two-way FE via Mundlak device (not recommended for unbalanced panels)
+result = duckreg("y ~ x1 + x2 | unit + time", data="mydata.parquet", fe_method="mundlak")
+
+# 2SLS with an instrument
+result = duckreg("y ~ x1 | fe1 | endog (instrument)", data="mydata.parquet")
+
+# Cluster-robust SEs
+result = duckreg("y ~ x1 + x2 | unit | | cluster_var", data="mydata.parquet", se_method="CRV1")
+
+print(result.summary())
+```
+
+`data` accepts: `.parquet`, `.csv`, `.tsv`, `.json`, `.feather/.arrow` files, a directory of
+`.parquet` files, or an in-memory pandas / Polars / PyArrow DataFrame or DuckDB relation.
+
+---
+
+## Standard errors
+
+| `se_method` | Description |
+|---|---|
+| `"iid"` | Homoscedastic (classical) |
+| `"HC1"` | Heteroscedasticity-robust (default) |
+| `"CRV1"` | Cluster-robust (analytical) |
+| `"BS"` | Cluster bootstrap |
+| `"none"` | Skip SE computation |
+
+The cluster variable is specified either in the formula's 4th slot (`| cluster`) or passed separately alongside `se_method="CRV1"`.
+
+---
+
+## Key parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `formula` | `str` | required | lfe-style formula (see above) |
+| `data` | various | required | File path, DataFrame, or DuckDB relation |
+| `fe_method` | `str` | `"auto"` | `"mundlak"` (not recommended for unbalanced panels), `"demean"`, or `"auto"` |
+| `se_method` | `str` | `"HC1"` | Standard error method |
+| `round_strata` | `int` | `None` | Round continuous columns to N decimals before stratification (improves compression) |
+| `fitter` | `str` | `"numpy"` | `"numpy"` (in-memory WLS) or `"duckdb"` (fully out-of-core) |
+| `subset` | `str` | `None` | SQL `WHERE` clause to filter rows |
+| `n_bootstraps` | `int` | `100` | Bootstrap iterations (only for `se_method="BS"`) |
+| `remove_singletons` | `bool` | `True` | Drop singleton FE groups before fitting |
+| `seed` | `int` | `42` | Random seed |
+| `n_jobs` | `int` | `1` | Parallel jobs for bootstrap |
+| `cache_dir` | `str` | `None` | Directory for DuckDB cache files |
+| `duckdb_kwargs` | `dict` | `None` | DuckDB configuration overrides |
+
+---
+
+## How it works
+
+The core insight (from [Lal, Fischer & Wardrop 2024](https://arxiv.org/abs/2410.09952)) is that any OLS regression can be
+rewritten as a *small* WLS regression on compressed sufficient statistics. This fork extends that to:
+
+- **True OOM fitting**: compressed sufficient statistics are computed and (optionally) fitted entirely inside DuckDB,
+  so the raw data never has to be loaded into Python memory. Set `fitter="duckdb"` to enable.
+- **`round_strata`**: continuous covariates create an explosion of unique strata. Rounding to `N` decimals before
+  compression dramatically reduces the number of strata and speeds up both aggregation and WLS.
+- **Iterative demeaning in DuckDB**: the MAP demeaning loop runs as a sequence of DuckDB SQL queries, keeping
+  intermediate demean tables out of Python memory even for very large panels.
+- **2SLS**: the first stage is run as a compressed DuckDB aggregation, fitted values are substituted, and
+  the second stage is run as standard compressed WLS with correct analytical SEs propagated.
+
+---
+
+## Citation
+
+```bibtex
 @misc{lal2024largescalelongitudinalexperiments,
-      title={Large Scale Longitudinal Experiments: Estimation and Inference}, 
+      title={Large Scale Longitudinal Experiments: Estimation and Inference},
       author={Apoorva Lal and Alexander Fischer and Matthew Wardrop},
       year={2024},
       eprint={2410.09952},
       archivePrefix={arXiv},
       primaryClass={econ.EM},
-      url={https://arxiv.org/abs/2410.09952}, 
+      url={https://arxiv.org/abs/2410.09952},
 }
 ```
 
 ---
-references:
 
-methods:
-+ [Arkhangelsky and Imbens (2023)](https://arxiv.org/abs/1807.02099)
-+ [Wooldridge 2021](https://www.researchgate.net/publication/353938385_Two-Way_Fixed_Effects_the_Two-Way_Mundlak_Regression_and_Difference-in-Differences_Estimators)
-+ [Wong et al (2021)](https://arxiv.org/abs/2102.11297)
+## References
 
-libraries:
-+ [Grant McDermott's duckdb lecture](https://grantmcdermott.com/duckdb-polars/)
+**Methods:**
+- [Arkhangelsky and Imbens (2023)](https://arxiv.org/abs/1807.02099)
+- [Wooldridge (2021) – Two-Way FE, Mundlak, and DiD](https://doi.org/10.1007/s00181-025-02807-z)
+- [Wong et al. (2021)](https://arxiv.org/abs/2102.11297)
+
+**Libraries / tutorials:**
+- [py-econometrics/duckreg (upstream)](https://github.com/py-econometrics/duckreg)

@@ -102,7 +102,7 @@ def iv_parquet(iv_panel_data):
 @pytest.fixture(scope="module")
 def fitted_numpy(iv_parquet):
     """Duck2SLS, numpy fitter, no FE, fitted."""
-    m = _build(iv_parquet, "y ~ x | | endog (z)", fitter="numpy", remove_singletons=False)
+    m = _build(iv_parquet, "y ~ x | | (endog ~ z)", fitter="numpy", remove_singletons=False)
     m.fit(se_method="HC1")
     return m
 
@@ -110,7 +110,7 @@ def fitted_numpy(iv_parquet):
 @pytest.fixture(scope="module")
 def fitted_numpy_fe(iv_parquet):
     """Duck2SLS, numpy fitter, one FE (firm_id), fitted."""
-    m = _build(iv_parquet, "y ~ x | firm_id | endog (z)", fitter="numpy", remove_singletons=False)
+    m = _build(iv_parquet, "y ~ x | firm_id | (endog ~ z)", fitter="numpy", remove_singletons=False)
     m.fit(se_method="HC1")
     return m
 
@@ -118,7 +118,7 @@ def fitted_numpy_fe(iv_parquet):
 @pytest.fixture(scope="module")
 def fitted_duckdb(iv_parquet):
     """Duck2SLS, duckdb fitter, no FE, fitted."""
-    m = _build(iv_parquet, "y ~ x | | endog (z)", fitter="duckdb", remove_singletons=False)
+    m = _build(iv_parquet, "y ~ x | | (endog ~ z)", fitter="duckdb", remove_singletons=False)
     m.fit(se_method="HC1")
     return m
 

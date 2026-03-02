@@ -602,10 +602,15 @@ def build_meat_query(
     add_intercept: bool = False
 ) -> str:
     """
-    Build SQL query for meat matrix: sum_i (X_i * resid_i * weight_i)^2.
+    Build SQL query for meat matrix: sum_i weight_i * (X_i * resid_i)^2.
     
-    Computes the "meat" part of the sandwich estimator (X'ΩX where Ω = diag(e²w²)).
+    Computes the "meat" part of the sandwich estimator (X'ΩX where Ω = diag(e²w)).
     Only upper triangle is returned (matrix is symmetric).
+    
+    The weight appears once (not squared): this correctly replicates the
+    per-observation sum sum_j x_j^2 u_j^2 = sum_i n_i x_i^2 u_i^2
+    for compressed data where every observation within stratum i shares the
+    same (x_i, u_i).
     
     Parameters
     ----------
@@ -651,9 +656,105 @@ def build_meat_query(
         for j in range(i, k):
             meat_parts.append(
                 f"SUM(({all_x_cols[i]}) * ({all_x_cols[j]}) * "
-                f"POW({residual_expr}, 2) * POW({weight_col}, 2)) AS meat_{i}_{j}"
+                f"POW({residual_expr}, 2) * {weight_col}) AS meat_{i}_{j}"
             )
     
+    return f"""
+    SELECT {', '.join(meat_parts)}
+    FROM {table_name}
+    {where_clause}
+    """
+
+
+def build_exact_meat_query(
+    table_name: str,
+    x_cols: List[str],
+    theta: np.ndarray,
+    sum_y_col: str,
+    sum_y_sq_col: str,
+    weight_col: str = "count",
+    where_clause: str = "",
+    add_intercept: bool = False
+) -> str:
+    """
+    Build SQL query for exact meat matrix using stored per-stratum sum-of-squares.
+
+    When data are compressed into strata (e.g. via ``round_strata``), each stratum
+    may contain observations with different y values.  The standard approach of
+    using the mean residual ``(mean_y - x@theta)`` underestimates the true meat
+    because it ignores within-stratum y variation.
+
+    This function uses the pre-aggregated ``sum_y_sq`` column (sum of individual
+    y² within each stratum) to recover the exact per-stratum residual sum-of-squares::
+
+        ss_i = sum_y_sq_i - 2 * fitted_i * sum_y_i + count_i * fitted_i^2
+
+    and computes the exact meat::
+
+        meat_{pq} = SUM_strata( x_p * x_q * ss_i )
+
+    Parameters
+    ----------
+    table_name : str
+        Source table / view name.
+    x_cols : List[str]
+        X column names (without intercept). Intercept prepended if ``add_intercept``.
+    theta : np.ndarray
+        Coefficient vector (k,).
+    sum_y_col : str
+        Column containing SUM(y) within each stratum (e.g. ``"sum_avhrr_median"``).
+    sum_y_sq_col : str
+        Column containing SUM(y²) within each stratum (e.g. ``"sum_avhrr_median_sq"``).
+    weight_col : str, default "count"
+        Column containing observation counts per stratum.
+    where_clause : str, optional
+        WHERE clause including the ``WHERE`` keyword.
+    add_intercept : bool, default False
+        If True, prepend ``"1"`` to x_cols and the first element of theta is
+        the intercept coefficient.
+
+    Returns
+    -------
+    str
+        SQL query returning ``meat_{i}_{j}`` columns for the upper triangle.
+    """
+    if not table_name or not table_name.strip():
+        raise ValueError("table_name cannot be empty")
+    if not x_cols and not add_intercept:
+        raise ValueError("x_cols cannot be empty if add_intercept is False")
+    if theta is None or len(theta) == 0:
+        raise ValueError("theta cannot be empty")
+    if not sum_y_col or not sum_y_sq_col:
+        raise ValueError("sum_y_col and sum_y_sq_col cannot be empty")
+
+    all_x_cols = ["1"] + x_cols if add_intercept else x_cols
+    k = len(all_x_cols)
+
+    if len(theta) != k:
+        raise ValueError(
+            f"theta length ({len(theta)}) must match number of columns ({k})"
+        )
+
+    # Fitted value: x @ theta  (stratum-level prediction)
+    fitted_terms = " + ".join(
+        [f"({theta[i]:.17e}) * ({col})" for i, col in enumerate(all_x_cols)]
+    )
+    fitted_expr = f"({fitted_terms})"
+
+    # Exact per-stratum residual SS:
+    #   ss = sum_y_sq - 2 * fitted * sum_y + count * fitted^2
+    exact_ss = (
+        f"({sum_y_sq_col} - 2.0 * {fitted_expr} * {sum_y_col} "
+        f"+ {weight_col} * POW({fitted_expr}, 2))"
+    )
+
+    meat_parts = []
+    for i in range(k):
+        for j in range(i, k):
+            meat_parts.append(
+                f"SUM(({all_x_cols[i]}) * ({all_x_cols[j]}) * {exact_ss}) AS meat_{i}_{j}"
+            )
+
     return f"""
     SELECT {', '.join(meat_parts)}
     FROM {table_name}
@@ -1775,6 +1876,7 @@ __all__ = [
     'build_xty_query',
     'build_cross_xtz_query',
     'build_meat_query',
+    'build_exact_meat_query',
     'build_cluster_scores_query',
     'build_leverage_query',
     

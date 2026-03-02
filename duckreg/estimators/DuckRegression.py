@@ -73,7 +73,7 @@ class DuckRegression(DuckLinearModel):
 
     def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, Optional[str]]:
         self._ensure_data_fetched()
-        return self.df_compressed, self.cluster_col
+        return self.df_compressed, self._effective_cluster_col
 
     def _build_agg_columns(self, outcome_vars, boolean_cols, unit_col):
         """Build aggregation column expressions."""
@@ -90,9 +90,10 @@ class DuckRegression(DuckLinearModel):
         
         select_parts, group_by_parts = self._build_strata_select_sql(boolean_cols, unit_col)
         
-        if self.cluster_col:
-            cluster_expr = f"CAST({self.cluster_col} AS SMALLINT)" if self.cluster_col in boolean_cols else self.cluster_col
-            select_parts.append(f"{cluster_expr} AS {self.cluster_col}")
+        eff_cluster = self._effective_cluster_col
+        if eff_cluster:
+            cluster_expr = f"CAST({eff_cluster} AS SMALLINT)" if eff_cluster in boolean_cols else eff_cluster
+            select_parts.append(f"{cluster_expr} AS {eff_cluster}")
             group_by_parts.append(cluster_expr)
         
         agg_parts = self._build_agg_columns(self.formula.outcomes, boolean_cols, unit_col)

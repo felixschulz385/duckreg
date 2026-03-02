@@ -174,10 +174,10 @@ class TestDuckRegressionCompression:
         
         try:
             model = compressed_ols(
-                formula="y ~ x1 + x2 | 0 | 0 | cluster",
+                formula="y ~ x1 + x2",
                 data=temp_path,
                 round_strata=3,
-                se_method="none"
+                se_method={"CRV1": "cluster"},
             )
             
             # Cluster variable should be in compressed data

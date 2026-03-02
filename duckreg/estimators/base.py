@@ -100,18 +100,23 @@ class DuckEstimator(ABC):
 
     def _compute_standard_errors(self, se_method: str):
         """Dispatch standard error computation based on method"""
-        if se_method == SEMethod.BS:
-            if self.n_bootstraps > 0:
-                logger.debug("Computing bootstrap standard errors")
-                self.vcov = self.bootstrap()
-                self.se = "bootstrap"
-        elif se_method in (SEMethod.IID, SEMethod.HC1, SEMethod.CRV1):
-            logger.debug(f"Computing {se_method} standard errors")
-            self.fit_vcov(se_method=se_method)
-        elif se_method == SEMethod.NONE:
+        # When vcov_spec is set (via duckreg API), derive the effective method from it.
+        # This ensures the parsed VcovSpec is used rather than the string fallback.
+        vcov_spec = getattr(self, 'vcov_spec', None)
+        effective = vcov_spec.vcov_detail if vcov_spec is not None else se_method
+
+        if self.n_bootstraps > 0 and (effective == SEMethod.BS or se_method == SEMethod.BS):
+            logger.debug("Computing bootstrap standard errors")
+            self.vcov = self.bootstrap()
+            self.se = "bootstrap"
+        elif effective == SEMethod.NONE:
             logger.debug("Skipping standard error computation")
+        elif effective in (SEMethod.IID, SEMethod.HC1, SEMethod.CRV1,
+                           'HC2', 'HC3', 'CRV3', 'hetero', 'iid'):
+            logger.debug(f"Computing {effective} standard errors")
+            self.fit_vcov()
         else:
-            logger.warning(f"Unknown se_method '{se_method}'")
+            logger.warning(f"Unknown se_method '{effective}'")
 
     # -------------------------------------------------------------------------
     # Abstract methods - must be implemented by subclasses

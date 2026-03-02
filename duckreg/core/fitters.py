@@ -51,6 +51,7 @@ from .linalg import safe_solve, safe_inv
 from .vcov import (
     SSCConfig,
     VcovContext,
+    VcovSpec,
     compute_iid_vcov,
     compute_hetero_vcov,
     compute_cluster_vcov,
@@ -189,45 +190,28 @@ def _compute_weighted_matrices(
     return XtX, Xty
 
 
-def _compute_r_squared(
-    theta: np.ndarray,
-    Xty: np.ndarray,
-    y: np.ndarray,
-    weights: np.ndarray,
-    n_obs: int
-) -> Tuple[float, float]:
-    """Compute R-squared and RSS.
-    
-    Returns:
-        Tuple of (r_squared, rss)
-    """
-    sum_y = (y.flatten() * weights).sum()
-    sum_y_squared = ((y.flatten() ** 2) * weights).sum()
-    rss = sum_y_squared - theta @ Xty.flatten()
-    mean_y = sum_y / n_obs
-    tss = sum_y_squared - n_obs * (mean_y ** 2)
-    r_squared = max(0.0, 1.0 - rss / tss) if tss > 0 else 0.0
-    
-    return r_squared, rss
-
-
 def compute_vcov_dispatch(
     X: np.ndarray,
     y: np.ndarray,
     weights: np.ndarray,
     coefficients: np.ndarray,
     residuals: Optional[np.ndarray],
-    XtX_inv: np.ndarray,
-    vcov_type: str,
+    XtX_inv: np.ndarray = None,
+    vcov_spec: VcovSpec = None,
     cluster_ids: Optional[np.ndarray] = None,
-    ssc_dict: Optional[Dict[str, Any]] = None,
     k_fe: int = 0,
     n_fe: int = 0,
     k_fe_nested: int = 0,
     n_fe_fully_nested: int = 0,
     Z: Optional[np.ndarray] = None,
     is_iv: bool = False,
-    alpha: float = DEFAULT_ALPHA
+    alpha: float = DEFAULT_ALPHA,
+    # Convenience aliases
+    XtXinv: np.ndarray = None,
+    vcov_type: Optional[str] = None,
+    ssc_dict: Optional[Dict[str, Any]] = None,
+    kfe: Optional[int] = None,
+    nfe: Optional[int] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
     """Unified variance-covariance computation dispatcher.
     
@@ -245,12 +229,10 @@ def compute_vcov_dispatch(
         Pre-computed residuals. If None, computed as y - X @ coefficients
     XtX_inv : np.ndarray
         (X'X)^{-1} matrix (k, k)
-    vcov_type : str
-        Standard error type: "iid", "HC1", "HC2", "HC3"
+    vcov_spec : VcovSpec
+        Fully-parsed vcov specification (type, SSC config, cluster info)
     cluster_ids : np.ndarray, optional
         Cluster identifiers (n,)
-    ssc_dict : Dict[str, Any], optional
-        SSC configuration
     k_fe : int
         Number of fixed effect levels
     n_fe : int
@@ -266,6 +248,29 @@ def compute_vcov_dispatch(
     -------
     Tuple of (vcov, vcov_meta, aggregates)
     """
+    # Handle aliases
+    if XtXinv is not None and XtX_inv is None:
+        XtX_inv = XtXinv
+    if kfe is not None:
+        k_fe = kfe
+    if nfe is not None:
+        n_fe = nfe
+    # Build vcov_spec from vcov_type/ssc_dict if not provided directly
+    if vcov_spec is None:
+        _vtype = vcov_type or 'HC1'
+        # If cluster_ids provided and vcov_type is not explicitly CRV, use CRV1
+        if cluster_ids is not None and _vtype not in ('CRV1', 'CRV3'):
+            vcov_spec = VcovSpec.build('CRV1', ssc_dict)
+            vcov_spec = VcovSpec(
+                vcov_type='CRV',
+                vcov_detail='CRV1',
+                is_clustered=True,
+                cluster_vars=None,
+                ssc=vcov_spec.ssc,
+            )
+        else:
+            vcov_spec = VcovSpec.build(_vtype, ssc_dict)
+
     n_rows, n_features = X.shape
     n_obs = int(weights.sum())
     theta = coefficients.flatten()
@@ -299,7 +304,7 @@ def compute_vcov_dispatch(
         aggregates.update({'tXZ': tXZ, 'tZZinv': tZZinv, 'tZX': tZX})
     
     # Dispatch based on vcov type
-    if cluster_ids is not None:
+    if vcov_spec.vcov_type == 'CRV':
         # Cluster-robust
         agg = compute_residual_aggregates_numpy(
             theta=theta,
@@ -314,16 +319,15 @@ def compute_vcov_dispatch(
         )
         
         context = VcovContext(
-            N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
-            k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested
+            N=n_obs, k=n_features, kfe=k_fe, nfe=n_fe,
+            kfenested=k_fe_nested, nfefullynested=n_fe_fully_nested
         )
-        ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict else None
         vcov, vcov_meta = compute_cluster_vcov(
             bread=XtX_inv,
             cluster_scores=agg['cluster_scores'],
             context=context,
             G=agg['n_clusters'],
-            ssc_config=ssc_config,
+            ssc_config=vcov_spec.ssc,
             is_iv=is_iv,
             tXZ=tXZ,
             tZZinv=tZZinv,
@@ -332,7 +336,7 @@ def compute_vcov_dispatch(
         aggregates['cluster_scores'] = agg['cluster_scores']
         aggregates['n_clusters'] = agg['n_clusters']
     
-    elif vcov_type == "iid":
+    elif vcov_spec.vcov_type == 'iid':
         # Classical IID
         agg = compute_residual_aggregates_numpy(
             theta=theta,
@@ -346,15 +350,14 @@ def compute_vcov_dispatch(
         )
         
         context = VcovContext(
-            N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
-            k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested
+            N=n_obs, k=n_features, kfe=k_fe, nfe=n_fe,
+            kfenested=k_fe_nested, nfefullynested=n_fe_fully_nested
         )
-        ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict else None
         vcov, vcov_meta = compute_iid_vcov(
             bread=XtX_inv,
             rss=agg['rss'],
             context=context,
-            ssc_config=ssc_config,
+            ssc_config=vcov_spec.ssc,
             is_iv=is_iv,
             tXZ=tXZ,
             tZZinv=tZZinv,
@@ -364,10 +367,10 @@ def compute_vcov_dispatch(
     
     else:
         # Heteroskedastic (HC1, HC2, HC3)
-        compute_lev = vcov_type in ["HC2", "HC3"]
+        compute_lev = vcov_spec.vcov_detail in ["HC2", "HC3"]
         if compute_lev:
             logger.warning(
-                f"{vcov_type} with compressed data: leverages at stratum level. "
+                f"{vcov_spec.vcov_detail} with compressed data: leverages at stratum level. "
                 f"Approximation when strata have multiple observations."
             )
         
@@ -388,12 +391,14 @@ def compute_vcov_dispatch(
             bread=XtX_inv,
             meat=agg['meat'],
             leverages=agg.get('leverages'),
-            vcov_type_detail=vcov_type,  # Pass to vcov module
-            ssc_dict=ssc_dict,
+            vcov_type_detail=vcov_spec.vcov_detail,
+            ssc_config=vcov_spec.ssc,
             N=n_obs,
             k=n_features,
-            k_fe=k_fe,
-            n_fe=n_fe,
+            kfe=k_fe,
+            nfe=n_fe,
+            k_fe_nested=k_fe_nested,
+            n_fe_fully_nested=n_fe_fully_nested,
             is_iv=is_iv,
             tXZ=tXZ,
             tZZinv=tZZinv,
@@ -457,10 +462,8 @@ class NumpyFitter(BaseFitter):
         cluster_ids: Optional[np.ndarray] = None,
         residuals: Optional[np.ndarray] = None,
         coefficients: Optional[np.ndarray] = None,
-        ssc_dict: Optional[Dict[str, Any]] = None,
         k_fe: int = 0,
         n_fe: int = 0,
-        vcov_type: str = "HC1"
     ) -> FitterResult:
         """Fit WLS model using numpy."""
         # Validate and prepare
@@ -517,8 +520,7 @@ class NumpyFitter(BaseFitter):
         coefficients: Optional[np.ndarray] = None,
         coef_names: Optional[List[str]] = None,
         cluster_ids: Optional[np.ndarray] = None,
-        vcov_type: str = "HC1",
-        ssc_dict: Optional[Dict[str, Any]] = None,
+        vcov_spec: VcovSpec = None,
         k_fe: int = 0,
         n_fe: int = 0,
         k_fe_nested: int = 0,
@@ -526,19 +528,49 @@ class NumpyFitter(BaseFitter):
         existing_result: Optional[FitterResult] = None,
         Z: Optional[np.ndarray] = None,
         is_iv: bool = False,
-        residual_X: Optional[np.ndarray] = None
+        residual_X: Optional[np.ndarray] = None,
+        # Convenience aliases
+        vcov_type: Optional[str] = None,
+        ssc_dict: Optional[Dict[str, Any]] = None,
+        kfe: Optional[int] = None,
+        nfe: Optional[int] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
         """Compute variance-covariance matrix.
         
         Parameters
         ----------
+        vcov_spec : VcovSpec
+            Fully-parsed vcov specification. If None, built from vcov_type/ssc_dict or defaults to HC1.
+        vcov_type : str, optional
+            SE type string (e.g. 'iid', 'HC1', 'CRV1'). Used to build vcov_spec if not provided.
+        ssc_dict : dict, optional
+            SSC configuration dict. Used with vcov_type to build vcov_spec.
+        kfe : int, optional
+            Alias for k_fe (number of FE levels).
+        nfe : int, optional
+            Alias for n_fe (number of FE variables).
         residual_X : np.ndarray, optional
             Alternative X matrix for residual computation (for 2SLS).
-            If provided, residuals are computed as y - residual_X @ coefficients,
-            but bread/IV matrices use the main X parameter.
-            This is needed for 2SLS where residuals use actual endogenous
-            but bread uses fitted endogenous.
         """
+        # Handle aliases
+        if kfe is not None:
+            k_fe = kfe
+        if nfe is not None:
+            n_fe = nfe
+        if vcov_spec is None:
+            _vtype = vcov_type or 'HC1'
+            if cluster_ids is not None and _vtype not in ('CRV1', 'CRV3'):
+                _base = VcovSpec.build('CRV1', ssc_dict)
+                vcov_spec = VcovSpec(
+                    vcov_type='CRV',
+                    vcov_detail='CRV1',
+                    is_clustered=True,
+                    cluster_vars=None,
+                    ssc=_base.ssc,
+                )
+            else:
+                vcov_spec = VcovSpec.build(_vtype, ssc_dict)
+
         result = existing_result or self._last_result
         
         # Validate and prepare
@@ -581,9 +613,8 @@ class NumpyFitter(BaseFitter):
             coefficients=theta,
             residuals=residuals,
             XtX_inv=XtX_inv,
-            vcov_type=vcov_type,
+            vcov_spec=vcov_spec,
             cluster_ids=cluster_ids,
-            ssc_dict=ssc_dict,
             k_fe=k_fe,
             n_fe=n_fe,
             k_fe_nested=k_fe_nested,
@@ -610,19 +641,26 @@ class DuckDBFitter(BaseFitter):
     def fit(
         self,
         table_name: str,
-        x_cols: List[str],
-        y_col: str,
+        x_cols: List[str] = None,
+        y_col: str = None,
         weight_col: str = "count",
         add_intercept: bool = True,
         cluster_col: Optional[str] = None,
         coefficients: Optional[np.ndarray] = None,
         residual_x_cols: Optional[List[str]] = None,
-        ssc_dict: Optional[Dict[str, Any]] = None,
-        k_fe: int = 0,
-        n_fe: int = 0,
-        vcov_type: str = "HC1"
+        # Aliases
+        xcols: List[str] = None,
+        ycol: str = None,
+        weightcol: str = None,
     ) -> FitterResult:
         """Fit WLS model using DuckDB sufficient statistics."""
+        # Handle aliases
+        if xcols is not None and x_cols is None:
+            x_cols = xcols
+        if ycol is not None and y_col is None:
+            y_col = ycol
+        if weightcol is not None:
+            weight_col = weightcol
         # Compute sufficient statistics
         # Try to use exact sum_y_sq if available:
         # - For compressed data: sum_{outcome}_sq (created during compression)
@@ -671,24 +709,50 @@ class DuckDBFitter(BaseFitter):
     def fit_vcov(
         self,
         table_name: str,
-        x_cols: List[str],
-        y_col: str,
+        x_cols: List[str] = None,
+        y_col: str = None,
         weight_col: str = "count",
         add_intercept: bool = True,
         coefficients: Optional[np.ndarray] = None,
         cluster_col: Optional[str] = None,
-        vcov_type: str = "HC1",
+        vcov_spec: VcovSpec = None,
         residual_x_cols: Optional[List[str]] = None,
-        ssc_dict: Optional[Dict[str, Any]] = None,
         k_fe: int = 0,
         n_fe: int = 0,
         k_fe_nested: int = 0,
         n_fe_fully_nested: int = 0,
         existing_result: Optional[FitterResult] = None,
         z_cols: Optional[List[str]] = None,
-        is_iv: bool = False
+        is_iv: bool = False,
+        # Aliases
+        xcols: List[str] = None,
+        ycol: str = None,
+        weightcol: str = None,
+        vcov_type: Optional[str] = None,
+        ssc_dict: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
         """Compute variance-covariance matrix using DuckDB SQL."""
+        # Handle aliases
+        if xcols is not None and x_cols is None:
+            x_cols = xcols
+        if ycol is not None and y_col is None:
+            y_col = ycol
+        if weightcol is not None:
+            weight_col = weightcol
+        if vcov_spec is None:
+            _vtype = vcov_type or 'HC1'
+            if cluster_col and _vtype not in ('CRV1', 'CRV3'):
+                _base = VcovSpec.build('CRV1', ssc_dict)
+                vcov_spec = VcovSpec(
+                    vcov_type='CRV',
+                    vcov_detail='CRV1',
+                    is_clustered=True,
+                    cluster_vars=None,
+                    ssc=_base.ssc,
+                )
+            else:
+                vcov_spec = VcovSpec.build(_vtype, ssc_dict)
+
         result = existing_result or self._last_result
         
         # Get or compute sufficient statistics
@@ -730,8 +794,8 @@ class DuckDBFitter(BaseFitter):
         tZZinv = None
         tZX = None
         if is_iv and z_cols is not None:
-            from .residual_aggregates import compute_cross_sufficient_stats_sql
-            
+            from .sql_builders import compute_cross_sufficient_stats_sql
+
             iv_stats = compute_cross_sufficient_stats_sql(
                 conn=self.conn,
                 table_name=table_name,
@@ -766,16 +830,15 @@ class DuckDBFitter(BaseFitter):
             )
             
             context = VcovContext(
-                N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
-                k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested
+                N=n_obs, k=n_features, kfe=k_fe, nfe=n_fe,
+                kfenested=k_fe_nested, nfefullynested=n_fe_fully_nested
             )
-            ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict else None
             vcov, vcov_meta = compute_cluster_vcov(
                 bread=XtX_inv,
                 cluster_scores=agg['cluster_scores'],
                 context=context,
                 G=agg['n_clusters'],
-                ssc_config=ssc_config,
+                ssc_config=vcov_spec.ssc,
                 is_iv=is_iv,
                 tXZ=tXZ,
                 tZZinv=tZZinv,
@@ -783,7 +846,7 @@ class DuckDBFitter(BaseFitter):
             )
             aggregates.update({'cluster_scores': agg['cluster_scores'], 'n_clusters': agg['n_clusters']})
         
-        elif vcov_type == "iid":
+        elif vcov_spec.vcov_type == 'iid':
             rss = (result.rss if result and result.rss is not None
                   else compute_residual_aggregates_sql(
                       theta=theta, conn=self.conn, table_name=table_name,
@@ -793,39 +856,55 @@ class DuckDBFitter(BaseFitter):
                   )['rss'])
             
             context = VcovContext(
-                N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
-                k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested
+                N=n_obs, k=n_features, kfe=k_fe, nfe=n_fe,
+                kfenested=k_fe_nested, nfefullynested=n_fe_fully_nested
             )
-            ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict else None
             vcov, vcov_meta = compute_iid_vcov(
-                bread=XtX_inv, rss=rss, context=context, ssc_config=ssc_config,
+                bread=XtX_inv, rss=rss, context=context, ssc_config=vcov_spec.ssc,
                 is_iv=is_iv, tXZ=tXZ, tZZinv=tZZinv, tZX=tZX
             )
             aggregates['rss'] = rss
         
         else:
-            compute_lev = vcov_type in ["HC2", "HC3"]
+            compute_lev = vcov_spec.vcov_detail in ["HC2", "HC3"]
             if compute_lev:
                 logger.warning(
-                    f"{vcov_type} with compressed data: leverages at stratum level. "
+                    f"{vcov_spec.vcov_detail} with compressed data: leverages at stratum level. "
                     f"Approximation when strata have multiple observations."
                 )
-            
+
+            # For compressed DuckFE data, y_col is in sum_{outcome} format.
+            # The compressed view also stores sum_{outcome}_sq (sum of individual y²
+            # per stratum), which lets us compute the exact meat that accounts for
+            # within-stratum y variation caused by round_strata compression.
+            _y_bare = y_col.strip('"').strip("'")
+            _exact_meat_col = f"{_y_bare}_sq"
+            try:
+                _col_exists = self.conn.execute(
+                    f"SELECT column_name FROM (DESCRIBE SELECT * FROM {table_name}) "
+                    f"WHERE column_name = '{_exact_meat_col}'"
+                ).fetchone()
+                sum_y_sq_col_for_meat = _exact_meat_col if _col_exists else None
+            except Exception:
+                sum_y_sq_col_for_meat = None
+
             agg = compute_residual_aggregates_sql(
                 theta=theta, conn=self.conn, table_name=table_name,
                 x_cols=x_cols, y_col=y_col, weight_col=weight_col,
                 add_intercept=add_intercept, residual_x_cols=residual_x_cols,
                 XtX_inv=XtX_inv if compute_lev else None,
                 compute_meat=True, compute_leverages=compute_lev,
-                z_cols=z_cols, is_iv=is_iv
+                z_cols=z_cols, is_iv=is_iv,
+                sum_y_sq_col=sum_y_sq_col_for_meat,
             )
             
             vcov, vcov_meta = compute_hetero_vcov(
                 bread=XtX_inv, meat=agg['meat'],
                 leverages=agg.get('leverages'),
-                vcov_type_detail=vcov_type,  # Pass to vcov module
-                ssc_dict=ssc_dict,
+                vcov_type_detail=vcov_spec.vcov_detail,
+                ssc_config=vcov_spec.ssc,
                 N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
+                k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested,
                 is_iv=is_iv, tXZ=tXZ, tZZinv=tZZinv, tZX=tZX
             )
             aggregates['meat'] = agg['meat']

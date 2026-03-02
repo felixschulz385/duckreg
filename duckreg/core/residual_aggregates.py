@@ -9,9 +9,11 @@ Weight Convention (Frequency Weights):
 - weights[i] = count of observations represented by row i
 - For compressed/aggregated data, weights are strata counts
 - Residuals: residual_i = (y_i / weight_i) - X_i @ theta
-  (i.e., per-observation residual for stratum i)
-- Scores: score_i = X_i * (residual_i * weight_i)
-  (stratum-level score, sum of original observation scores)
+  (per-observation residual for stratum i; identical for all obs in the stratum)
+- Cluster scores: score_i = X_i * (residual_i * weight_i)
+  (sum of per-observation scores within the stratum; correct for CRV aggregation)
+- Meat (HC-type): meat = sum_i weight_i * (X_i * residual_i)(X_i * residual_i)^T
+  computed as (X * u * sqrt(n))^T @ (X * u * sqrt(n)), giving the n_i factor.
 - RSS: sum((residual_i * sqrt(weight_i))^2)
   (weighted sum of squared residuals)
 
@@ -27,6 +29,7 @@ import duckdb
 from .sql_builders import (
     build_residual_expr,
     build_meat_query,
+    build_exact_meat_query,
     build_cluster_scores_query,
     build_leverage_query
 )
@@ -99,23 +102,23 @@ def compute_residual_aggregates_numpy(
     if compute_rss:
         result['rss'] = np.sum((residuals * np.sqrt(weights)) ** 2)
     
-    # Scores: Use Z (instruments) for IV, X (regressors) for OLS
-    # For IV: scores = Z * residuals to compute Ω = Z' diag(e²) Z correctly
-    # For OLS: scores = X * residuals as usual
-    scores = None
+    # Scores / meat / cluster-scores all use the same score_matrix (Z for IV, X for OLS).
+    score_matrix = None
     if compute_scores or compute_meat or compute_cluster_scores:
-        # Use instruments Z for IV, regressors X for OLS
         score_matrix = Z if (is_iv and Z is not None) else X
-        # For duckreg with compressed data, we use:
-        # scores = matrix * (residuals * weights) to properly weight the stratum contributions
+
+    # Individual scores: x_i * u_i * n_i  (sum within a cluster = cluster score)
+    if compute_scores or compute_cluster_scores:
         scores = score_matrix * (residuals * weights).reshape(-1, 1)
         if compute_scores:
             result['scores'] = scores
-    
-    # Meat
+
+    # Meat: sum_i n_i * (x_i u_i)(x_i u_i)^T — scale by sqrt(n_i) so the outer
+    # product gives the n_i factor without squaring it.
     if compute_meat:
-        result['meat'] = scores.T @ scores
-    
+        meat_scores = score_matrix * (residuals * np.sqrt(weights)).reshape(-1, 1)
+        result['meat'] = meat_scores.T @ meat_scores
+
     # Cluster scores
     if compute_cluster_scores:
         if cluster_ids is None:
@@ -154,7 +157,8 @@ def compute_residual_aggregates_sql(
     compute_leverages: bool = False,
     where_clause: str = "",
     z_cols: Optional[List[str]] = None,
-    is_iv: bool = False
+    is_iv: bool = False,
+    sum_y_sq_col: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     SQL backend for residual aggregates computation.
@@ -275,11 +279,25 @@ def compute_residual_aggregates_sql(
     elif compute_meat:
         # Use z_cols for IV, x_cols for OLS
         cols_for_scores = z_cols if (is_iv and z_cols is not None) else x_cols
-        
-        # Note: build_meat_query expects cols without intercept and add_intercept parameter
-        query = build_meat_query(
-            table_name, cols_for_scores, residual_expr, weight_col, where_clause, add_intercept
-        )
+
+        # When sum_y_sq_col is available and not IV, use exact meat formula that
+        # accounts for within-stratum y variation (round_strata compression).
+        if sum_y_sq_col is not None and not is_iv:
+            query = build_exact_meat_query(
+                table_name=table_name,
+                x_cols=cols_for_scores,
+                theta=theta,
+                sum_y_col=y_col,
+                sum_y_sq_col=sum_y_sq_col,
+                weight_col=weight_col,
+                where_clause=where_clause,
+                add_intercept=add_intercept,
+            )
+        else:
+            # Note: build_meat_query expects cols without intercept and add_intercept parameter
+            query = build_meat_query(
+                table_name, cols_for_scores, residual_expr, weight_col, where_clause, add_intercept
+            )
         
         meat_result = conn.execute(query).fetchone()
         meat = np.zeros((k_scores, k_scores))
@@ -319,42 +337,3 @@ def compute_residual_aggregates_sql(
     return result
 
 
-def compute_cross_sufficient_stats_sql(
-    conn: duckdb.DuckDBPyConnection,
-    table_name: str,
-    x_cols: List[str],
-    z_cols: List[str],
-    weight_col: str = 'count',
-    add_intercept: bool = True,
-    where_clause: str = ""
-) -> Dict[str, Any]:
-    """
-    Compute cross-product sufficient statistics for IV estimation via SQL.
-    
-    Delegates to sql_builders.compute_cross_sufficient_stats_sql.
-    
-    Parameters
-    ----------
-    conn : duckdb.DuckDBPyConnection
-        Active DuckDB connection
-    table_name : str
-        Source table name
-    x_cols : List[str]
-        X column names (excludes intercept)
-    z_cols : List[str]
-        Z column names (excludes intercept)
-    weight_col : str
-        Weight column name
-    add_intercept : bool
-        Whether to include intercept in both X and Z
-    where_clause : str, optional
-        WHERE clause (including 'WHERE')
-        
-    Returns
-    -------
-    Dict[str, Any]
-        Dictionary with 'tXZ' (np.ndarray k_x x k_z), 
-        'tZZ' (np.ndarray k_z x k_z), 'n_obs' (int)
-    """
-    from .sql_builders import compute_cross_sufficient_stats_sql as _compute
-    return _compute(conn, table_name, x_cols, z_cols, weight_col, add_intercept, where_clause)

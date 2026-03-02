@@ -48,6 +48,7 @@ import pandas as pd
 from .base import DuckEstimator
 from ..core.transformers import MundlakTransformer, IterativeDemeanTransformer, AutoFETransformer
 from ..core.fitters import NumpyFitter, DuckDBFitter
+from ..core.vcov import VcovSpec
 from ..core.results import RegressionResults, FirstStageResults
 from ..utils.formula_parser import cast_if_boolean, quote_identifier
 from ..utils.name_utils import build_coef_name_lists, build_first_stage_coef_names
@@ -102,6 +103,7 @@ class Duck2SLS(DuckEstimator):
         method: str = "mundlak",
         # backward-compat alias
         fe_method: str = None,
+        vcov_spec: Optional[VcovSpec] = None,
         # Transformer tuning (forwarded to MundlakTransformer)
         fe_types: Optional[Dict[str, str]] = None,
         cardinality_threshold: int = 50,
@@ -127,10 +129,12 @@ class Duck2SLS(DuckEstimator):
             **kwargs,
         )
 
-        self.formula = formula
-        self.n_jobs  = n_jobs
-        self.subset  = subset
-        self.method  = fe_method or method   # fe_method kept for compat
+        self.formula    = formula
+        self.n_jobs     = n_jobs
+        self.subset     = subset
+        self.method     = fe_method or method   # fe_method kept for compat
+        self.vcov_spec  = vcov_spec
+        self.ssc_dict   = vcov_spec.ssc.to_dict() if vcov_spec is not None else None
 
         if self.method not in ("mundlak", "demean", "auto_fe"):
             raise ValueError(
@@ -197,6 +201,19 @@ class Duck2SLS(DuckEstimator):
     # =========================================================================
     # Properties
     # =========================================================================
+
+    @property
+    def _effective_cluster_col(self) -> Optional[str]:
+        """Cluster column resolved from formula or ``vcov_spec.cluster_vars``."""
+        if self.cluster_col:
+            return self.cluster_col
+        if (
+            self.vcov_spec is not None
+            and self.vcov_spec.is_clustered
+            and self.vcov_spec.cluster_vars
+        ):
+            return self.vcov_spec.cluster_vars[0]
+        return None
 
     @property
     def first_stage(self) -> Dict[str, FirstStageResults]:
@@ -310,9 +327,10 @@ class Duck2SLS(DuckEstimator):
         ``design_matrix`` can be joined back to the staging table after first-stage
         fitted values have been computed.
         """
-        boolean_cols  = self._get_boolean_columns()
-        unit_col      = self.fe_cols[0] if self.fe_cols else None
-        cluster_alias = self._CLUSTER_ALIAS if self.cluster_col else None
+        boolean_cols = self._get_boolean_columns()
+        unit_col     = self.fe_cols[0] if self.fe_cols else None
+        eff_cluster  = self._effective_cluster_col
+        cluster_alias = self._CLUSTER_ALIAS if eff_cluster else None
 
         select_parts = []
 
@@ -340,8 +358,9 @@ class Duck2SLS(DuckEstimator):
         if inst_sql:
             select_parts.append(inst_sql)
 
+        # Pass eff_cluster as fallback so clusters via se_method dict are included.
         cluster_sql = self.formula.get_cluster_select_sql(
-            boolean_cols, cluster_alias, unit_col
+            boolean_cols, cluster_alias, eff_cluster
         )
         if cluster_sql:
             select_parts.append(cluster_sql)
@@ -489,7 +508,7 @@ class Duck2SLS(DuckEstimator):
         actual_endog_sql = [v.sql_name for v in self.formula.endogenous]
         outcome_sql      = [v.sql_name for v in self.formula.outcomes]
         inst_sql         = self._get_inst_sql()
-        cluster_col      = self._CLUSTER_ALIAS if self.cluster_col else None
+        cluster_col      = self._CLUSTER_ALIAS if self._effective_cluster_col else None
 
         variables = outcome_sql + exog_sql + actual_endog_sql + inst_sql
 
@@ -773,7 +792,7 @@ class Duck2SLS(DuckEstimator):
         self.n_obs           = self._fitter_result.n_obs
         return self._fitter_result.coefficients
 
-    def _fit_vcov_duckdb_demean(self, se_method: str = "HC1"):
+    def _fit_vcov_duckdb_demean(self, vcov_spec: VcovSpec = None):
         """Compute IV vcov via DuckDB for the demean path (no intercept)."""
         if (
             self._fitter_result is not None
@@ -785,6 +804,8 @@ class Duck2SLS(DuckEstimator):
             self._results    = None
             return
 
+        if vcov_spec is None:
+            vcov_spec = VcovSpec.build('HC1', None, is_iv=True)
         x_sql       = self._exog_sql + self._fitted_endog_sql
         residual_x  = self._exog_sql + self._actual_endog_sql
         z_cols      = self._exog_sql + self._inst_sql
@@ -792,7 +813,7 @@ class Duck2SLS(DuckEstimator):
         cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
         view        = f"{self._DEMEANED_STAGING}_fit"
 
-        duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type=se_method)
+        duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type=vcov_spec.vcov_detail)
         vcov, vcov_meta, _ = duckdb_fitter.fit_vcov(
             table_name=view,
             x_cols=x_sql,
@@ -801,7 +822,7 @@ class Duck2SLS(DuckEstimator):
             add_intercept=False,
             coefficients=self.point_estimate,
             cluster_col=cluster_col,
-            vcov_type=se_method if se_method != "CRV1" else "HC1",
+            vcov_spec=vcov_spec,
             residual_x_cols=residual_x,
             z_cols=z_cols,
             is_iv=True,
@@ -1022,25 +1043,28 @@ class Duck2SLS(DuckEstimator):
 
     def fit_vcov(self, se_method: str = "HC1"):
         """Compute vcov with correct 2SLS formula using actual residuals."""
+        vcov_spec = self.vcov_spec or VcovSpec.build(se_method, None, is_iv=True)
         if self.fitter == "duckdb":
             if self.method == "demean":
-                self._fit_vcov_duckdb_demean(se_method)
+                self._fit_vcov_duckdb_demean(vcov_spec)
             else:
-                self._fit_vcov_duckdb(se_method)
+                self._fit_vcov_duckdb(vcov_spec)
         else:
-            self._fit_vcov_numpy(se_method)
+            self._fit_vcov_numpy(vcov_spec)
 
-    def _fit_vcov_numpy(self, se_method: str = "HC1"):
+    def _fit_vcov_numpy(self, vcov_spec: VcovSpec = None):
         if self._X_actual is None or self._X_fitted is None or self._Z is None:
             raise RuntimeError("compress_data() must be called before fit_vcov()")
-        fitter = NumpyFitter(alpha=1e-8, se_type=se_method)
+        if vcov_spec is None:
+            vcov_spec = VcovSpec.build('HC1', None, is_iv=True)
+        fitter = NumpyFitter(alpha=1e-8, se_type=vcov_spec.vcov_detail)
         vcov, vcov_meta, _ = fitter.fit_vcov(
             X=self._X_fitted,
             y=self._y,
             weights=self._weights,
             coefficients=self.point_estimate,
             cluster_ids=self._cluster_ids,
-            vcov_type=se_method if se_method != "CRV1" else "HC1",
+            vcov_spec=vcov_spec,
             Z=self._Z,
             is_iv=True,
             residual_X=self._X_actual,
@@ -1050,7 +1074,7 @@ class Duck2SLS(DuckEstimator):
         self._n_clusters = vcov_meta.get("n_clusters")
         self._results    = None
 
-    def _fit_vcov_duckdb(self, se_method: str = "HC1"):
+    def _fit_vcov_duckdb(self, vcov_spec: VcovSpec = None):
         if (
             self._fitter_result is not None
             and self._fitter_result.vcov is not None
@@ -1061,6 +1085,8 @@ class Duck2SLS(DuckEstimator):
             self._results    = None
             return
 
+        if vcov_spec is None:
+            vcov_spec = VcovSpec.build('HC1', None, is_iv=True)
         extra      = self._ss_transformer.extra_regressors
         x_extra    = self._x_extra(extra)
         z_extra    = self._z_extra(extra)
@@ -1070,7 +1096,7 @@ class Duck2SLS(DuckEstimator):
         z_cols     = self._exog_sql + self._inst_sql + z_extra
         cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
 
-        duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type=se_method)
+        duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type=vcov_spec.vcov_detail)
         vcov, vcov_meta, _ = duckdb_fitter.fit_vcov(
             table_name=self._COMPRESSED_VIEW,
             x_cols=x_sql,
@@ -1079,7 +1105,7 @@ class Duck2SLS(DuckEstimator):
             add_intercept=True,
             coefficients=self.point_estimate,
             cluster_col=cluster_col,
-            vcov_type=se_method if se_method != "CRV1" else "HC1",
+            vcov_spec=vcov_spec,
             residual_x_cols=residual_x,
             z_cols=z_cols,
             is_iv=True,
@@ -1091,7 +1117,7 @@ class Duck2SLS(DuckEstimator):
 
     def bootstrap(self) -> np.ndarray:
         logger.warning("Bootstrap for 2SLS is not yet implemented; using analytical SEs.")
-        self.fit_vcov()
+        self.fit_vcov()  # reads self.vcov_spec internally
         return self.vcov
 
     # =========================================================================

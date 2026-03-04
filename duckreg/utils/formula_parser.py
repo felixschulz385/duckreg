@@ -665,7 +665,19 @@ class FormulaParser:
     _SHIFT_PATTERN = re.compile(r'^(.+?)\s*([+\-])\s*([0-9.]+)$')
     
     def parse(self, formula: str) -> Formula:
-        """Parse a formula string into a Formula object"""
+        """Parse a formula string into a Formula object.
+
+        Supported format (fixest/lfe-style)::
+
+            "y ~ x1 + x2 | fe1 + fe2 | (endog ~ inst1 + inst2)"
+
+        The 4th pipe segment for cluster is *deprecated*; pass the cluster
+        variable via ``se_method={'CRV1': 'cluster_var'}`` instead.
+        The old IV syntax ``endog(inst1 + inst2)`` is also *deprecated*; use
+        the fixest-style ``(endog ~ inst1 + inst2)`` form in the 3rd segment.
+        """
+        import warnings
+
         logger.debug(f"Parsing formula: {formula}")
         
         if "~" not in formula:
@@ -681,16 +693,24 @@ class FormulaParser:
         covariates, interactions = self._parse_covariates_with_interactions(parts[0]) if parts[0] else ([], [])
         fixed_effects, merged_fes = self._parse_fixed_effects(parts[1]) if len(parts) > 1 and parts[1].strip() != "0" else ([], [])
         
-        # Parse instrumental variables (part 3)
+        # Parse instrumental variables (3rd pipe segment)
         endogenous, instruments = [], []
         if len(parts) > 2 and parts[2].strip() not in ("", "0"):
             endogenous, instruments = self._parse_instruments(parts[2])
         
+        # 4th pipe segment (cluster) is deprecated → move to se_method dict
         cluster = None
         if len(parts) > 3 and parts[3].strip() not in ("", "0"):
+            warnings.warn(
+                "Specifying the cluster variable in the formula (4th pipe segment) "
+                "is deprecated and will be removed in a future version. "
+                "Use se_method={'CRV1': 'cluster_var'} instead.",
+                DeprecationWarning,
+                stacklevel=4,
+            )
             cluster_vars = self._parse_variable_list(parts[3], VariableRole.CLUSTER)
             if len(cluster_vars) > 1:
-                raise ValueError("Only one cluster variable allowed")
+                raise ValueError("Only one cluster variable is allowed in the formula")
             cluster = cluster_vars[0] if cluster_vars else None
         
         return Formula(
@@ -846,32 +866,62 @@ class FormulaParser:
         return expr, 0.0
     
     def _parse_instruments(self, iv_string: str) -> Tuple[List[Variable], List[Variable]]:
-        """Parse instrumental variables specification: endogenous(instrument1, instrument2, ...)
-        
-        Format: endog1 + endog2 (inst1 + inst2 + inst3)
-        Or simpler: endog (inst1 + inst2)
-        
-        Handles functions like log(x + 0.01) correctly by finding the last opening paren
-        that starts the instrument list.
+        """Parse instrumental variables specification.
+
+        Preferred fixest-style format::
+
+            (endog ~ inst1 + inst2)
+            (endog1 + endog2 ~ inst1 + inst2 + inst3)
+
+        The legacy format ``endog(inst1 + inst2)`` is still accepted but
+        emits a :class:`DeprecationWarning`.
         """
+        import warnings
+
         iv_string = iv_string.strip()
-        
-        # Find the instrument parentheses - we need to find the opening paren that
-        # corresponds to the instrument list, not function parentheses
-        # The instrument list paren should be preceded by whitespace or end of variable name
-        
+
+        # ── New fixest-style: (endog ~ instruments) ──────────────────────────
+        if iv_string.startswith("(") and iv_string.endswith(")"):
+            inner = iv_string[1:-1].strip()
+            if "~" in inner:
+                endog_part, inst_part = inner.split("~", 1)
+                endog_part = endog_part.strip()
+                inst_part  = inst_part.strip()
+                if not endog_part or not inst_part:
+                    raise ValueError(
+                        "IV specification requires both endogenous variables and "
+                        f"instruments.  Got: {iv_string!r}"
+                    )
+                endogenous  = self._parse_variable_list(endog_part, VariableRole.ENDOGENOUS)
+                instruments = self._parse_variable_list(inst_part, VariableRole.INSTRUMENT)
+                if len(instruments) < len(endogenous):
+                    raise ValueError(
+                        f"Number of instruments ({len(instruments)}) must be at least "
+                        f"equal to number of endogenous variables ({len(endogenous)})"
+                    )
+                return endogenous, instruments
+
+        # ── Legacy format: endog(inst1 + inst2) ──────────────────────────────
+        warnings.warn(
+            "The IV syntax 'endog(inst1 + inst2)' is deprecated.  "
+            "Use the fixest-style '(endog ~ inst1 + inst2)' in the 3rd pipe "
+            "segment instead, e.g.  'y ~ x | fe | (endog ~ z1 + z2)'.",
+            DeprecationWarning,
+            stacklevel=5,
+        )
+
         paren_start = self._find_instrument_paren_start(iv_string)
         
         if paren_start == -1 or ')' not in iv_string[paren_start:]:
             raise ValueError(
-                "IV specification must be in format: endogenous (instrument1 + instrument2). "
-                f"Got: {iv_string}"
+                "IV specification must be in format: (endog ~ inst1 + inst2) "
+                f"[fixest-style] or endog(inst1 + inst2) [legacy].  Got: {iv_string!r}"
             )
         
         paren_end = iv_string.rindex(')')
         
         endog_part = iv_string[:paren_start].strip()
-        inst_part = iv_string[paren_start + 1:paren_end].strip()
+        inst_part  = iv_string[paren_start + 1:paren_end].strip()
         
         if not endog_part or not inst_part:
             raise ValueError(
@@ -879,8 +929,8 @@ class FormulaParser:
                 f"Got endogenous: '{endog_part}', instruments: '{inst_part}'"
             )
         
-        endogenous = self._parse_variable_list(endog_part, VariableRole.ENDOGENOUS)
-        instruments = self._parse_variable_list(inst_part, VariableRole.INSTRUMENT)
+        endogenous  = self._parse_variable_list(endog_part, VariableRole.ENDOGENOUS)
+        instruments = self._parse_variable_list(inst_part,  VariableRole.INSTRUMENT)
         
         if len(instruments) < len(endogenous):
             raise ValueError(

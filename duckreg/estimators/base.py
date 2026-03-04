@@ -79,7 +79,20 @@ class DuckEstimator(ABC):
         Subclasses should not override this; override the individual steps instead.
         """
         logger.debug(f"fit() START with se_method={se_method}")
-        
+
+        # If se_method is a dict (e.g. {"CRV1": "firm_id"}), build/update
+        # vcov_spec from it BEFORE prepare_data() runs so the staging table
+        # includes the cluster column via _effective_cluster_col.
+        if isinstance(se_method, dict):
+            from ..core.vcov import VcovSpec
+            has_fixef = bool(getattr(self, 'fe_cols', None))
+            is_iv = bool(getattr(self, 'endogenous_vars', None))
+            self.vcov_spec = VcovSpec.build(
+                se_method=se_method,
+                has_fixef=has_fixef,
+                is_iv=is_iv,
+            )
+
         # Step 1: Prepare data (create tables, run first stages for IV, etc.)
         self.prepare_data()
         
@@ -100,18 +113,37 @@ class DuckEstimator(ABC):
 
     def _compute_standard_errors(self, se_method: str):
         """Dispatch standard error computation based on method"""
-        if se_method == SEMethod.BS:
-            if self.n_bootstraps > 0:
-                logger.debug("Computing bootstrap standard errors")
-                self.vcov = self.bootstrap()
-                self.se = "bootstrap"
-        elif se_method in (SEMethod.IID, SEMethod.HC1, SEMethod.CRV1):
-            logger.debug(f"Computing {se_method} standard errors")
-            self.fit_vcov(se_method=se_method)
-        elif se_method == SEMethod.NONE:
+        # When vcov_spec is set (via duckreg API), derive the effective method from it.
+        # This ensures the parsed VcovSpec is used rather than the string fallback.
+        vcov_spec = getattr(self, 'vcov_spec', None)
+        effective = vcov_spec.vcov_detail if vcov_spec is not None else se_method
+
+        # For string se_method (not dict), ensure vcov_spec is built so all
+        # subclasses (DuckLinearModel, Duck2SLS) can read self.vcov_spec in
+        # their fit_vcov implementations.
+        if vcov_spec is None and effective not in (SEMethod.NONE, SEMethod.BS, None):
+            from ..core.vcov import VcovSpec
+            has_fixef = bool(getattr(self, 'fe_cols', None))
+            is_iv     = bool(getattr(self, 'endogenous_vars', None))
+            try:
+                self.vcov_spec = VcovSpec.build(
+                    effective, None, has_fixef=has_fixef, is_iv=is_iv
+                )
+            except Exception:
+                pass
+
+        if self.n_bootstraps > 0 and (effective == SEMethod.BS or se_method == SEMethod.BS):
+            logger.debug("Computing bootstrap standard errors")
+            self.vcov = self.bootstrap()
+            self.se = "bootstrap"
+        elif effective == SEMethod.NONE:
             logger.debug("Skipping standard error computation")
+        elif effective in (SEMethod.IID, SEMethod.HC1, SEMethod.CRV1,
+                           'HC2', 'HC3', 'CRV3', 'hetero', 'iid'):
+            logger.debug(f"Computing {effective} standard errors")
+            self.fit_vcov(effective)
         else:
-            logger.warning(f"Unknown se_method '{se_method}'")
+            logger.warning(f"Unknown se_method '{effective}'")
 
     # -------------------------------------------------------------------------
     # Abstract methods - must be implemented by subclasses

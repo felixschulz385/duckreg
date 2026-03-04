@@ -5,15 +5,15 @@
 from ._version import __version__, get_version, get_version_info
 from .duckreg import duckreg, compressed_ols, DuckReg, SEMethod
 from .utils.api import FEMethod
-from .core.fitters import (
-    wls, 
-    wls_duckdb, 
-    ridge_closed_form, 
-    ridge_closed_form_batch,
-    NumpyFitter,
+from .core.fitters.base import FitterResult
+from .core.fitters.numpy_fitter import NumpyFitter
+from .core.fitters.duckdb_fitter import (
     DuckDBFitter,
     get_fitter,
-    FitterResult,
+    wls,
+    wls_duckdb,
+    ridge_closed_form,
+    ridge_closed_form_batch,
 )
 from .estimators import DuckRegression
 from .core.results import RegressionResults, FirstStageResults, ModelSummary

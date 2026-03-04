@@ -170,6 +170,8 @@ class DuckFE(DuckLinearModel):
         drop_kw = "VIEW" if row[0] == "VIEW" else "TABLE"
         self.conn.execute(f"DROP {drop_kw} {self._STAGING_TABLE}")
 
+    # _effective_cluster_col is inherited from DuckLinearModel
+
     def _make_transformer(
         self,
         fe_sql_names: List[str],
@@ -242,7 +244,8 @@ class DuckFE(DuckLinearModel):
             # Build a staging table via formula helpers so that boolean
             # casting, interaction columns, and the cluster alias are all
             # handled correctly before the transformer sees the data.
-            cluster_alias = self._CLUSTER_ALIAS if self.cluster_col else None
+            eff_cluster = self._effective_cluster_col
+            cluster_alias = self._CLUSTER_ALIAS if eff_cluster else None
 
             select_parts = [
                 self.formula.get_fe_select_sql(boolean_cols),
@@ -253,8 +256,10 @@ class DuckFE(DuckLinearModel):
                     unit_col, "year", boolean_cols, include_interactions=True
                 ),
             ]
+            # Pass eff_cluster as fallback so clusters specified via
+            # se_method={'CRV1': 'var'} (not in formula) are also included.
             cluster_sql = self.formula.get_cluster_select_sql(
-                boolean_cols, self._CLUSTER_ALIAS, unit_col
+                boolean_cols, self._CLUSTER_ALIAS, eff_cluster
             )
             if cluster_sql:
                 select_parts.append(cluster_sql)
@@ -331,7 +336,7 @@ class DuckFE(DuckLinearModel):
             self._transformer = self._make_transformer(
                 fe_sql_names=fe_sql_names,
                 cov_sql_names=cov_sql,
-                cluster_col=self.cluster_col,
+                cluster_col=self._effective_cluster_col,
                 source_table=source_table,
             )
             variables = outcome_sql + cov_sql
@@ -384,8 +389,11 @@ class DuckFE(DuckLinearModel):
             # subquery.  Without this, they are only referenced as outer-SELECT
             # aliases and DuckDB rejects ROUND(alias, n) in GROUP BY.
             transformed_select = self._transformer.transform_query(all_variables + extra)
+            # Use the effective cluster col (formula or vcov_spec fallback) so
+            # CRV1 requested via se_method={'CRV1': 'unit'} is preserved.
+            eff_cluster = self._effective_cluster_col
             cluster_part_select = (
-                f", {self.cluster_col}" if self.cluster_col else ""
+                f", {eff_cluster}" if eff_cluster else ""
             )
             rhs_cols = cov_sql + extra
 
@@ -399,9 +407,9 @@ class DuckFE(DuckLinearModel):
                 sel, grp = build_round_expr(col, col, self.round_strata)
                 select_parts.append(sel)
                 group_parts.append(grp)
-            if self.cluster_col:
-                select_parts.append(self.cluster_col)
-                group_parts.append(self.cluster_col)
+            if eff_cluster:
+                select_parts.append(eff_cluster)
+                group_parts.append(eff_cluster)
 
             outcome_aggs = []
             for v in self.formula.outcomes:
@@ -424,9 +432,10 @@ class DuckFE(DuckLinearModel):
             # Mundlak: group by all RHS columns + cluster col; aggregate outcomes.
             # For 'mundlak', the cluster column was aliased to __cluster__ during
             # staging; for 'auto_fe' pure-Mundlak we use the original column name.
+            _eff = self._effective_cluster_col
             cluster_alias = (
-                self._CLUSTER_ALIAS if self.method == "mundlak" and self.cluster_col
-                else self.cluster_col if self.method == "auto_fe" and self.cluster_col
+                self._CLUSTER_ALIAS if self.method == "mundlak" and _eff
+                else _eff if self.method == "auto_fe" and _eff
                 else None
             )
             rhs_cols = cov_sql + extra
@@ -583,19 +592,33 @@ class DuckFE(DuckLinearModel):
     def _get_vcov_fe_params(self) -> Tuple[int, int, int, int]:
         """Return (k_fe, n_fe, k_fe_nested, n_fe_fully_nested) for VcovContext."""
         uses_map = not self._is_pure_mundlak()
-        if uses_map:
-            k_fe_nested, n_fe_fully_nested = self._compute_fe_nesting()
-            # For auto_fe hybrid/pure-MAP, fe_cols on the active transformer
-            # are only the MAP-routed dimensions.
-            active = getattr(self._transformer, "_active_transformer", self._transformer)
-            n_fe = len(active.fe_cols) if active is not None else len(self._transformer.fe_cols)
-            return (
-                self._transformer.df_correction,
-                n_fe,
-                k_fe_nested,
-                n_fe_fully_nested,
-            )
-        return 0, 0, 0, 0
+        if not uses_map:
+            return 0, 0, 0, 0
+
+        # Be robust to attribute naming (vcovspec vs vcov_spec, isclustered vs is_clustered)
+        vc = getattr(self, "vcovspec", None)
+        if vc is None:
+            vc = getattr(self, "vcov_spec", None)
+
+        is_clustered = False
+        if vc is not None:
+            is_clustered = bool(getattr(vc, "isclustered", getattr(vc, "is_clustered", False)))
+
+        active = getattr(self._transformer, "_active_transformer", self._transformer)
+        n_fe = len(active.fe_cols) if active is not None else len(self._transformer.fe_cols)
+
+        # Always compute nesting regardless of SE method, as it affects DOF
+        k_fe_nested = 0
+        n_fe_fully_nested = 0
+        k_fe_nested, n_fe_fully_nested = self._compute_fe_nesting()
+
+        return (
+            self._transformer.df_correction,  # k_fe
+            n_fe,
+            k_fe_nested,
+            n_fe_fully_nested,
+        )
+
 
     def _compute_fe_nesting(self) -> Tuple[int, int]:
         """Detect nested FE structure for the nonnested SSC path.
@@ -613,44 +636,92 @@ class DuckFE(DuckLinearModel):
         n_fe_fully_nested : int
             Number of FE dimensions that are fully nested within another.
         """
+        # Return cached result (computed during fit, before connection closes)
+        if hasattr(self, '_fe_nesting_cache'):
+            return self._fe_nesting_cache
+
         if self._transformer is None or self._result_table is None:
             return 0, 0
         # For auto_fe, use the active (MAP) transformer's fe_cols, since those
         # are the dimensions whose group structure lives in demeaned_data.
         active = getattr(self._transformer, "_active_transformer", self._transformer)
         effective_transformer = active if active is not None else self._transformer
-        if len(effective_transformer.fe_cols) < 2:
-            return 0, 0
 
         fe_cols = effective_transformer.fe_cols
         result_table = self._result_table
         k_fe_nested = 0
         n_fe_fully_nested = 0
 
-        for i, fe_b in enumerate(fe_cols):
-            is_nested = False
-            for j, fe_a in enumerate(fe_cols):
-                if i == j:
+        # --- (A) FE-to-FE nesting: B nested in A (B levels map to one A level) ---
+        if len(fe_cols) >= 2:
+            for i, fe_b in enumerate(fe_cols):
+                is_nested = False
+                n_levels_b = 0
+                for j, fe_a in enumerate(fe_cols):
+                    if i == j:
+                        continue
+                    # B is nested in A iff every B-level maps to exactly one A-level
+                    row = self.conn.execute(f"""
+                        SELECT MAX(cnt) AS max_a_per_b,
+                               COUNT(DISTINCT {fe_b}) AS n_levels_b
+                        FROM (
+                            SELECT {fe_b}, COUNT(DISTINCT {fe_a}) AS cnt
+                            FROM {result_table}
+                            GROUP BY {fe_b}
+                        ) t
+                    """).fetchone()
+                    if row is not None and row[0] == 1:
+                        is_nested = True
+                        n_levels_b = int(row[1]) if row[1] is not None else 0
+                        break
+                if is_nested:
+                    n_fe_fully_nested += 1
+                    k_fe_nested += n_levels_b
+
+        # --- (B) FE-to-cluster nesting: B nested in the CRV cluster column ---
+        # pyfixest's kfixef='nonnested' also subtracts FE dimensions that are
+        # fully nested *within the cluster*.  The unit FE is trivially nested
+        # in a CRV1 cluster-by-unit because every unit level maps to exactly
+        # one cluster level (they are the same identifier).  Only check this
+        # when a cluster column is available and not already counted above.
+        cluster_col = self._effective_cluster_col
+        if cluster_col:
+            already_nested = set()
+            # Rebuild the set of FE dims detected as FE-to-FE nested
+            if len(fe_cols) >= 2:
+                for i, fe_b in enumerate(fe_cols):
+                    for j, fe_a in enumerate(fe_cols):
+                        if i == j:
+                            continue
+                        row = self.conn.execute(f"""
+                            SELECT MAX(cnt) FROM (
+                                SELECT {fe_b}, COUNT(DISTINCT {fe_a}) AS cnt
+                                FROM {result_table} GROUP BY {fe_b}
+                            ) t
+                        """).fetchone()
+                        if row is not None and row[0] == 1:
+                            already_nested.add(i)
+                            break
+
+            for i, fe_b in enumerate(fe_cols):
+                if i in already_nested:
                     continue
-                # B is nested in A iff every B-level maps to exactly one A-level
                 row = self.conn.execute(f"""
-                    SELECT MAX(cnt) AS max_a_per_b,
+                    SELECT MAX(cnt) AS max_c_per_b,
                            COUNT(DISTINCT {fe_b}) AS n_levels_b
                     FROM (
-                        SELECT {fe_b}, COUNT(DISTINCT {fe_a}) AS cnt
+                        SELECT {fe_b}, COUNT(DISTINCT {cluster_col}) AS cnt
                         FROM {result_table}
                         GROUP BY {fe_b}
                     ) t
                 """).fetchone()
                 if row is not None and row[0] == 1:
-                    is_nested = True
-                    n_levels_b = int(row[1]) if row[1] is not None else 0
-                    break
-            if is_nested:
-                n_fe_fully_nested += 1
-                k_fe_nested += n_levels_b
+                    n_fe_fully_nested += 1
+                    k_fe_nested += int(row[1]) if row[1] is not None else 0
 
-        return k_fe_nested, n_fe_fully_nested
+        result = (k_fe_nested, n_fe_fully_nested)
+        self._fe_nesting_cache = result
+        return result
 
     def _get_y_col_for_duckdb(self) -> str:
         main_outcome = self.formula.outcomes[0].sql_name
@@ -665,9 +736,13 @@ class DuckFE(DuckLinearModel):
 
     def _get_cluster_col_for_vcov(self) -> Optional[str]:
         if self.method == "mundlak":
-            return self._CLUSTER_ALIAS if self.cluster_col else None
-        if self.method in ("iterative_demean", "auto_fe") and self.cluster_col:
-            return getattr(self._transformer, "cluster_col", self.cluster_col)
+            return self._CLUSTER_ALIAS if self._effective_cluster_col else None
+        if self.method in ("iterative_demean", "auto_fe"):
+            # Return the cluster col that the transformer was given; it honours
+            # both formula-level clusters and vcov_spec.cluster_vars fallback.
+            eff = self._effective_cluster_col
+            if eff:
+                return getattr(self._transformer, "cluster_col", eff)
         return None
 
     def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, str]:

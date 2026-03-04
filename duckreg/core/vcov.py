@@ -38,43 +38,69 @@ WeightType = Literal["aweights", "fweights"]
 class SSCConfig:
     """Small sample correction configuration.
     
-    Matches fixest's SSC options for consistent behavior.
+    Matches pyfixest's SSC options for consistent behavior.
     
     Attributes
     ----------
-    k_adj : bool
+    kadj : bool
         Whether to adjust for number of parameters (N-1)/(N-k)
-    k_fixef : str
+    kfixef : str
         How to count fixed effects: "none", "nonnested", or "full"
-    G_adj : bool
+    Gadj : bool
         Whether to apply cluster adjustment G/(G-1)
-    G_df : str
+    Gdf : str
         Cluster df adjustment: "conventional" or "min"
     """
-    k_adj: bool = True
-    k_fixef: str = "full"
-    G_adj: bool = True
-    G_df: str = "conventional"
-    
+    kadj: bool = True
+    kfixef: str = "nonnested"
+    Gadj: bool = True
+    Gdf: str = "conventional"
+
+    @classmethod
+    def default(cls) -> "SSCConfig":
+        """Return a default SSCConfig instance."""
+        return cls()
+
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "SSCConfig":
         """Create from dictionary with defaults."""
         if d is None:
             return cls()
         return cls(
-            k_adj=d.get('k_adj', True),
-            k_fixef=d.get('k_fixef', 'full'),
-            G_adj=d.get('G_adj', True),
-            G_df=d.get('G_df', 'conventional')
+            kadj=d.get('kadj', True),
+            kfixef=d.get('kfixef', 'nonnested'),
+            Gadj=d.get('Gadj', True),
+            Gdf=d.get('Gdf', 'conventional')
         )
     
+    @classmethod
+    def for_formula(
+        cls,
+        has_fixef: bool = False,
+        is_clustered: bool = False,
+        is_iv: bool = False,
+    ) -> "SSCConfig":
+        """Auto-determine SSC settings from formula properties.
+
+        Matches pyfixest defaults: ``Gdf='min'`` when clustering is present.
+        ``kfixef='nonnested'`` is always used — nesting detection in
+        ``_compute_fe_nesting`` adjusts ``dfk`` correctly for FE levels nested
+        inside cluster variables.
+        """
+        return cls(
+            kadj=True,
+            kfixef='nonnested',
+            Gadj=True,
+            Gdf='min' if is_clustered else 'conventional',
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
-            'k_adj': self.k_adj,
-            'k_fixef': self.k_fixef,
-            'G_adj': self.G_adj,
-            'G_df': self.G_df
+            'kadj': self.kadj,
+            'kfixef': self.kfixef,
+            'Gadj': self.Gadj,
+            'Gdf': self.Gdf
         }
 
 
@@ -90,21 +116,76 @@ class VcovContext:
         Number of observations
     k : int
         Number of parameters
-    k_fe : int
+    kfe : int
         Number of fixed effect levels
-    n_fe : int
+    nfe : int
         Number of fixed effect variables
-    k_fe_nested : int
+    kfenested : int
         Number of nested fixed effect levels
-    n_fe_fully_nested : int
+    nfefullynested : int
         Number of fully nested FE dimensions
     """
     N: int
     k: int
-    k_fe: int = 0
-    n_fe: int = 0
-    k_fe_nested: int = 0
-    n_fe_fully_nested: int = 0
+    kfe: int = 0
+    nfe: int = 0
+    kfenested: int = 0
+    nfefullynested: int = 0
+
+
+@dataclass(frozen=True)
+class VcovSpec:
+    """
+    Fully-parsed, validated vcov specification.
+    Created ONCE at the duckreg() API boundary.
+    Passed as a single typed object through all layers.
+    Never re-parsed or re-defaulted downstream.
+    """
+    vcov_type: str                     # broad: 'iid' | 'hetero' | 'CRV' | 'HAC'
+    vcov_detail: str                   # specific: 'iid' | 'HC1' | 'HC2' | 'HC3' | 'CRV1' | 'CRV3'
+    is_clustered: bool
+    cluster_vars: Optional[List[str]]  # logical column names; None if not clustered
+    ssc: SSCConfig                     # resolved, non-None SSCConfig
+
+    @classmethod
+    def build(
+        cls,
+        se_method: str,
+        ssc_dict: Optional[Dict[str, Any]] = None,
+        has_fixef: bool = False,
+        is_iv: bool = False,
+    ) -> "VcovSpec":
+        """
+        Parse se_method string into a validated VcovSpec.
+        This is the single place where validation and defaulting happens.
+        Raises VcovTypeNotSupportedError or ValueError on invalid input.
+
+        When ``ssc_dict`` is *None* (the default), SSC settings are
+        auto-determined from formula properties via ``SSCConfig.for_formula()``.
+        Pass an explicit ``ssc_dict`` only for component-level testing or
+        legacy callers; the high-level ``duckreg()`` API no longer exposes it.
+        """
+        vcov_type, vcov_detail, is_clustered, cluster_vars = \
+            parse_vcov_specification(se_method, has_fixef=has_fixef, is_iv=is_iv)
+        if ssc_dict is not None:
+            ssc = SSCConfig.from_dict(ssc_dict)
+        else:
+            ssc = SSCConfig.for_formula(
+                has_fixef=has_fixef,
+                is_clustered=is_clustered,
+                is_iv=is_iv,
+            )
+        return cls(
+            vcov_type=vcov_type,
+            vcov_detail=vcov_detail,
+            is_clustered=is_clustered,
+            cluster_vars=cluster_vars,
+            ssc=ssc,
+        )
+
+    @property
+    def needs_cluster_data(self) -> bool:
+        return self.is_clustered
 
 
 # ============================================================================
@@ -376,57 +457,57 @@ def compute_ssc(
     -------
     Tuple[float, int, int]
         - ssc: float, the small sample correction factor
-        - df_k: int, degrees of freedom for parameters
-        - df_t: int, total degrees of freedom for t-tests
+        - dfk: int, degrees of freedom for parameters
+        - dft: int, total degrees of freedom for t-tests
     """
     # Adjust fixed effects count: subtract one for each FE except the first
     # See: https://github.com/lrberge/fixest/issues/554
-    k_fe_adj = context.k_fe - (context.n_fe - 1) if context.n_fe > 1 else context.k_fe
+    k_fe_adj = context.kfe - (context.nfe - 1) if context.nfe > 1 else context.kfe
     
-    # Compute df_k based on k_fixef rule
-    if ssc_config.k_fixef == "none":
-        df_k = context.k
-    elif ssc_config.k_fixef == "nonnested":
-        if context.n_fe == 0:
-            df_k = context.k
-        elif context.k_fe_nested == 0:
-            df_k = context.k + k_fe_adj
+    # Compute dfk based on kfixef rule
+    if ssc_config.kfixef == "none":
+        dfk = context.k
+    elif ssc_config.kfixef == "nonnested":
+        if context.nfe == 0:
+            dfk = context.k
+        elif context.kfenested == 0:
+            dfk = context.k + k_fe_adj
         else:
-            df_k = context.k + k_fe_adj - context.k_fe_nested + context.n_fe_fully_nested
-    elif ssc_config.k_fixef == "full":
-        df_k = context.k + k_fe_adj if context.n_fe > 0 else context.k
+            dfk = context.k + k_fe_adj - context.kfenested + context.nfefullynested
+    elif ssc_config.kfixef == "full":
+        dfk = context.k + k_fe_adj if context.nfe > 0 else context.k
     else:
-        raise ValueError(f"k_fixef must be 'none', 'nonnested', or 'full', got: {ssc_config.k_fixef}")
+        raise ValueError(f"kfixef must be 'none', 'nonnested', or 'full', got: {ssc_config.kfixef}")
     
     # Compute base adjustment value
     adj_value = 1.0
-    if ssc_config.k_adj:
+    if ssc_config.kadj:
         if vcov_type in ("hetero", "HC0"):
-            adj_value = context.N / max(1, context.N - df_k)
+            adj_value = context.N / max(1, context.N - dfk)
         else:
-            adj_value = (context.N - 1) / max(1, context.N - df_k)
+            adj_value = (context.N - 1) / max(1, context.N - dfk)
     
     # Apply cluster adjustments for CRV/HAC
     G_adj_value = 1.0
-    if vcov_type in ("CRV", "cluster", "CRV1", "HAC") and ssc_config.G_adj:
-        if ssc_config.G_df == "conventional":
+    if vcov_type in ("CRV", "cluster", "CRV1", "HAC") and ssc_config.Gadj:
+        if ssc_config.Gdf == "conventional":
             G_adj_value = G / (G - 1) if G > 1 else 1.0
-        elif ssc_config.G_df == "min":
+        elif ssc_config.Gdf == "min":
             G_min = np.min(G) if hasattr(G, '__iter__') else G
             G_adj_value = G_min / (G_min - 1) if G_min > 1 else 1.0
         else:
-            raise ValueError(f"G_df must be 'conventional' or 'min', got: {ssc_config.G_df}")
+            raise ValueError(f"Gdf must be 'conventional' or 'min', got: {ssc_config.Gdf}")
     
     # Compute total SSC
     ssc = adj_value * G_adj_value * vcov_sign
     
     # Compute degrees of freedom for t-statistics
     if vcov_type in ("iid", "hetero", "HC0", "HC1", "HAC-TS"):
-        df_t = context.N - df_k
+        dft = context.N - dfk
     else:  # CRV, cluster, HAC
-        df_t = G - 1
+        dft = G - 1
     
-    return ssc, df_k, df_t
+    return ssc, dfk, dft
 
 
 # ============================================================================
@@ -498,7 +579,7 @@ def compute_iid_vcov(
     bread: np.ndarray,
     rss: float,
     context: VcovContext,
-    ssc_config: Optional[SSCConfig] = None,
+    ssc_config: SSCConfig = None,
     is_iv: bool = False,
     tXZ: Optional[np.ndarray] = None,
     tZZinv: Optional[np.ndarray] = None,
@@ -522,8 +603,8 @@ def compute_iid_vcov(
         Residual sum of squares: sum(u_hat^2)
     context : VcovContext
         Computation context (N, k, FE parameters)
-    ssc_config : SSCConfig, optional
-        SSC configuration (uses defaults if None)
+    ssc_config : SSCConfig
+        SSC configuration (required; use SSCConfig.default() for defaults)
     is_iv : bool
         Whether this is IV regression
     tXZ, tZZinv, tZX : np.ndarray, optional
@@ -535,9 +616,9 @@ def compute_iid_vcov(
         (vcov matrix, metadata dict)
     """
     if ssc_config is None:
-        ssc_config = SSCConfig(k_adj=True, k_fixef='full', G_adj=False, G_df='none')
-    
-    ssc, df_k, df_t = compute_ssc(ssc_config, context, G=1, vcov_type="iid", vcov_sign=1)
+        ssc_config = SSCConfig.default()
+
+    ssc, dfk, dft = compute_ssc(ssc_config, context, G=1, vcov_type="iid", vcov_sign=1)
     
     sigma2 = rss / (context.N - 1)
     
@@ -550,8 +631,8 @@ def compute_iid_vcov(
     
     vcov_meta = {
         'ssc': ssc,
-        'df_k': df_k,
-        'df_t': df_t,
+        'dfk': dfk,
+        'dft': dft,
         'vcov_type': 'iid',
         'vcov_type_detail': 'iid',
         'sigma2': sigma2
@@ -654,11 +735,16 @@ def compute_hetero_vcov(
     weights_type: Optional[WeightType] = None,
     leverages: Optional[np.ndarray] = None,
     vcov_type_detail: str = "HC1",
-    ssc_dict: Optional[Dict[str, Any]] = None,
+    ssc_config: SSCConfig = None,
+    ssc_dict: Optional[Dict[str, Any]] = None,  # backward-compat alias; ssc_config takes precedence
     N: Optional[int] = None,
     k: Optional[int] = None,
     k_fe: int = 0,
     n_fe: int = 0,
+    k_fe_nested: int = 0,
+    n_fe_fully_nested: int = 0,
+    kfe: Optional[int] = None,  # alias for k_fe
+    nfe: Optional[int] = None,  # alias for n_fe
     is_iv: bool = False,
     tXZ: Optional[np.ndarray] = None,
     tZZinv: Optional[np.ndarray] = None,
@@ -695,8 +781,8 @@ def compute_hetero_vcov(
         Leverage values h_ii (n,) for HC2/HC3 adjustment
     vcov_type_detail : str
         "hetero", "HC1", "HC2", or "HC3"
-    ssc_dict : Dict[str, Any], optional
-        SSC configuration
+    ssc_config : SSCConfig
+        SSC configuration (required; use SSCConfig.default() for defaults)
     N : int, optional
         Number of observations
     k : int, optional
@@ -715,10 +801,17 @@ def compute_hetero_vcov(
     """
     if k is None:
         k = bread.shape[0]
-    
-    if ssc_dict is None:
-        ssc_dict = {'k_adj': True, 'k_fixef': 'full', 'G_adj': True, 'G_df': 'conventional'}
-    
+
+    # Handle kfe/nfe aliases
+    if kfe is not None:
+        k_fe = kfe
+    if nfe is not None:
+        n_fe = nfe
+
+    if ssc_config is None:
+        # Support backward-compatible ssc_dict alias
+        ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict is not None else SSCConfig.default()
+
     # Compute meat if not provided
     if meat is None:
         if scores is None:
@@ -776,9 +869,9 @@ def compute_hetero_vcov(
             raise ValueError("N must be provided when using pre-computed meat")
     
     # Compute SSC - for hetero, G = N (fixest convention)
-    context = VcovContext(N=N, k=k, k_fe=k_fe, n_fe=n_fe)
-    ssc_config = SSCConfig.from_dict(ssc_dict)
-    ssc, df_k, df_t = compute_ssc(
+    context = VcovContext(N=N, k=k, kfe=k_fe, nfe=n_fe,
+                          kfenested=k_fe_nested, nfefullynested=n_fe_fully_nested)
+    ssc, dfk, dft = compute_ssc(
         ssc_config=ssc_config,
         context=context,
         G=N,
@@ -796,8 +889,8 @@ def compute_hetero_vcov(
     
     vcov_meta = {
         'ssc': ssc,
-        'df_k': df_k,
-        'df_t': df_t,
+        'dfk': dfk,
+        'dft': dft,
         'vcov_type': 'hetero',
         'vcov_type_detail': vcov_type_detail
     }
@@ -871,7 +964,7 @@ def compute_cluster_vcov(
     cluster_scores: np.ndarray,
     context: VcovContext,
     G: int,
-    ssc_config: Optional[SSCConfig] = None,
+    ssc_config: SSCConfig = None,
     is_iv: bool = False,
     tXZ: Optional[np.ndarray] = None,
     tZZinv: Optional[np.ndarray] = None,
@@ -895,8 +988,8 @@ def compute_cluster_vcov(
         Computation context (N, k, FE parameters)
     G : int
         Number of clusters
-    ssc_config : SSCConfig, optional
-        SSC configuration (uses defaults if None)
+    ssc_config : SSCConfig
+        SSC configuration (required; use SSCConfig.default() for defaults)
     is_iv : bool
         Whether this is IV regression
     tXZ, tZZinv, tZX : np.ndarray, optional
@@ -908,8 +1001,8 @@ def compute_cluster_vcov(
         (vcov matrix, metadata dict)
     """
     if ssc_config is None:
-        ssc_config = SSCConfig(k_adj=True, k_fixef='full', G_adj=True, G_df='conventional')
-    
+        ssc_config = SSCConfig.default()
+
     # Compute meat from cluster scores
     meat = cluster_scores.T @ cluster_scores
     
@@ -918,7 +1011,7 @@ def compute_cluster_vcov(
         meat = tXZ @ tZZinv @ meat @ tZZinv @ tZX
     
     # Compute SSC
-    ssc, df_k, df_t = compute_ssc(ssc_config, context, G, vcov_type="CRV", vcov_sign=1)
+    ssc, dfk, dft = compute_ssc(ssc_config, context, G, vcov_type="CRV", vcov_sign=1)
     
     vcov = ssc * (bread @ meat @ bread)
     # Symmetrize
@@ -926,8 +1019,8 @@ def compute_cluster_vcov(
     
     vcov_meta = {
         'ssc': ssc,
-        'df_k': df_k,
-        'df_t': df_t,
+        'dfk': dfk,
+        'dft': dft,
         'vcov_type': 'cluster',
         'vcov_type_detail': 'CRV1',
         'n_clusters': G
@@ -940,13 +1033,18 @@ def compute_twoway_cluster_vcov(
     bread: np.ndarray,
     scores: np.ndarray,
     cluster_df: np.ndarray,
-    ssc_dict: Optional[Dict[str, Any]],
-    N: int,
+    ssc_config: SSCConfig = None,
+    ssc_dict: Optional[Dict[str, Any]] = None,  # alias for ssc_config
+    N: int = 0,
     k: Optional[int] = None,
     k_fe: int = 0,
     n_fe: int = 0,
     k_fe_nested: int = 0,
-    n_fe_fully_nested: int = 0
+    n_fe_fully_nested: int = 0,
+    kfe: Optional[int] = None,
+    nfe: Optional[int] = None,
+    kfenested: Optional[int] = None,
+    nfefullynested: Optional[int] = None
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Compute two-way cluster-robust variance.
@@ -963,8 +1061,8 @@ def compute_twoway_cluster_vcov(
     cluster_df : np.ndarray
         Cluster assignments, shape (n, 3) for two-way
         Columns: [cluster1, cluster2, cluster1_x_cluster2]
-    ssc_dict : Dict[str, Any], optional
-        SSC configuration
+    ssc_config : SSCConfig
+        SSC configuration (required; use SSCConfig.default() for defaults)
     N : int
         Number of observations
     k : int, optional
@@ -979,12 +1077,22 @@ def compute_twoway_cluster_vcov(
     """
     if k is None:
         k = bread.shape[0]
-    
-    if ssc_dict is None:
-        ssc_dict = {'k_adj': True, 'k_fixef': 'full', 'G_adj': True, 'G_df': 'conventional'}
-    
+
+    # Handle aliases
+    if kfe is not None:
+        k_fe = kfe
+    if nfe is not None:
+        n_fe = nfe
+    if kfenested is not None:
+        k_fe_nested = kfenested
+    if nfefullynested is not None:
+        n_fe_fully_nested = nfefullynested
+
+    if ssc_config is None:
+        ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict is not None else SSCConfig.default()
+
     vcov_sign_list = [1, 1, -1]
-    df_t_full = np.zeros(cluster_df.shape[1])
+    dft_full = np.zeros(cluster_df.shape[1])
     G_list = []
     
     vcov = np.zeros((k, k))
@@ -997,11 +1105,10 @@ def compute_twoway_cluster_vcov(
         G_list.append(G)
         
         context = VcovContext(
-            N=N, k=k, k_fe=k_fe, n_fe=n_fe,
-            k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested
+            N=N, k=k, kfe=k_fe, nfe=n_fe,
+            kfenested=k_fe_nested, nfefullynested=n_fe_fully_nested
         )
-        ssc_config = SSCConfig.from_dict(ssc_dict)
-        ssc, df_k, df_t = compute_ssc(
+        ssc, dfk, dft = compute_ssc(
             ssc_config=ssc_config,
             context=context,
             G=G,
@@ -1010,7 +1117,7 @@ def compute_twoway_cluster_vcov(
         )
         
         ssc_list.append(ssc)
-        df_t_full[x] = df_t
+        dft_full[x] = dft
         
         # Compute CRV1 for this clustering dimension
         vcov_x = vcov_crv1(bread, scores, cluster_col, clustid)
@@ -1021,8 +1128,8 @@ def compute_twoway_cluster_vcov(
     
     vcov_meta = {
         'ssc': ssc_list,
-        'df_k': df_k,
-        'df_t': np.min(df_t_full),
+        'dfk': dfk,
+        'dft': np.min(dft_full),
         'vcov_type': 'cluster',
         'vcov_type_detail': 'CRV1-twoway',
         'n_clusters': G_list
@@ -1089,8 +1196,8 @@ def _bootstrap_iteration_iid(args: Tuple) -> Tuple[np.ndarray, float]:
     Tuple[np.ndarray, float]
         (coefficients, total weight)
     """
-    from ..core.fitters import wls
-    
+    from .fitters.duckdb_fitter import wls
+
     b, X, y, n, n_rows, seed = args
     rng = np.random.default_rng(seed)
     
@@ -1121,8 +1228,8 @@ def _bootstrap_iteration_cluster(args: Tuple) -> Tuple[np.ndarray, float]:
     Tuple[np.ndarray, float]
         (coefficients, total weight)
     """
-    from ..core.fitters import wls
-    
+    from .fitters.duckdb_fitter import wls
+
     b, X, y, n, group_idx, n_unique_groups, seed = args
     rng = np.random.default_rng(seed)
     
@@ -1215,6 +1322,7 @@ __all__ = [
     # Configuration classes
     'SSCConfig',
     'VcovContext',
+    'VcovSpec',
     
     # Exceptions
     'VcovTypeNotSupportedError',

@@ -24,14 +24,19 @@ from .sql_builders import (
     build_meat_query,
     build_cluster_scores_query,
     build_leverage_query,
-    # Execution helpers
-    execute_to_matrix,
-    compute_cross_sufficient_stats_sql
+    # Pure string helper
+    build_exact_sum_y_sq_sql,
 )
 from .suffstats import (
+    SuffStats,
     compute_sufficient_stats_numpy,
     compute_sufficient_stats_sql,
-    build_exact_sum_y_sq_sql
+    # Execution helpers (live here, shims remain in sql_builders for back-compat)
+    execute_to_matrix,
+    compute_cross_sufficient_stats_sql,
+    # FE utilities
+    profile_fe_column,
+    get_fe_unique_levels,
 )
 from .residual_aggregates import (
     compute_residual_aggregates_numpy,
@@ -74,13 +79,17 @@ __all__ = [
     'build_meat_query',
     'build_cluster_scores_query',
     'build_leverage_query',
-    # SQL builders - execution helpers
+    # SQL builders - execution helpers (real home: suffstats)
     'execute_to_matrix',
     'compute_cross_sufficient_stats_sql',
     # Sufficient statistics
+    'SuffStats',
     'compute_sufficient_stats_numpy',
     'compute_sufficient_stats_sql',
     'build_exact_sum_y_sq_sql',
+    # FE utilities
+    'profile_fe_column',
+    'get_fe_unique_levels',
     # Residual aggregates
     'compute_residual_aggregates',
     'compute_residual_aggregates_numpy',

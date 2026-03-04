@@ -3,7 +3,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from .base import DuckReg
-from ..core.fitters import wls
+from ..core.fitters.duckdb_fitter import wls
 
 
 class DuckMundlakEventStudy(DuckReg):

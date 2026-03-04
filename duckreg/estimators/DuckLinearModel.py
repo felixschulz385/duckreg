@@ -16,14 +16,16 @@ import pandas as pd
 import logging
 from typing import Tuple, Optional, List, Dict, Any
 
-from ..core.demean import demean, _convert_to_int
 from .base import DuckEstimator, SEMethod
-from ..core.fitters import wls, NumpyFitter, DuckDBFitter, FitterResult
+from ..core.fitters.base import FitterResult
+from ..core.fitters.numpy_fitter import NumpyFitter
+from ..core.fitters.duckdb_fitter import DuckDBFitter, wls
 from ..utils.formula_parser import cast_if_boolean, needs_quoting, quote_identifier, _make_sql_safe_name
 
 # Import from refactored modules - Single Responsibility Principle
 from ..core.results import RegressionResults, FirstStageResults
 from ..core.vcov import (
+    VcovSpec,
     BootstrapExecutor,
     _bootstrap_iteration_iid, _bootstrap_iteration_cluster
 )
@@ -66,24 +68,16 @@ class DuckLinearModel(DuckEstimator):
         n_jobs: int = 1,
         fitter: str = "numpy",
         remove_singletons: bool = True,
-        ssc_dict: Optional[Dict[str, Any]] = None,
+        vcov_spec: Optional[VcovSpec] = None,
         **kwargs,
     ):
         """
         Parameters
         ----------
-        ssc_dict : dict, optional
-            Small-sample correction overrides forwarded to every analytical
-            vcov computation (iid, HC1, CRV1, …).  Recognised keys:
-
-            * ``k_adj``   – bool, default True.  Apply N/(N−k) adjustment.
-            * ``k_fixef`` – str, ``"full"`` (default) | ``"nonnested"`` | ``"none"``.
-              Controls how absorbed FE levels count toward df_k.
-            * ``G_adj``   – bool, default True.  Apply G/(G−1) cluster factor.
-            * ``G_df``    – str, ``"conventional"`` (default) | ``"min"``.
-
-            When *None* (the default), each vcov function uses its own
-            built-in defaults, which match fixest conventions.
+        vcov_spec : VcovSpec, optional
+            Fully-parsed vcov specification created once at the API boundary.
+            Encapsulates the SE type, SSC configuration, and cluster info.
+            When *None* (the default), each vcov method uses HC1 defaults.
         """
         if formula is None:
             raise ValueError("Formula object is required")
@@ -103,7 +97,8 @@ class DuckLinearModel(DuckEstimator):
         self.formula = formula
         self.n_jobs = n_jobs
         self.subset = subset
-        self.ssc_dict = ssc_dict
+        self.vcov_spec = vcov_spec
+        self.ssc_dict = vcov_spec.ssc.to_dict() if vcov_spec is not None else None
 
         # State
         self.strata_cols: List[str] = []
@@ -158,9 +153,36 @@ class DuckLinearModel(DuckEstimator):
 
 
 
+    @property
+    def _effective_cluster_col(self) -> Optional[str]:
+        """Cluster column resolved from the formula *or* from ``vcov_spec``.
+
+        When the cluster is encoded in the formula (legacy syntax), returns
+        ``self.cluster_col``.  When it is supplied only via
+        ``se_method={'CRV1': 'var'}`` (preferred), falls back to the first
+        element of ``vcov_spec.cluster_vars``.
+        """
+        if self.cluster_col:
+            return self.cluster_col
+        if (
+            self.vcov_spec is not None
+            and self.vcov_spec.is_clustered
+            and self.vcov_spec.cluster_vars
+        ):
+            return self.vcov_spec.cluster_vars[0]
+        return None
+
     def _get_cluster_col_for_vcov(self) -> Optional[str]:
-        """Get cluster column name for vcov computation. Subclasses may override."""
-        return self.cluster_col
+        """Get cluster column name for vcov computation.
+
+        Returns the cluster column parsed from the formula (e.g. ``y ~ x | fe ^
+        cluster``) if available.  When the cluster is specified only through
+        *se_method* (e.g. ``se_method={'CRV1': 'unit'}``), the formula parser
+        leaves ``self.cluster_col`` as *None* and the cluster variable lives in
+        ``vcov_spec.cluster_vars``.  Fall back to that list so the duckdb and
+        numpy fitters receive a non-None value and take the CRV code path.
+        """
+        return self._effective_cluster_col
 
     def _get_unit_col(self) -> Optional[str]:
         """Get unit column (first FE) for panel operations"""
@@ -194,6 +216,18 @@ class DuckLinearModel(DuckEstimator):
         fixed effects are absorbed via demeaning and are *not* present in ``X``.
         """
         return 0, 0, 0, 0
+
+    def get_vcov_fe_params(self) -> Tuple[int, int, int, int]:
+        """Public wrapper for :meth:`_get_vcov_fe_params`.
+
+        Returns (k_fe, n_fe, k_fe_nested, n_fe_fully_nested).
+        """
+        return self._get_vcov_fe_params()
+
+    @property
+    def nobs(self) -> int:
+        """Number of observations (sum of weights / strata counts)."""
+        return getattr(self, 'n_obs', 0)
 
     def _ensure_data_fetched(self):
         """Fetch compressed data to memory if not already done"""
@@ -287,6 +321,16 @@ class DuckLinearModel(DuckEstimator):
         )
         
         self._update_coef_names()
+
+        # Populate df_compressed for downstream inspection / vcov helpers.
+        # This is a best-effort fetch; if the connection is already closed or
+        # the view no longer exists the attribute stays None.
+        if not getattr(self, '_data_fetched', False):
+            try:
+                self._ensure_data_fetched()
+            except Exception:
+                pass
+
         return self._fitter_result.coefficients
     
     def _get_y_col_for_duckdb(self) -> str:
@@ -355,18 +399,14 @@ class DuckLinearModel(DuckEstimator):
     # Variance-covariance
     # -------------------------------------------------------------------------
 
-    def fit_vcov(self, se_method: str = "HC1"):
-        """Compute variance-covariance matrix.
-        
-        Args:
-            se_method: Type of standard errors ('iid', 'HC1', 'CRV1')
-        """
+    def fit_vcov(self, se_method: str = None):
+        """Compute variance-covariance matrix using self.vcov_spec."""
         if self.fitter == "duckdb":
-            self._fit_vcov_duckdb(se_method=se_method)
+            self._fit_vcov_duckdb()
         else:
-            self._fit_vcov_numpy(se_method=se_method)
+            self._fit_vcov_numpy()
     
-    def _fit_vcov_numpy(self, se_method: str = "HC1"):
+    def _fit_vcov_numpy(self):
         """Compute vcov using numpy (in-memory) backend via NumpyFitter"""
         self._ensure_data_fetched()
         
@@ -374,8 +414,11 @@ class DuckLinearModel(DuckEstimator):
         cluster_ids = self._get_cluster_ids_from_df()
         k_fe, n_fe, k_fe_nested, n_fe_fully_nested = self._get_vcov_fe_params()
         
+        # Resolve vcov_spec: use stored spec or default to HC1
+        vcov_spec = self.vcov_spec if self.vcov_spec is not None else VcovSpec.build('HC1', None)
+
         # Use NumpyFitter for vcov computation
-        fitter = NumpyFitter(alpha=1e-8, se_type=se_method)
+        fitter = NumpyFitter(alpha=1e-8, se_type="stata")
         
         vcov, vcov_meta, _ = fitter.fit_vcov(
             X=X,
@@ -383,21 +426,22 @@ class DuckLinearModel(DuckEstimator):
             weights=n,
             coefficients=self.point_estimate,
             cluster_ids=cluster_ids,
-            vcov_type=se_method,
+            vcov_spec=vcov_spec,
             coef_names=getattr(self, 'coef_names_', None),
             k_fe=k_fe,
             n_fe=n_fe,
             k_fe_nested=k_fe_nested,
             n_fe_fully_nested=n_fe_fully_nested,
-            ssc_dict=self.ssc_dict,
         )
 
         self.vcov = vcov
+        # Annotate meta with the SSC kfixef actually used, for inspection.
+        vcov_meta['ssc_kfixef'] = vcov_spec.ssc.kfixef if vcov_spec is not None else None
         self.vcov_meta = vcov_meta
-        self.se = vcov_meta.get('vcov_type_detail', se_method)
+        self.se = vcov_meta.get('vcov_type_detail', vcov_spec.vcov_detail)
         self._results = None
 
-    def _fit_vcov_duckdb(self, se_method: str = "HC1"):
+    def _fit_vcov_duckdb(self):
         """Compute vcov using DuckDB (out-of-core) backend"""
         # Option B fix: _get_vcov_fe_params() is called BEFORE the early-return
         # guard so the cached result is only reused when k_fe == 0 (no FE DOF
@@ -408,11 +452,14 @@ class DuckLinearModel(DuckEstimator):
         # without touching DuckDBFitter or any other module.
         k_fe, n_fe, k_fe_nested, n_fe_fully_nested = self._get_vcov_fe_params()
 
+        # Resolve vcov_spec: use stored spec or default to HC1
+        vcov_spec = self.vcov_spec if self.vcov_spec is not None else VcovSpec.build('HC1', None)
+
         # Only reuse the fitter's cached vcov when there are no absorbed FE
         # levels (DuckRegression / no-FE case).  For k_fe > 0 (DuckFE),
         # always recompute via fit_vcov() so the DOF correction is applied.
         if k_fe == 0 and self._fitter_result is not None and self._fitter_result.vcov is not None:
-            if self._fitter_result.se_type == se_method or se_method in self._fitter_result.se_type:
+            if self._fitter_result.se_type == vcov_spec.vcov_detail or vcov_spec.vcov_detail in self._fitter_result.se_type:
                 self.vcov = self._fitter_result.vcov
                 self.se = self._fitter_result.se_type
                 self._results = None
@@ -425,7 +472,7 @@ class DuckLinearModel(DuckEstimator):
         view_cols = self._get_view_columns()
         # k_fe, n_fe, k_fe_nested, n_fe_fully_nested already resolved above
         
-        duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type=se_method)
+        duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type="stata")
         vcov, vcov_meta, _ = duckdb_fitter.fit_vcov(
             table_name=self._COMPRESSED_VIEW,
             x_cols=x_cols,
@@ -434,17 +481,19 @@ class DuckLinearModel(DuckEstimator):
             add_intercept=self._needs_intercept_for_duckdb(),
             coefficients=self.point_estimate,
             cluster_col=cluster_col if cluster_col in view_cols else None,
-            vcov_type=se_method,
+            vcov_spec=vcov_spec,
             k_fe=k_fe,
             n_fe=n_fe,
             k_fe_nested=k_fe_nested,
             n_fe_fully_nested=n_fe_fully_nested,
-            ssc_dict=self.ssc_dict,
+            existing_result=self._fitter_result,
         )
 
         self.vcov = vcov
+        # Annotate meta with the SSC kfixef actually used, for inspection.
+        vcov_meta['ssc_kfixef'] = vcov_spec.ssc.kfixef if vcov_spec is not None else None
         self.vcov_meta = vcov_meta
-        self.se = vcov_meta.get('vcov_type_detail', se_method)
+        self.se = vcov_meta.get('vcov_type_detail', vcov_spec.vcov_detail)
         self._results = None
 
     # -------------------------------------------------------------------------

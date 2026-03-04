@@ -3,7 +3,6 @@ import pandas as pd
 import logging
 from typing import Tuple, Optional, List
 
-from ..core.demean import demean, _convert_to_int
 from ..utils.formula_parser import quote_identifier, cast_if_boolean, _make_sql_safe_name
 from .DuckLinearModel import DuckLinearModel
 
@@ -73,7 +72,7 @@ class DuckRegression(DuckLinearModel):
 
     def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, Optional[str]]:
         self._ensure_data_fetched()
-        return self.df_compressed, self.cluster_col
+        return self.df_compressed, self._effective_cluster_col
 
     def _build_agg_columns(self, outcome_vars, boolean_cols, unit_col):
         """Build aggregation column expressions."""
@@ -90,9 +89,10 @@ class DuckRegression(DuckLinearModel):
         
         select_parts, group_by_parts = self._build_strata_select_sql(boolean_cols, unit_col)
         
-        if self.cluster_col:
-            cluster_expr = f"CAST({self.cluster_col} AS SMALLINT)" if self.cluster_col in boolean_cols else self.cluster_col
-            select_parts.append(f"{cluster_expr} AS {self.cluster_col}")
+        eff_cluster = self._effective_cluster_col
+        if eff_cluster:
+            cluster_expr = f"CAST({eff_cluster} AS SMALLINT)" if eff_cluster in boolean_cols else eff_cluster
+            select_parts.append(f"{cluster_expr} AS {eff_cluster}")
             group_by_parts.append(cluster_expr)
         
         agg_parts = self._build_agg_columns(self.formula.outcomes, boolean_cols, unit_col)
@@ -129,7 +129,7 @@ class DuckRegression(DuckLinearModel):
         
         self._expected_cols = (
             strata_sql_names + 
-            ([self.cluster_col] if self.cluster_col else []) +
+            ([self._effective_cluster_col] if self._effective_cluster_col else []) +
             ["count"] + 
             [f"sum_{v.sql_name}" for v in self.formula.outcomes] + 
             [f"sum_{v.sql_name}_sq" for v in self.formula.outcomes]

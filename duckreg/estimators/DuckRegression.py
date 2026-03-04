@@ -3,7 +3,6 @@ import pandas as pd
 import logging
 from typing import Tuple, Optional, List
 
-from ..core.demean import demean, _convert_to_int
 from ..utils.formula_parser import quote_identifier, cast_if_boolean, _make_sql_safe_name
 from .DuckLinearModel import DuckLinearModel
 
@@ -130,7 +129,7 @@ class DuckRegression(DuckLinearModel):
         
         self._expected_cols = (
             strata_sql_names + 
-            ([self.cluster_col] if self.cluster_col else []) +
+            ([self._effective_cluster_col] if self._effective_cluster_col else []) +
             ["count"] + 
             [f"sum_{v.sql_name}" for v in self.formula.outcomes] + 
             [f"sum_{v.sql_name}_sq" for v in self.formula.outcomes]

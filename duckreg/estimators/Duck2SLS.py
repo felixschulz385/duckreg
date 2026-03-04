@@ -47,7 +47,8 @@ import pandas as pd
 
 from .base import DuckEstimator
 from ..core.transformers import MundlakTransformer, IterativeDemeanTransformer, AutoFETransformer
-from ..core.fitters import NumpyFitter, DuckDBFitter
+from ..core.fitters.numpy_fitter import NumpyFitter
+from ..core.fitters.duckdb_fitter import DuckDBFitter
 from ..core.vcov import VcovSpec
 from ..core.results import RegressionResults, FirstStageResults
 from ..utils.formula_parser import cast_if_boolean, quote_identifier
@@ -133,8 +134,10 @@ class Duck2SLS(DuckEstimator):
         self.n_jobs     = n_jobs
         self.subset     = subset
         self.method     = fe_method or method   # fe_method kept for compat
-        self.vcov_spec  = vcov_spec
-        self.ssc_dict   = vcov_spec.ssc.to_dict() if vcov_spec is not None else None
+        self.vcov_spec   = vcov_spec
+        self.ssc_dict    = vcov_spec.ssc.to_dict() if vcov_spec is not None else None
+        self.vcov_meta: Optional[Dict[str, Any]] = None
+        self.df_compressed: Optional[pd.DataFrame] = None
 
         if self.method not in ("mundlak", "demean", "auto_fe"):
             raise ValueError(
@@ -184,6 +187,7 @@ class Duck2SLS(DuckEstimator):
         self._demean_transformer:   Optional[IterativeDemeanTransformer] = None
         self._demean_result_table:  Optional[str]                        = None
         self._df_correction:        int                                  = 0
+        self._fe_nesting_cache:     Optional[Tuple[int, int]]            = None
 
         # Numpy-path arrays
         self._y:           Optional[np.ndarray] = None
@@ -214,6 +218,21 @@ class Duck2SLS(DuckEstimator):
         ):
             return self.vcov_spec.cluster_vars[0]
         return None
+
+    @property
+    def _cluster_staging_col(self) -> Optional[str]:
+        """Column name for the cluster variable as it appears in the staging table.
+
+        When the cluster variable is also a FE column it is present by its own
+        name. When it is a non-FE variable that was pulled in via the cluster
+        alias mechanism it lives under ``_CLUSTER_ALIAS`` (``__cluster__``).
+        """
+        eff = self._effective_cluster_col
+        if not eff:
+            return None
+        if eff in (self.fe_cols or []):
+            return eff
+        return self._CLUSTER_ALIAS
 
     @property
     def first_stage(self) -> Dict[str, FirstStageResults]:
@@ -419,7 +438,7 @@ class Duck2SLS(DuckEstimator):
         )
         exog_sql    = self._get_exog_sql()
         inst_sql    = self._get_inst_sql()
-        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+        cluster_col = self._cluster_staging_col
 
         # Transformer: adds Mundlak means of exog + instruments
         transformer = self._make_transformer(
@@ -558,7 +577,7 @@ class Duck2SLS(DuckEstimator):
         """
         exog_sql    = self._get_exog_sql()
         inst_sql    = self._get_inst_sql()
-        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+        cluster_col = self._cluster_staging_col
         x_sql       = exog_sql + inst_sql
 
         for endog_var in self.endogenous_vars:
@@ -626,7 +645,7 @@ class Duck2SLS(DuckEstimator):
         actual_endog_sql = [v.sql_name for v in self.formula.endogenous]
         outcome_sql      = [v.sql_name for v in self.formula.outcomes]
         inst_sql         = self._get_inst_sql()
-        cluster_col      = self._CLUSTER_ALIAS if self.cluster_col else None
+        cluster_col      = self._cluster_staging_col
 
         # Cache for downstream helpers
         self._exog_sql         = exog_sql
@@ -668,7 +687,7 @@ class Duck2SLS(DuckEstimator):
     def _create_compressed_view(self):
         """Create the compressed view for DuckDB-path estimation."""
         extra       = self._ss_transformer.extra_regressors
-        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+        cluster_col = self._cluster_staging_col
 
         # Group-by columns: X cols + instruments (for Z) + extra Mundlak cols
         group_cols = (
@@ -703,6 +722,9 @@ class Duck2SLS(DuckEstimator):
         ).fetchone()
         self.n_obs             = int(result[0]) if result[0] else 0
         self.n_compressed_rows = int(result[1]) if result[1] else 0
+        self.df_compressed = self.conn.execute(
+            f"SELECT * FROM {self._COMPRESSED_VIEW}"
+        ).fetchdf()
 
     def _setup_second_stage_demean(self):
         """Rebuild the demeaned staging view (with fitted columns) and populate
@@ -712,7 +734,7 @@ class Duck2SLS(DuckEstimator):
         actual_endog_sql = [v.sql_name for v in self.formula.endogenous]
         outcome_sql      = [v.sql_name for v in self.formula.outcomes]
         inst_sql         = self._get_inst_sql()
-        cluster_col      = self._CLUSTER_ALIAS if self.cluster_col else None
+        cluster_col      = self._cluster_staging_col
 
         # Cache for downstream helpers
         self._exog_sql         = exog_sql
@@ -764,7 +786,7 @@ class Duck2SLS(DuckEstimator):
         """Estimate second-stage coefficients via DuckDB (demean path, no intercept)."""
         x_sql       = self._exog_sql + self._fitted_endog_sql
         y_col       = self._outcome_sql[0]
-        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+        cluster_col = self._cluster_staging_col
         view        = f"{self._DEMEANED_STAGING}_fit"
 
         duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type="stata")
@@ -810,8 +832,9 @@ class Duck2SLS(DuckEstimator):
         residual_x  = self._exog_sql + self._actual_endog_sql
         z_cols      = self._exog_sql + self._inst_sql
         y_col       = self._outcome_sql[0]
-        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+        cluster_col = self._cluster_staging_col
         view        = f"{self._DEMEANED_STAGING}_fit"
+        k_fe_nested, n_fe_fully_nested = self._compute_fe_nesting()
 
         duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type=vcov_spec.vcov_detail)
         vcov, vcov_meta, _ = duckdb_fitter.fit_vcov(
@@ -827,8 +850,14 @@ class Duck2SLS(DuckEstimator):
             z_cols=z_cols,
             is_iv=True,
             k_fe=self._df_correction,
+            n_fe=len(self.fe_cols or []),
+            k_fe_nested=k_fe_nested,
+            n_fe_fully_nested=n_fe_fully_nested,
         )
         self.vcov        = vcov
+        self.vcov_spec   = vcov_spec
+        self.vcov_meta   = vcov_meta
+        self.ssc_dict    = vcov_spec.ssc.to_dict()
         self.se          = vcov_meta["vcov_type_detail"]
         self._n_clusters = vcov_meta.get("n_clusters")
         self._results    = None
@@ -912,7 +941,7 @@ class Duck2SLS(DuckEstimator):
             f"SELECT * FROM {self._ss_result_table}"
         ).fetchdf().dropna()
         n           = len(df)
-        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+        cluster_col = self._cluster_staging_col
 
         # Outcome
         self._y = df[self._outcome_sql[0]].values.reshape(-1, 1)
@@ -968,7 +997,7 @@ class Duck2SLS(DuckEstimator):
         extra       = self._ss_transformer.extra_regressors
         x_extra     = self._x_extra(extra)
         z_extra     = self._z_extra(extra)
-        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+        cluster_col = self._cluster_staging_col
 
         # Outcome
         self._y = df[self._outcome_sql[0]].values.reshape(-1, 1)
@@ -1020,7 +1049,7 @@ class Duck2SLS(DuckEstimator):
         x_sql       = self._exog_sql + self._fitted_endog_sql + x_extra
         residual_x  = self._exog_sql + self._actual_endog_sql + x_extra
         y_col       = f"sum_{self._outcome_sql[0]}"
-        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+        cluster_col = self._cluster_staging_col
 
         duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type="stata")
         self._fitter_result = duckdb_fitter.fit(
@@ -1052,11 +1081,74 @@ class Duck2SLS(DuckEstimator):
         else:
             self._fit_vcov_numpy(vcov_spec)
 
+    def _compute_fe_nesting(self) -> Tuple[int, int]:
+        """Compute (k_fe_nested, n_fe_fully_nested) for SSC kfixef='nonnested'.
+
+        Mirrors DuckFE._compute_fe_nesting: detects FE dimensions that are
+        fully nested within another FE dimension or within the cluster column.
+        Results are cached in ``_fe_nesting_cache`` so the DuckDB connection
+        only needs to be open on the first call (during fit_vcov).
+        """
+        if self._fe_nesting_cache is not None:
+            return self._fe_nesting_cache
+        if not self.fe_cols:
+            self._fe_nesting_cache = (0, 0)
+            return self._fe_nesting_cache
+
+        fe_cols     = self._resolve_fe_sql_names()
+        staging     = self._STAGING_TABLE
+        cluster_col = self._cluster_staging_col
+
+        k_fe_nested      = 0
+        n_fe_fully_nested = 0
+        already_nested   = set()
+
+        # (A) FE-to-FE nesting
+        if len(fe_cols) >= 2:
+            for i, fe_b in enumerate(fe_cols):
+                for j, fe_a in enumerate(fe_cols):
+                    if i == j:
+                        continue
+                    row = self.conn.execute(f"""
+                        SELECT MAX(cnt) AS max_a_per_b,
+                               COUNT(DISTINCT {fe_b}) AS n_levels_b
+                        FROM (
+                            SELECT {fe_b}, COUNT(DISTINCT {fe_a}) AS cnt
+                            FROM {staging} GROUP BY {fe_b}
+                        ) t
+                    """).fetchone()
+                    if row is not None and row[0] == 1:
+                        already_nested.add(i)
+                        k_fe_nested      += int(row[1]) if row[1] is not None else 0
+                        n_fe_fully_nested += 1
+                        break
+
+        # (B) FE-to-cluster nesting
+        if cluster_col:
+            for i, fe_b in enumerate(fe_cols):
+                if i in already_nested:
+                    continue
+                row = self.conn.execute(f"""
+                    SELECT MAX(cnt) AS max_c_per_b,
+                           COUNT(DISTINCT {fe_b}) AS n_levels_b
+                    FROM (
+                        SELECT {fe_b}, COUNT(DISTINCT {cluster_col}) AS cnt
+                        FROM {staging} GROUP BY {fe_b}
+                    ) t
+                """).fetchone()
+                if row is not None and row[0] == 1:
+                    n_fe_fully_nested += 1
+                    k_fe_nested       += int(row[1]) if row[1] is not None else 0
+
+        self._fe_nesting_cache = (k_fe_nested, n_fe_fully_nested)
+        return self._fe_nesting_cache
+
     def _fit_vcov_numpy(self, vcov_spec: VcovSpec = None):
         if self._X_actual is None or self._X_fitted is None or self._Z is None:
             raise RuntimeError("compress_data() must be called before fit_vcov()")
         if vcov_spec is None:
             vcov_spec = VcovSpec.build('HC1', None, is_iv=True)
+        k_fe_nested, n_fe_fully_nested = self._compute_fe_nesting()
         fitter = NumpyFitter(alpha=1e-8, se_type=vcov_spec.vcov_detail)
         vcov, vcov_meta, _ = fitter.fit_vcov(
             X=self._X_fitted,
@@ -1068,8 +1160,15 @@ class Duck2SLS(DuckEstimator):
             Z=self._Z,
             is_iv=True,
             residual_X=self._X_actual,
+            k_fe=self._df_correction,
+            n_fe=len(self.fe_cols or []),
+            k_fe_nested=k_fe_nested,
+            n_fe_fully_nested=n_fe_fully_nested,
         )
         self.vcov        = vcov
+        self.vcov_spec   = vcov_spec
+        self.vcov_meta   = vcov_meta
+        self.ssc_dict    = vcov_spec.ssc.to_dict()
         self.se          = vcov_meta["vcov_type_detail"]
         self._n_clusters = vcov_meta.get("n_clusters")
         self._results    = None
@@ -1094,7 +1193,7 @@ class Duck2SLS(DuckEstimator):
         residual_x = self._exog_sql + self._actual_endog_sql + x_extra
         y_col      = f"sum_{self._outcome_sql[0]}"
         z_cols     = self._exog_sql + self._inst_sql + z_extra
-        cluster_col = self._CLUSTER_ALIAS if self.cluster_col else None
+        cluster_col = self._cluster_staging_col
 
         duckdb_fitter = DuckDBFitter(conn=self.conn, alpha=1e-8, se_type=vcov_spec.vcov_detail)
         vcov, vcov_meta, _ = duckdb_fitter.fit_vcov(
@@ -1111,6 +1210,9 @@ class Duck2SLS(DuckEstimator):
             is_iv=True,
         )
         self.vcov        = vcov
+        self.vcov_spec   = vcov_spec
+        self.vcov_meta   = vcov_meta
+        self.ssc_dict    = vcov_spec.ssc.to_dict()
         self.se          = vcov_meta["vcov_type_detail"]
         self._n_clusters = vcov_meta.get("n_clusters")
         self._results    = None

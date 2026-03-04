@@ -1196,8 +1196,8 @@ def _bootstrap_iteration_iid(args: Tuple) -> Tuple[np.ndarray, float]:
     Tuple[np.ndarray, float]
         (coefficients, total weight)
     """
-    from ..core.fitters import wls
-    
+    from .fitters.duckdb_fitter import wls
+
     b, X, y, n, n_rows, seed = args
     rng = np.random.default_rng(seed)
     
@@ -1228,8 +1228,8 @@ def _bootstrap_iteration_cluster(args: Tuple) -> Tuple[np.ndarray, float]:
     Tuple[np.ndarray, float]
         (coefficients, total weight)
     """
-    from ..core.fitters import wls
-    
+    from .fitters.duckdb_fitter import wls
+
     b, X, y, n, group_idx, n_unique_groups, seed = args
     rng = np.random.default_rng(seed)
     

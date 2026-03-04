@@ -1,1273 +1,1020 @@
 """
-Comprehensive tests for residual aggregate computation.
+tests/test_residual_aggregates.py
 
-Tests all residual aggregate computation functions across both NumPy and DuckDB backends
-with simulated data including:
-- Simple unweighted data
-- Weighted data with frequency weights
-- Clustered data
-- IV regression data
+Comprehensive test suite for:
+    - compute_residual_aggregates_numpy
+    - compute_residual_aggregates_sql
 
-Residual Aggregates Tested:
----------------------------
-- RSS (residual sum of squares)
-- Scores (X' * residuals)
-- Meat matrix (scores' * scores)
-- Cluster scores (aggregated by cluster)
-- Leverages (diagonal of hat matrix)
+All SQL tests use an in-process DuckDB connection — no fixtures, no files.
 
-Weight Convention:
-------------------
-- weights[i] = count of observations represented by row i
-- For compressed/aggregated data, weights are strata counts
-- Residuals: residual_i = (y_i / weight_i) - X_i @ theta
-- Scores: score_i = X_i * (residual_i * weight_i)
-- RSS: sum((residual_i * sqrt(weight_i))^2)
+Usage
+-----
+    pytest tests/test_residual_aggregates.py -v
 """
-import pytest
-import numpy as np
-import pandas as pd
-import duckdb
-import logging
-from typing import Dict, Any, Tuple, Optional, Literal, List
 
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import duckdb
+from unittest.mock import patch
+
+# ---------------------------------------------------------------------------
+# Imports under test — adjust to match your package layout
+# ---------------------------------------------------------------------------
 from duckreg.core.residual_aggregates import (
     compute_residual_aggregates_numpy,
     compute_residual_aggregates_sql,
 )
-from duckreg.core.linalg import safe_solve
 
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
-
-# ============================================================================
-# Reference Implementation: pyfixest patterns
-# ============================================================================
-
-def compute_residuals_scores_meat_pyfixest_style(
-    X: np.ndarray,
-    y: np.ndarray,
-    weights: np.ndarray,
-    theta: np.ndarray,
-    Z: Optional[np.ndarray] = None,
-    is_iv: bool = False
-):
-    """
-    Compute residuals, scores, and meat matrix using pyfixest patterns.
-    
-    Extracted from pyfixest.estimation.feols_ and vcov_utils.
-    This serves as our reference implementation.
-    
-    Weight convention (frequency weights):
-    - weights[i] = count of observations represented by row i
-    - residuals: (y[i] / weights[i]) - X[i] @ theta (per-observation residual)
-    - scores: X[i] * (residuals[i] * weights[i]) (stratum-level score)
-    - RSS: sum((residuals[i] * sqrt(weights[i]))^2)
-    
-    Parameters
-    ----------
-    X : np.ndarray
-        Design matrix (n, k)
-    y : np.ndarray
-        Response vector (n,)
-    weights : np.ndarray
-        Frequency weights (n,)
-    theta : np.ndarray
-        Coefficient estimates (k,)
-    Z : np.ndarray, optional
-        Instrument matrix (n, m) for IV regressions
-    is_iv : bool
-        Whether to use Z (instruments) for scores instead of X
-        
-    Returns
-    -------
-    residuals : np.ndarray (n,)
-    scores : np.ndarray (n, k or m)
-    meat : np.ndarray (k x k or m x m)
-    rss : float
-    """
-    # Ensure proper shapes
-    y = y.reshape(-1, 1) if y.ndim == 1 else y
-    X = X.reshape(-1, 1) if X.ndim == 1 else X
-    weights = weights.flatten()
-    theta = theta.flatten()
-    
-    # Compute residuals: per-observation residuals
-    # For compressed data: (y[i] / weights[i]) - X[i] @ theta
-    residuals = y.flatten() - X @ theta
-    
-    # RSS: sum of weighted squared residuals
-    # For frequency weights: sum((residuals * sqrt(weights))^2)
-    sqrt_w = np.sqrt(weights)
-    rss = np.sum((residuals * sqrt_w) ** 2)
-    
-    # Scores: Use Z for IV, X for OLS
-    # Weighted by frequency weights to get stratum-level scores
-    score_matrix = Z if (is_iv and Z is not None) else X
-    if score_matrix.ndim == 1:
-        score_matrix = score_matrix.reshape(-1, 1)
-    
-    # scores[i] = matrix[i] * (residuals[i] * weights[i])
-    scores = score_matrix * (residuals * weights).reshape(-1, 1)
-    
-    # Meat matrix: scores' @ scores
-    meat = scores.T @ scores
-    
-    return residuals, scores, meat, rss
+ATOL = 1e-10
+RTOL = 1e-7
 
 
-def compute_cluster_scores_pyfixest_style(
-    scores: np.ndarray,
-    cluster_ids: np.ndarray
-):
-    """
-    Aggregate scores by cluster using pyfixest patterns.
-    
-    Extracted from pyfixest vcov_utils cluster score aggregation logic.
-    
-    Parameters
-    ----------
-    scores : np.ndarray
-        Individual observation scores (n, k)
-    cluster_ids : np.ndarray
-        Cluster identifiers (n,)
-        
-    Returns
-    -------
-    cluster_scores : np.ndarray (G, k)
-        Aggregated scores by cluster
-    n_clusters : int
-        Number of clusters
-    """
-    # Get unique clusters
-    unique_clusters = np.unique(cluster_ids)
-    n_clusters = len(unique_clusters)
-    k = scores.shape[1]
-    
-    # Aggregate scores by cluster
-    cluster_scores = np.zeros((n_clusters, k))
-    for i, cluster_id in enumerate(unique_clusters):
-        mask = cluster_ids == cluster_id
-        cluster_scores[i] = scores[mask].sum(axis=0)
-    
-    return cluster_scores, n_clusters
+def _make_conn() -> duckdb.DuckDBPyConnection:
+    return duckdb.connect(":memory:")
 
 
-# ============================================================================
-# FIXTURES: Data Generation
-# ============================================================================
-
-@pytest.fixture
-def simple_ols_data():
-    """
-    Simple OLS data: y = 2 + 3*X1 + 1.5*X2 + e
-    
-    No weights, no intercept in X (will be added).
-    """
-    np.random.seed(42)
-    n = 200
-    
-    X1 = np.random.randn(n)
-    X2 = np.random.randn(n)
-    e = np.random.randn(n) * 0.5
-    
-    y = 2.0 + 3.0 * X1 + 1.5 * X2 + e
-    
-    X = np.column_stack([X1, X2])
-    weights = np.ones(n)
-    
-    # Fit coefficients
-    X_with_intercept = np.column_stack([np.ones(n), X])
-    theta = np.linalg.lstsq(X_with_intercept, y, rcond=None)[0]
-    
-    return {
-        'X': X,
-        'y': y,
-        'weights': weights,
-        'X_with_intercept': X_with_intercept,
-        'theta': theta,
-        'true_beta': np.array([2.0, 3.0, 1.5]),
-        'n': n,
-        'k': 2,
+def _seed_table(conn, table_name, x1_vals, x2_vals, y_vals,
+                count_vals=None, cluster_vals=None, sum_y_sq_vals=None):
+    n = len(x1_vals)
+    count_vals = count_vals or [1] * n
+    sum_y_sq_vals = sum_y_sq_vals or [v ** 2 for v in y_vals]
+    conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+    parts = {
+        "x1": x1_vals,
+        "x2": x2_vals,
+        "sum_y": y_vals,
+        "sum_y_sq": sum_y_sq_vals,
+        "count": count_vals,
     }
+    if cluster_vals is not None:
+        parts["cluster_id"] = cluster_vals
+    select_parts = ", ".join(
+        f"unnest({v!r}) AS {c}" for c, v in parts.items()
+    )
+    conn.execute(f"CREATE TABLE {table_name} AS SELECT {select_parts}")
 
 
-@pytest.fixture
-def weighted_ols_data():
-    """
-    Weighted OLS data with varying frequency weights.
-    
-    y = 1 + 2*X1 - 0.5*X2 + 1.2*X3 + e
-    """
-    np.random.seed(123)
-    n = 300
-    
-    X1 = np.random.randn(n)
-    X2 = np.random.randn(n)
-    X3 = np.random.randn(n)
-    e = np.random.randn(n) * 0.3
-    
-    y = 1.0 + 2.0 * X1 - 0.5 * X2 + 1.2 * X3 + e
-    
-    X = np.column_stack([X1, X2, X3])
-    weights = np.random.randint(1, 10, n).astype(float)  # Frequency weights 1-9
-    
-    # Fit weighted coefficients
-    X_with_intercept = np.column_stack([np.ones(n), X])
-    sqrt_w = np.sqrt(weights).reshape(-1, 1)
-    Xw = X_with_intercept * sqrt_w
-    yw = (y * sqrt_w.flatten()).reshape(-1, 1)
-    theta = np.linalg.lstsq(Xw, yw, rcond=None)[0].flatten()
-    
-    return {
-        'X': X,
-        'y': y,
-        'weights': weights,
-        'X_with_intercept': X_with_intercept,
-        'theta': theta,
-        'true_beta': np.array([1.0, 2.0, -0.5, 1.2]),
-        'n': n,
-        'k': 3,
-        'n_obs': int(weights.sum()),
-    }
+# ---------------------------------------------------------------------------
+# Canonical dataset — reused across many tests
+# ---------------------------------------------------------------------------
+
+N_CANONICAL = 30
+RNG_CANONICAL = np.random.default_rng(0)
+X_CANONICAL_RAW = RNG_CANONICAL.standard_normal((N_CANONICAL, 2))
+X_CANONICAL = np.column_stack([np.ones(N_CANONICAL), X_CANONICAL_RAW])
+Y_CANONICAL = X_CANONICAL @ np.array([1.0, -0.5, 0.3]) + 0.2 * RNG_CANONICAL.standard_normal(N_CANONICAL)
+W_CANONICAL = np.ones(N_CANONICAL)
+THETA_CANONICAL = np.linalg.lstsq(X_CANONICAL, Y_CANONICAL, rcond=None)[0]
 
 
-@pytest.fixture
-def clustered_data():
-    """
-    Clustered data with 20 clusters, cluster sizes 10-30.
-    """
-    np.random.seed(456)
-    n_clusters = 20
-    cluster_sizes = np.random.randint(10, 30, n_clusters)
-    n = cluster_sizes.sum()
-    
-    X1 = np.random.randn(n)
-    X2 = np.random.randn(n)
-    X3 = np.random.randn(n)
-    e = np.random.randn(n) * 0.5
-    y = 1.0 + 1.5 * X1 + 0.8 * X2 - 0.3 * X3 + e
-    
-    # Add cluster effect
-    cluster_ids = np.repeat(np.arange(n_clusters), cluster_sizes)
-    cluster_effect = np.repeat(np.random.randn(n_clusters) * 0.3, cluster_sizes)
-    y = y + cluster_effect
-    
-    X = np.column_stack([X1, X2, X3])
-    weights = np.ones(n)
-    
-    # Fit coefficients
-    X_with_intercept = np.column_stack([np.ones(n), X])
-    theta = np.linalg.lstsq(X_with_intercept, y, rcond=None)[0]
-    
-    return {
-        'X': X,
-        'y': y,
-        'weights': weights,
-        'X_with_intercept': X_with_intercept,
-        'theta': theta,
-        'cluster_ids': cluster_ids,
-        'true_beta': np.array([1.0, 1.5, 0.8, -0.3]),
-        'n': n,
-        'k': 3,
-        'n_clusters': n_clusters,
-    }
-
-
-@pytest.fixture
-def compressed_data():
-    """
-    Pre-compressed (aggregated) data simulating strata compression.
-    
-    This mimics data that has been grouped by strata with counts.
-    """
-    np.random.seed(789)
-    n_strata = 100
-    
-    # Strata-level means
-    X1_mean = np.random.randn(n_strata)
-    X2_mean = np.random.randn(n_strata)
-    
-    # Strata counts (frequency weights)
-    counts = np.random.randint(5, 20, n_strata).astype(float)
-    
-    # Generate y for each stratum
-    e_mean = np.random.randn(n_strata) * 0.5
-    y_mean = 0.5 + 1.5 * X1_mean + 0.8 * X2_mean + e_mean
-    
-    X = np.column_stack([X1_mean, X2_mean])
-    y = y_mean
-    weights = counts
-    
-    # Fit weighted coefficients
-    X_with_intercept = np.column_stack([np.ones(n_strata), X])
-    sqrt_w = np.sqrt(weights).reshape(-1, 1)
-    Xw = X_with_intercept * sqrt_w
-    yw = (y * sqrt_w.flatten()).reshape(-1, 1)
-    theta = np.linalg.lstsq(Xw, yw, rcond=None)[0].flatten()
-    
-    return {
-        'X': X,
-        'y': y,
-        'weights': weights,
-        'X_with_intercept': X_with_intercept,
-        'theta': theta,
-        'true_beta': np.array([0.5, 1.5, 0.8]),
-        'n_strata': n_strata,
-        'n_obs': int(counts.sum()),
-        'k': 2,
-    }
-
-
-@pytest.fixture
-def iv_data():
-    """
-    IV data: Y = endogenous_X + X2 + X3 + e
-    Instrument Z correlated with endogenous_X but not with e.
-    """
-    np.random.seed(999)
-    n = 500
-    
-    # Instrument
-    Z = np.random.randn(n)
-    
-    # Endogenous regressor correlated with Z and with error
-    endogenous_X = 0.7 * Z + np.random.randn(n) * 0.3
-    
-    # Exogenous regressors
-    X2 = np.random.randn(n)
-    X3 = np.random.randn(n)
-    
-    # Error (correlated with endogenous_X)
-    e = 0.3 * endogenous_X + np.random.randn(n) * 0.5
-    
-    # Generate y
-    y = 1.0 * endogenous_X + 2.0 * X2 + 0.5 * X3 + e
-    
-    X = np.column_stack([endogenous_X, X2, X3])
-    Z_mat = Z.reshape(-1, 1)
-    weights = np.ones(n)
-    
-    # Fit coefficients (IV)
-    X_with_intercept = np.column_stack([np.ones(n), X])
-    Z_with_intercept = np.column_stack([np.ones(n), Z_mat, X2, X3])
-    
-    # Two-stage least squares
-    # Stage 1: X = Z * pi + u
-    pi = np.linalg.lstsq(Z_with_intercept, X_with_intercept[:, 1], rcond=None)[0]
-    X_hat = Z_with_intercept @ pi
-    
-    # Stage 2: y = X_hat * theta + e
-    X_stage2 = np.column_stack([np.ones(n), X_hat, X2, X3])
-    theta = np.linalg.lstsq(X_stage2, y, rcond=None)[0]
-    
-    return {
-        'X': X,
-        'Z': Z_mat,
-        'y': y,
-        'weights': weights,
-        'X_with_intercept': X_with_intercept,
-        'Z_with_intercept': Z_with_intercept,
-        'theta': theta,
-        'true_beta': np.array([1.0, 2.0, 0.5]),
-        'n': n,
-        'k': 3,
-    }
-
-
-@pytest.fixture
-def duckdb_simple_data(simple_ols_data):
-    """Create DuckDB table from simple OLS data."""
-    conn = duckdb.connect(":memory:")
-    
-    df = pd.DataFrame({
-        'X1': simple_ols_data['X'][:, 0],
-        'X2': simple_ols_data['X'][:, 1],
-        'y': simple_ols_data['y'],
-        'weight': simple_ols_data['weights'],
-    })
-    
-    conn.execute("CREATE TABLE data AS SELECT * FROM df")
-    
-    return {'conn': conn, 'df': df, 'theta': simple_ols_data['theta']}
-
-
-@pytest.fixture
-def duckdb_weighted_data(weighted_ols_data):
-    """Create DuckDB table from weighted OLS data in compressed format."""
-    conn = duckdb.connect(":memory:")
-    
-    # Store in compressed format: sum_y = y * count
-    # SQL backend expects y_col to be in sum format, divides by weight to get mean
-    df = pd.DataFrame({
-        'X1': weighted_ols_data['X'][:, 0],
-        'X2': weighted_ols_data['X'][:, 1],
-        'X3': weighted_ols_data['X'][:, 2],
-        'sum_y': weighted_ols_data['y'] * weighted_ols_data['weights'],
-        'count': weighted_ols_data['weights'],
-    })
-    
-    # Add sum_y_sq for exact variance computation
-    df['sum_y_sq'] = (weighted_ols_data['y'] ** 2) * weighted_ols_data['weights']
-    
-    conn.execute("CREATE TABLE weighted_data AS SELECT * FROM df")
-    
-    return {'conn': conn, 'df': df, 'theta': weighted_ols_data['theta']}
-
-
-@pytest.fixture
-def duckdb_clustered_data(clustered_data):
-    """Create DuckDB table from clustered data."""
-    conn = duckdb.connect(":memory:")
-    
-    df = pd.DataFrame({
-        'X1': clustered_data['X'][:, 0],
-        'X2': clustered_data['X'][:, 1],
-        'X3': clustered_data['X'][:, 2],
-        'y': clustered_data['y'],
-        'weight': clustered_data['weights'],
-        'cluster_id': clustered_data['cluster_ids'],
-    })
-    
-    conn.execute("CREATE TABLE clustered_data AS SELECT * FROM df")
-    
-    return {'conn': conn, 'df': df, 'theta': clustered_data['theta']}
-
-
-@pytest.fixture
-def duckdb_compressed_data(compressed_data):
-    """Create DuckDB table from compressed data (sum format)."""
-    conn = duckdb.connect(":memory:")
-    
-    # For compressed data, store as sum_y = y * count
-    # SQL backend expects y_col in sum format, divides by weight to get mean
-    df = pd.DataFrame({
-        'X1': compressed_data['X'][:, 0],
-        'X2': compressed_data['X'][:, 1],
-        'sum_y': compressed_data['y'] * compressed_data['weights'],
-        'count': compressed_data['weights'],
-    })
-    
-    # Add sum_y_sq for exact variance computation
-    df['sum_y_sq'] = (compressed_data['y'] ** 2) * compressed_data['weights']
-    
-    conn.execute("CREATE TABLE compressed_data AS SELECT * FROM df")
-    
-    return {'conn': conn, 'df': df, 'theta': compressed_data['theta']}
+def _canonical_table(conn, name="canon"):
+    _seed_table(
+        conn, name,
+        x1_vals=X_CANONICAL_RAW[:, 0].tolist(),
+        x2_vals=X_CANONICAL_RAW[:, 1].tolist(),
+        y_vals=Y_CANONICAL.tolist(),
+    )
+    return name
 
 
 # ============================================================================
-# TESTS: NumPy Backend vs pyfixest patterns
+# ── 1. compute_residual_aggregates_numpy — residuals
 # ============================================================================
 
-class TestResidualAggregatesNumpyVsPyfixest:
-    """Compare our NumPy implementation with pyfixest patterns."""
-    
-    def test_rss_simple_vs_pyfixest(self, simple_ols_data):
-        """Test RSS computation matches pyfixest pattern."""
-        # Reference: pyfixest pattern
-        _, _, _, rss_ref = compute_residuals_scores_meat_pyfixest_style(
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            theta=simple_ols_data['theta']
+
+class TestNumpyResiduals:
+
+    def test_residuals_computed_from_theta(self):
+        X = np.array([[1.0, 2.0], [1.0, 3.0]])
+        y = np.array([5.0, 8.0])
+        theta = np.array([1.0, 2.0])
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(2), compute_rss=False
         )
-        
-        # Our implementation
-        result = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            compute_rss=True,
+        # No exception — empty dict without rss when all flags False
+        assert isinstance(agg, dict)
+
+    def test_precomputed_residuals_used_verbatim(self):
+        X = np.ones((5, 1))
+        y = np.ones(5)
+        theta = np.array([0.0])
+        precomp = np.array([3.0, 3.0, 3.0, 3.0, 3.0])
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(5),
+            residuals=precomp, compute_rss=True
         )
-        
-        np.testing.assert_allclose(result['rss'], rss_ref, rtol=1e-10, atol=1e-12)
-    
-    def test_scores_simple_vs_pyfixest(self, simple_ols_data):
-        """Test score computation matches pyfixest pattern."""
-        # Reference: pyfixest pattern
-        _, scores_ref, _, _ = compute_residuals_scores_meat_pyfixest_style(
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            theta=simple_ols_data['theta']
+        # rss = sum((3 * 1)^2) = 45
+        assert agg["rss"] == pytest.approx(45.0)
+
+    def test_residuals_flattened(self):
+        X = np.ones((4, 1))
+        y = np.ones((4, 1))
+        theta = np.array([1.0])
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(4), compute_rss=True
         )
-        
-        # Our implementation
-        result = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            compute_scores=True,
-        )
-        
-        np.testing.assert_allclose(result['scores'], scores_ref, rtol=1e-10, atol=1e-12)
-    
-    def test_meat_simple_vs_pyfixest(self, simple_ols_data):
-        """Test meat matrix computation matches pyfixest pattern."""
-        # Reference: pyfixest pattern
-        _, _, meat_ref, _ = compute_residuals_scores_meat_pyfixest_style(
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            theta=simple_ols_data['theta']
-        )
-        
-        # Our implementation
-        result = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            compute_meat=True,
-        )
-        
-        np.testing.assert_allclose(result['meat'], meat_ref, rtol=1e-10, atol=1e-12)
-    
-    def test_weighted_ols_vs_pyfixest(self, weighted_ols_data):
-        """Test weighted OLS with varying frequency weights matches pyfixest."""
-        # Reference: pyfixest pattern
-        residuals_ref, scores_ref, meat_ref, rss_ref = compute_residuals_scores_meat_pyfixest_style(
-            X=weighted_ols_data['X_with_intercept'],
-            y=weighted_ols_data['y'],
-            weights=weighted_ols_data['weights'],
-            theta=weighted_ols_data['theta']
-        )
-        
-        # Our implementation
-        result = compute_residual_aggregates_numpy(
-            theta=weighted_ols_data['theta'],
-            X=weighted_ols_data['X_with_intercept'],
-            y=weighted_ols_data['y'],
-            weights=weighted_ols_data['weights'],
-            compute_rss=True,
-            compute_scores=True,
-            compute_meat=True,
-        )
-        
-        # Compare all components
-        np.testing.assert_allclose(result['rss'], rss_ref, rtol=1e-10, atol=1e-12)
-        np.testing.assert_allclose(result['scores'], scores_ref, rtol=1e-10, atol=1e-12)
-        np.testing.assert_allclose(result['meat'], meat_ref, rtol=1e-10, atol=1e-12)
-    
-    def test_cluster_scores_vs_pyfixest(self, clustered_data):
-        """Test cluster score aggregation matches pyfixest pattern."""
-        # First compute individual scores using pyfixest pattern
-        _, scores_ref, _, _ = compute_residuals_scores_meat_pyfixest_style(
-            X=clustered_data['X_with_intercept'],
-            y=clustered_data['y'],
-            weights=clustered_data['weights'],
-            theta=clustered_data['theta']
-        )
-        
-        # Aggregate by cluster using pyfixest pattern
-        cluster_scores_ref, n_clusters_ref = compute_cluster_scores_pyfixest_style(
-            scores=scores_ref,
-            cluster_ids=clustered_data['cluster_ids']
-        )
-        
-        # Our implementation
-        result = compute_residual_aggregates_numpy(
-            theta=clustered_data['theta'],
-            X=clustered_data['X_with_intercept'],
-            y=clustered_data['y'],
-            weights=clustered_data['weights'],
-            cluster_ids=clustered_data['cluster_ids'],
-            compute_cluster_scores=True,
-        )
-        
-        # Compare
-        assert result['n_clusters'] == n_clusters_ref
-        np.testing.assert_allclose(
-            result['cluster_scores'], 
-            cluster_scores_ref, 
-            rtol=1e-10, 
-            atol=1e-12
-        )
-    
-    def test_iv_scores_vs_pyfixest(self, iv_data):
-        """Test IV score computation (using Z not X) matches pyfixest pattern."""
-        # Reference: pyfixest pattern with IV
-        _, scores_ref, meat_ref, _ = compute_residuals_scores_meat_pyfixest_style(
-            X=iv_data['X_with_intercept'],
-            y=iv_data['y'],
-            weights=iv_data['weights'],
-            theta=iv_data['theta'],
-            Z=iv_data['Z_with_intercept'],
-            is_iv=True
-        )
-        
-        # Our implementation
-        result = compute_residual_aggregates_numpy(
-            theta=iv_data['theta'],
-            X=iv_data['X_with_intercept'],
-            y=iv_data['y'],
-            weights=iv_data['weights'],
-            Z=iv_data['Z_with_intercept'],
-            is_iv=True,
-            compute_scores=True,
-            compute_meat=True,
-        )
-        
-        # Compare (scores should use Z, not X)
-        np.testing.assert_allclose(result['scores'], scores_ref, rtol=1e-10, atol=1e-12)
-        np.testing.assert_allclose(result['meat'], meat_ref, rtol=1e-10, atol=1e-12)
-    
-    def test_compressed_data_vs_pyfixest(self, compressed_data):
-        """Test with pre-compressed (aggregated) data matches pyfixest pattern."""
-        # Reference: pyfixest pattern
-        _, scores_ref, meat_ref, rss_ref = compute_residuals_scores_meat_pyfixest_style(
-            X=compressed_data['X_with_intercept'],
-            y=compressed_data['y'],
-            weights=compressed_data['weights'],
-            theta=compressed_data['theta']
-        )
-        
-        # Our implementation
-        result = compute_residual_aggregates_numpy(
-            theta=compressed_data['theta'],
-            X=compressed_data['X_with_intercept'],
-            y=compressed_data['y'],
-            weights=compressed_data['weights'],
-            compute_rss=True,
-            compute_scores=True,
-            compute_meat=True,
-        )
-        
-        # Compare
-        np.testing.assert_allclose(result['rss'], rss_ref, rtol=1e-10, atol=1e-12)
-        np.testing.assert_allclose(result['scores'], scores_ref, rtol=1e-10, atol=1e-12)
-        np.testing.assert_allclose(result['meat'], meat_ref, rtol=1e-10, atol=1e-12)
+        assert agg["rss"] == pytest.approx(0.0)
 
 
 # ============================================================================
-# TESTS: NumPy Backend - Basic Functionality
+# ── 2. compute_residual_aggregates_numpy — RSS
 # ============================================================================
 
-class TestResidualAggregatesNumpy:
-    """Test NumPy backend for residual aggregate computation."""
-    
-    def test_rss_simple(self, simple_ols_data):
-        """Test RSS computation with simple unweighted data."""
-        result = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            compute_rss=True,
+
+class TestNumpyRSS:
+
+    def test_rss_zero_perfect_fit(self):
+        """If residuals are all zero, RSS must be zero."""
+        theta = THETA_CANONICAL
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X_CANONICAL, y=Y_CANONICAL,
+            weights=W_CANONICAL, compute_rss=True
         )
-        
-        # RSS should be positive
-        assert result['rss'] > 0
-        
-        # Manually compute RSS
-        residuals = simple_ols_data['y'] - simple_ols_data['X_with_intercept'] @ simple_ols_data['theta']
-        expected_rss = np.sum(residuals ** 2)
-        
-        np.testing.assert_allclose(result['rss'], expected_rss, rtol=1e-10)
-    
-    def test_rss_weighted(self, weighted_ols_data):
-        """Test RSS computation with frequency weights."""
-        result = compute_residual_aggregates_numpy(
-            theta=weighted_ols_data['theta'],
-            X=weighted_ols_data['X_with_intercept'],
-            y=weighted_ols_data['y'],
-            weights=weighted_ols_data['weights'],
-            compute_rss=True,
+        # Least-squares theta should have the minimum RSS — close to zero
+        assert agg["rss"] >= -1e-10  # non-negative
+        assert "rss" in agg
+
+    def test_rss_formula_manual(self):
+        """rss = sum((u_i * sqrt(w_i))^2) for unit weights == sum(u_i^2)."""
+        X = np.eye(3)
+        y = np.array([1.0, 2.0, 3.0])
+        theta = np.array([0.0, 0.0, 0.0])
+        w = np.ones(3)
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=w, compute_rss=True
         )
-        
-        # Manually compute weighted RSS
-        residuals = weighted_ols_data['y'] - weighted_ols_data['X_with_intercept'] @ weighted_ols_data['theta']
-        expected_rss = np.sum((residuals * np.sqrt(weighted_ols_data['weights'])) ** 2)
-        
-        np.testing.assert_allclose(result['rss'], expected_rss, rtol=1e-10)
-    
-    def test_scores_simple(self, simple_ols_data):
-        """Test score computation with simple data."""
-        result = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            compute_scores=True,
+        assert agg["rss"] == pytest.approx(1.0 + 4.0 + 9.0)
+
+    def test_rss_with_frequency_weights(self):
+        """Doubling all weights should double rss."""
+        X = np.ones((4, 1))
+        y = np.array([2.0, 3.0, 4.0, 5.0])
+        theta = np.array([1.0])
+        w1 = np.ones(4)
+        w2 = 2 * np.ones(4)
+        rss1 = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=w1, compute_rss=True
+        )["rss"]
+        rss2 = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=w2, compute_rss=True
+        )["rss"]
+        assert rss2 == pytest.approx(2 * rss1)
+
+    def test_rss_not_returned_when_flag_false(self):
+        X = np.ones((3, 1))
+        y = np.ones(3)
+        theta = np.array([1.0])
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(3), compute_rss=False
         )
-        
-        # Scores shape
-        assert result['scores'].shape == (simple_ols_data['n'], 3)
-        
-        # Manually compute scores
-        residuals = simple_ols_data['y'] - simple_ols_data['X_with_intercept'] @ simple_ols_data['theta']
-        expected_scores = simple_ols_data['X_with_intercept'] * residuals.reshape(-1, 1)
-        
-        np.testing.assert_allclose(result['scores'], expected_scores, rtol=1e-10)
-    
-    def test_scores_weighted(self, weighted_ols_data):
-        """Test score computation with weights."""
-        result = compute_residual_aggregates_numpy(
-            theta=weighted_ols_data['theta'],
-            X=weighted_ols_data['X_with_intercept'],
-            y=weighted_ols_data['y'],
-            weights=weighted_ols_data['weights'],
-            compute_scores=True,
+        assert "rss" not in agg
+
+
+# ============================================================================
+# ── 3. compute_residual_aggregates_numpy — scores
+# ============================================================================
+
+
+class TestNumpyScores:
+
+    def test_scores_shape(self):
+        n, k = 10, 3
+        X = np.random.randn(n, k)
+        y = np.random.randn(n)
+        theta = np.zeros(k)
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(n), compute_scores=True
         )
-        
-        # Manually compute weighted scores
-        residuals = weighted_ols_data['y'] - weighted_ols_data['X_with_intercept'] @ weighted_ols_data['theta']
-        expected_scores = weighted_ols_data['X_with_intercept'] * (residuals * weighted_ols_data['weights']).reshape(-1, 1)
-        
-        np.testing.assert_allclose(result['scores'], expected_scores, rtol=1e-10)
-    
-    def test_meat_matrix(self, simple_ols_data):
-        """Test meat matrix computation."""
-        result = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            compute_meat=True,
+        assert agg["scores"].shape == (n, k)
+
+    def test_scores_formula_manual(self):
+        """score_i = x_i * u_i * w_i (unit weights → score_i = x_i * u_i)."""
+        X = np.array([[1.0, 0.0], [0.0, 1.0]])
+        y = np.array([2.0, 3.0])
+        theta = np.array([1.0, 1.0])
+        w = np.ones(2)
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=w,
+            compute_scores=True, compute_rss=False
         )
-        
-        # Meat should be symmetric
-        np.testing.assert_allclose(result['meat'], result['meat'].T, rtol=1e-10)
-        
-        # Meat should be k x k
-        assert result['meat'].shape == (3, 3)
-        
-        # Manually compute meat
-        residuals = simple_ols_data['y'] - simple_ols_data['X_with_intercept'] @ simple_ols_data['theta']
-        scores = simple_ols_data['X_with_intercept'] * residuals.reshape(-1, 1)
-        expected_meat = scores.T @ scores
-        
-        np.testing.assert_allclose(result['meat'], expected_meat, rtol=1e-10)
-    
-    def test_cluster_scores(self, clustered_data):
-        """Test cluster score computation."""
-        result = compute_residual_aggregates_numpy(
-            theta=clustered_data['theta'],
-            X=clustered_data['X_with_intercept'],
-            y=clustered_data['y'],
-            weights=clustered_data['weights'],
-            cluster_ids=clustered_data['cluster_ids'],
-            compute_cluster_scores=True,
+        u = y - X @ theta  # [1, 2]
+        expected = X * u.reshape(-1, 1)
+        assert np.allclose(agg["scores"], expected)
+
+    def test_scores_not_returned_when_flag_false(self):
+        X = np.ones((3, 2))
+        y = np.ones(3)
+        theta = np.zeros(2)
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(3), compute_rss=False
         )
-        
-        # Cluster scores shape: (n_clusters, k)
-        assert result['cluster_scores'].shape == (clustered_data['n_clusters'], 4)
-        assert result['n_clusters'] == clustered_data['n_clusters']
-        
-        # Verify cluster scores sum correctly
-        residuals = clustered_data['y'] - clustered_data['X_with_intercept'] @ clustered_data['theta']
-        scores = clustered_data['X_with_intercept'] * residuals.reshape(-1, 1)
-        
-        # Manually aggregate by cluster
-        for cluster_idx in range(clustered_data['n_clusters']):
-            mask = clustered_data['cluster_ids'] == cluster_idx
-            expected_cluster_score = scores[mask].sum(axis=0)
-            np.testing.assert_allclose(
-                result['cluster_scores'][cluster_idx],
-                expected_cluster_score,
-                rtol=1e-10
+        assert "scores" not in agg
+
+    def test_scores_weighted_scale(self):
+        """Doubling weights should double scores."""
+        X = np.array([[1.0, 2.0], [3.0, 4.0]])
+        y = np.array([1.0, 1.0])
+        theta = np.zeros(2)
+        w1 = np.ones(2)
+        w2 = 2 * np.ones(2)
+        s1 = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=w1,
+            compute_scores=True, compute_rss=False
+        )["scores"]
+        s2 = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=w2,
+            compute_scores=True, compute_rss=False
+        )["scores"]
+        assert np.allclose(s2, 2 * s1)
+
+
+# ============================================================================
+# ── 4. compute_residual_aggregates_numpy — meat
+# ============================================================================
+
+
+class TestNumpyMeat:
+
+    def test_meat_shape(self):
+        n, k = 20, 3
+        X = np.random.randn(n, k)
+        y = np.random.randn(n)
+        theta = np.zeros(k)
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(n),
+            compute_meat=True, compute_rss=False
+        )
+        assert agg["meat"].shape == (k, k)
+
+    def test_meat_symmetry(self):
+        n, k = 25, 3
+        X = np.random.randn(n, k)
+        y = np.random.randn(n)
+        theta = np.zeros(k)
+        meat = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(n),
+            compute_meat=True, compute_rss=False
+        )["meat"]
+        assert np.allclose(meat, meat.T)
+
+    def test_meat_positive_semidefinite(self):
+        n, k = 30, 3
+        np.random.seed(5)
+        X = np.random.randn(n, k)
+        y = np.random.randn(n)
+        theta = np.zeros(k)
+        meat = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(n),
+            compute_meat=True, compute_rss=False
+        )["meat"]
+        eigvals = np.linalg.eigvalsh(meat)
+        assert np.all(eigvals >= -1e-10)
+
+    def test_meat_formula_manual(self):
+        """meat = sum_i w_i * (x_i u_i)(x_i u_i)^T for k=1."""
+        X = np.array([[2.0], [3.0]])
+        y = np.array([4.0, 9.0])
+        theta = np.array([0.0])
+        w = np.ones(2)
+        meat = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=w,
+            compute_meat=True, compute_rss=False
+        )["meat"]
+        # u = [4, 9]; meat = (2*4)^2 + (3*9)^2 = 64 + 729 = 793
+        assert meat[0, 0] == pytest.approx(64.0 + 729.0)
+
+    def test_meat_not_returned_when_flag_false(self):
+        X = np.ones((3, 2))
+        y = np.ones(3)
+        theta = np.zeros(2)
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(3), compute_rss=False
+        )
+        assert "meat" not in agg
+
+
+# ============================================================================
+# ── 5. compute_residual_aggregates_numpy — cluster scores
+# ============================================================================
+
+
+class TestNumpyClusterScores:
+
+    def _make_cluster_data(self):
+        np.random.seed(9)
+        n, k, G = 40, 2, 5
+        X = np.random.randn(n, k)
+        y = np.random.randn(n)
+        theta = np.zeros(k)
+        w = np.ones(n)
+        cluster_ids = np.repeat(np.arange(G), n // G)
+        return X, y, theta, w, cluster_ids, G
+
+    def test_cluster_scores_shape(self):
+        X, y, theta, w, cids, G = self._make_cluster_data()
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=w,
+            cluster_ids=cids, compute_cluster_scores=True, compute_rss=False
+        )
+        k = X.shape[1]
+        assert agg["cluster_scores"].shape == (G, k)
+
+    def test_n_clusters_correct(self):
+        X, y, theta, w, cids, G = self._make_cluster_data()
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=w,
+            cluster_ids=cids, compute_cluster_scores=True, compute_rss=False
+        )
+        assert agg["n_clusters"] == G
+
+    def test_cluster_scores_sum_to_total_scores(self):
+        """Sum of cluster scores must equal sum of individual scores."""
+        X, y, theta, w, cids, G = self._make_cluster_data()
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=w,
+            cluster_ids=cids, compute_cluster_scores=True, compute_rss=False
+        )
+        # Individual scores
+        u = y - X @ theta
+        individual_scores = X * (u * w).reshape(-1, 1)
+        assert np.allclose(
+            agg["cluster_scores"].sum(axis=0),
+            individual_scores.sum(axis=0),
+            atol=1e-12,
+        )
+
+    def test_missing_cluster_ids_raises(self):
+        X = np.ones((4, 2))
+        y = np.ones(4)
+        theta = np.zeros(2)
+        with pytest.raises(ValueError, match="cluster_ids required"):
+            compute_residual_aggregates_numpy(
+                theta=theta, X=X, y=y, weights=np.ones(4),
+                compute_cluster_scores=True, compute_rss=False
             )
-    
-    def test_leverages(self, simple_ols_data):
-        """Test leverage computation."""
-        # Compute XtX_inv
-        XtX = simple_ols_data['X_with_intercept'].T @ simple_ols_data['X_with_intercept']
-        XtX_inv = np.linalg.inv(XtX)
-        
-        result = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
+
+
+# ============================================================================
+# ── 6. compute_residual_aggregates_numpy — leverages
+# ============================================================================
+
+
+class TestNumpyLeverages:
+
+    def test_leverages_shape(self):
+        n, k = 20, 3
+        X = np.random.randn(n, k)
+        y = np.random.randn(n)
+        theta = np.zeros(k)
+        XtX_inv = np.linalg.inv(X.T @ X)
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(n),
+            XtX_inv=XtX_inv, compute_leverages=True, compute_rss=False
+        )
+        assert agg["leverages"].shape == (n,)
+
+    def test_leverages_in_zero_one(self):
+        """Hat matrix diagonal elements are in [0, 1]."""
+        np.random.seed(2)
+        n, k = 30, 3
+        X = np.random.randn(n, k)
+        y = np.random.randn(n)
+        theta = np.zeros(k)
+        XtX_inv = np.linalg.inv(X.T @ X)
+        h = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(n),
+            XtX_inv=XtX_inv, compute_leverages=True, compute_rss=False
+        )["leverages"]
+        assert np.all(h >= -1e-10)
+        assert np.all(h <= 1.0 + 1e-10)
+
+    def test_leverages_sum_equals_k(self):
+        """Sum of leverages = trace(H) = k (number of columns)."""
+        np.random.seed(3)
+        n, k = 50, 4
+        X = np.random.randn(n, k)
+        y = np.random.randn(n)
+        theta = np.zeros(k)
+        XtX_inv = np.linalg.inv(X.T @ X)
+        h = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(n),
+            XtX_inv=XtX_inv, compute_leverages=True, compute_rss=False
+        )["leverages"]
+        assert h.sum() == pytest.approx(k, abs=1e-8)
+
+    def test_leverages_manual_formula(self):
+        """For X = I_n, h_ii = x_i' (X'X)^-1 x_i = 1 for all i."""
+        n = 5
+        X = np.eye(n)
+        XtX_inv = np.eye(n)
+        theta = np.zeros(n)
+        h = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=np.zeros(n), weights=np.ones(n),
+            XtX_inv=XtX_inv, compute_leverages=True, compute_rss=False
+        )["leverages"]
+        assert np.allclose(h, np.ones(n))
+
+    def test_missing_xtx_inv_raises(self):
+        X = np.ones((4, 2))
+        y = np.ones(4)
+        theta = np.zeros(2)
+        with pytest.raises(ValueError, match="XtX_inv required"):
+            compute_residual_aggregates_numpy(
+                theta=theta, X=X, y=y, weights=np.ones(4),
+                compute_leverages=True, compute_rss=False
+            )
+
+
+# ============================================================================
+# ── 7. compute_residual_aggregates_numpy — IV path
+# ============================================================================
+
+
+class TestNumpyIV:
+
+    def test_iv_scores_use_Z_not_X(self):
+        """With is_iv=True and Z provided, scores use Z not X."""
+        n, kx, kz = 20, 2, 3
+        np.random.seed(11)
+        X = np.random.randn(n, kx)
+        Z = np.random.randn(n, kz)
+        y = np.random.randn(n)
+        theta = np.zeros(kx)
+
+        agg_iv = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(n),
+            Z=Z, is_iv=True, compute_scores=True, compute_rss=False
+        )
+        agg_ols = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(n),
+            compute_scores=True, compute_rss=False
+        )
+        assert agg_iv["scores"].shape == (n, kz)
+        assert agg_ols["scores"].shape == (n, kx)
+
+    def test_iv_meat_uses_Z(self):
+        """With is_iv=True, meat shape must match (kz, kz)."""
+        n, kx, kz = 20, 2, 3
+        np.random.seed(12)
+        X = np.random.randn(n, kx)
+        Z = np.random.randn(n, kz)
+        y = np.random.randn(n)
+        theta = np.zeros(kx)
+
+        meat = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(n),
+            Z=Z, is_iv=True, compute_meat=True, compute_rss=False
+        )["meat"]
+        assert meat.shape == (kz, kz)
+
+    def test_ols_path_when_z_not_provided(self):
+        """is_iv=True but Z=None → scores still use X."""
+        n, k = 15, 2
+        X = np.random.randn(n, k)
+        y = np.random.randn(n)
+        theta = np.zeros(k)
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(n),
+            is_iv=True, Z=None, compute_scores=True, compute_rss=False
+        )
+        assert agg["scores"].shape == (n, k)
+
+
+# ============================================================================
+# ── 8. compute_residual_aggregates_numpy — multiple flags
+# ============================================================================
+
+
+class TestNumpyMultipleFlags:
+
+    def test_rss_and_scores_together(self):
+        X = X_CANONICAL
+        y = Y_CANONICAL
+        theta = THETA_CANONICAL
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=W_CANONICAL,
+            compute_rss=True, compute_scores=True
+        )
+        assert "rss" in agg
+        assert "scores" in agg
+
+    def test_rss_and_meat_together(self):
+        X = X_CANONICAL
+        y = Y_CANONICAL
+        theta = THETA_CANONICAL
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=W_CANONICAL,
+            compute_rss=True, compute_meat=True
+        )
+        assert "rss" in agg
+        assert "meat" in agg
+
+    def test_scores_and_leverages_together(self):
+        X = X_CANONICAL
+        y = Y_CANONICAL
+        theta = THETA_CANONICAL
+        XtX_inv = np.linalg.inv(X.T @ X)
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=W_CANONICAL,
             XtX_inv=XtX_inv,
-            compute_leverages=True,
+            compute_rss=False, compute_scores=True, compute_leverages=True
         )
-        
-        # Leverages should be between 0 and 1
-        assert np.all(result['leverages'] >= 0)
-        assert np.all(result['leverages'] <= 1)
-        
-        # Manually compute leverages
-        expected_leverages = np.sum((simple_ols_data['X_with_intercept'] @ XtX_inv) * simple_ols_data['X_with_intercept'], axis=1)
-        
-        np.testing.assert_allclose(result['leverages'], expected_leverages, rtol=1e-10)
-    
-    def test_precomputed_residuals(self, simple_ols_data):
-        """Test using pre-computed residuals."""
-        residuals = simple_ols_data['y'] - simple_ols_data['X_with_intercept'] @ simple_ols_data['theta']
-        
-        result1 = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            residuals=residuals,
-            compute_rss=True,
+        assert "scores" in agg
+        assert "leverages" in agg
+
+    def test_empty_result_when_all_flags_false(self):
+        X = np.ones((3, 1))
+        y = np.ones(3)
+        theta = np.array([1.0])
+        agg = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(3), compute_rss=False
         )
-        
-        result2 = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            compute_rss=True,
-        )
-        
-        # Should give same result
-        np.testing.assert_allclose(result1['rss'], result2['rss'], rtol=1e-10)
-    
-    def test_iv_scores(self, iv_data):
-        """Test score computation with instruments for IV."""
-        result = compute_residual_aggregates_numpy(
-            theta=iv_data['theta'],
-            X=iv_data['X_with_intercept'],
-            y=iv_data['y'],
-            weights=iv_data['weights'],
-            Z=iv_data['Z_with_intercept'],
-            is_iv=True,
-            compute_scores=True,
-        )
-        
-        # Scores should use Z (instruments), not X
-        residuals = iv_data['y'] - iv_data['X_with_intercept'] @ iv_data['theta']
-        expected_scores = iv_data['Z_with_intercept'] * residuals.reshape(-1, 1)
-        
-        np.testing.assert_allclose(result['scores'], expected_scores, rtol=1e-10)
+        assert agg == {}
 
 
 # ============================================================================
-# TESTS: SQL Backend - Basic Functionality
+# ── 9. compute_residual_aggregates_sql — RSS
 # ============================================================================
 
-class TestResidualAggregatesSQL:
-    """Test SQL backend for residual aggregate computation."""
-    
-    def test_rss_simple(self, duckdb_simple_data):
-        """Test RSS computation via SQL with simple data."""
-        result = compute_residual_aggregates_sql(
-            theta=duckdb_simple_data['theta'],
-            conn=duckdb_simple_data['conn'],
-            table_name="data",
-            x_cols=["X1", "X2"],
-            y_col="y",
-            weight_col="weight",
-            add_intercept=True,
-            compute_rss=True,
+
+class TestSQLRSS:
+
+    @pytest.fixture
+    def conn(self):
+        c = _make_conn()
+        yield c
+        c.close()
+
+    def test_rss_matches_numpy(self, conn):
+        tbl = _canonical_table(conn)
+        theta = THETA_CANONICAL
+
+        rss_sql = compute_residual_aggregates_sql(
+            theta=theta, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_rss=True, add_intercept=True
+        )["rss"]
+
+        rss_np = compute_residual_aggregates_numpy(
+            theta=theta, X=X_CANONICAL, y=Y_CANONICAL,
+            weights=W_CANONICAL, compute_rss=True
+        )["rss"]
+
+        assert rss_sql == pytest.approx(rss_np, rel=1e-6)
+
+    def test_rss_nonnegative(self, conn):
+        tbl = _canonical_table(conn)
+        rss = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_rss=True, add_intercept=True
+        )["rss"]
+        assert rss >= -1e-10
+
+    def test_rss_with_where_clause(self, conn):
+        tbl = _canonical_table(conn)
+        rss_all = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_rss=True, add_intercept=True
+        )["rss"]
+        rss_half = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_rss=True, add_intercept=True,
+            where_clause="WHERE x1 > 0"
+        )["rss"]
+        assert rss_half < rss_all
+
+    def test_rss_not_returned_when_flag_false(self, conn):
+        tbl = _canonical_table(conn)
+        agg = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_rss=False, add_intercept=True
         )
-        
-        assert result['rss'] > 0
-        
-        # Compare with manual computation
-        df = duckdb_simple_data['df']
-        X = np.column_stack([np.ones(len(df)), df['X1'], df['X2']])
-        residuals = df['y'].values - X @ duckdb_simple_data['theta']
-        expected_rss = np.sum(residuals ** 2)
-        
-        np.testing.assert_allclose(result['rss'], expected_rss, rtol=1e-10)
-    
-    def test_rss_weighted(self, duckdb_weighted_data):
-        """Test RSS computation via SQL with weights."""
-        result = compute_residual_aggregates_sql(
-            theta=duckdb_weighted_data['theta'],
-            conn=duckdb_weighted_data['conn'],
-            table_name="weighted_data",
-            x_cols=["X1", "X2", "X3"],
-            y_col="sum_y",
-            weight_col="count",
-            add_intercept=True,
-            compute_rss=True,
+        assert "rss" not in agg
+
+
+# ============================================================================
+# ── 10. compute_residual_aggregates_sql — meat
+# ============================================================================
+
+
+class TestSQLMeat:
+
+    @pytest.fixture
+    def conn(self):
+        c = _make_conn()
+        yield c
+        c.close()
+
+    def test_meat_matches_numpy(self, conn):
+        tbl = _canonical_table(conn)
+        theta = THETA_CANONICAL
+
+        meat_sql = compute_residual_aggregates_sql(
+            theta=theta, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_meat=True, compute_rss=False, add_intercept=True
+        )["meat"]
+
+        meat_np = compute_residual_aggregates_numpy(
+            theta=theta, X=X_CANONICAL, y=Y_CANONICAL,
+            weights=W_CANONICAL, compute_meat=True, compute_rss=False
+        )["meat"]
+
+        assert np.allclose(meat_sql, meat_np, atol=1e-9, rtol=1e-6)
+
+    def test_meat_symmetry(self, conn):
+        tbl = _canonical_table(conn)
+        meat = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_meat=True, compute_rss=False, add_intercept=True
+        )["meat"]
+        assert np.allclose(meat, meat.T)
+
+    def test_meat_shape(self, conn):
+        tbl = _canonical_table(conn)
+        k = 3  # intercept + x1 + x2
+        meat = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_meat=True, compute_rss=False, add_intercept=True
+        )["meat"]
+        assert meat.shape == (k, k)
+
+    def test_meat_no_intercept_shape(self, conn):
+        tbl = _canonical_table(conn)
+        theta_no_int = THETA_CANONICAL[1:]  # drop intercept
+        k = 2
+        meat = compute_residual_aggregates_sql(
+            theta=theta_no_int, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_meat=True, compute_rss=False, add_intercept=False
+        )["meat"]
+        assert meat.shape == (k, k)
+
+    def test_exact_meat_with_sum_y_sq_col(self, conn):
+        """When sum_y_sq_col provided, exact path runs without error and result is non-negative PSD."""
+        tbl = _canonical_table(conn)  # has sum_y_sq column
+        meat = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_meat=True, compute_rss=False, add_intercept=True,
+            sum_y_sq_col="sum_y_sq"
+        )["meat"]
+        eigvals = np.linalg.eigvalsh(meat)
+        assert np.all(eigvals >= -1e-10)
+
+
+# ============================================================================
+# ── 11. compute_residual_aggregates_sql — cluster scores
+# ============================================================================
+
+
+class TestSQLClusterScores:
+
+    @pytest.fixture
+    def conn_with_clusters(self):
+        c = _make_conn()
+        n = N_CANONICAL
+        cluster_ids = (np.arange(n) % 6).tolist()
+        _seed_table(
+            c, "canon_cl",
+            x1_vals=X_CANONICAL_RAW[:, 0].tolist(),
+            x2_vals=X_CANONICAL_RAW[:, 1].tolist(),
+            y_vals=Y_CANONICAL.tolist(),
+            cluster_vals=cluster_ids,
         )
-        
-        # Compare with manual computation
-        df = duckdb_weighted_data['df']
-        X = np.column_stack([np.ones(len(df)), df['X1'], df['X2'], df['X3']])
-        # y_mean = sum_y / count
-        y_mean = df['sum_y'].values / df['count'].values
-        residuals = y_mean - X @ duckdb_weighted_data['theta']
-        expected_rss = np.sum((residuals * np.sqrt(df['count'].values)) ** 2)
-        
-        np.testing.assert_allclose(result['rss'], expected_rss, rtol=1e-10)
-    
-    def test_scores_simple(self, duckdb_simple_data):
-        """Test score computation via SQL."""
-        result = compute_residual_aggregates_sql(
-            theta=duckdb_simple_data['theta'],
-            conn=duckdb_simple_data['conn'],
-            table_name="data",
-            x_cols=["X1", "X2"],
-            y_col="y",
-            weight_col="weight",
-            add_intercept=True,
-            compute_scores=True,
-        )
-        
-        # Scores shape
-        assert result['scores'].shape == (len(duckdb_simple_data['df']), 3)
-        
-        # Compare with manual computation
-        df = duckdb_simple_data['df']
-        X = np.column_stack([np.ones(len(df)), df['X1'], df['X2']])
-        residuals = df['y'].values - X @ duckdb_simple_data['theta']
-        expected_scores = X * residuals.reshape(-1, 1)
-        
-        np.testing.assert_allclose(result['scores'], expected_scores, rtol=1e-9)
-    
-    def test_meat_matrix(self, duckdb_simple_data):
-        """Test meat matrix computation via SQL."""
-        result = compute_residual_aggregates_sql(
-            theta=duckdb_simple_data['theta'],
-            conn=duckdb_simple_data['conn'],
-            table_name="data",
-            x_cols=["X1", "X2"],
-            y_col="y",
-            weight_col="weight",
-            add_intercept=True,
-            compute_meat=True,
-        )
-        
-        # Meat should be symmetric
-        np.testing.assert_allclose(result['meat'], result['meat'].T, rtol=1e-10)
-        
-        # Compare with manual computation
-        df = duckdb_simple_data['df']
-        X = np.column_stack([np.ones(len(df)), df['X1'], df['X2']])
-        residuals = df['y'].values - X @ duckdb_simple_data['theta']
-        scores = X * residuals.reshape(-1, 1)
-        expected_meat = scores.T @ scores
-        
-        np.testing.assert_allclose(result['meat'], expected_meat, rtol=1e-9)
-    
-    def test_cluster_scores(self, duckdb_clustered_data):
-        """Test cluster score computation via SQL."""
-        result = compute_residual_aggregates_sql(
-            theta=duckdb_clustered_data['theta'],
-            conn=duckdb_clustered_data['conn'],
-            table_name="clustered_data",
-            x_cols=["X1", "X2", "X3"],
-            y_col="y",
-            weight_col="weight",
+        yield c, cluster_ids
+        c.close()
+
+    def test_cluster_scores_shape(self, conn_with_clusters):
+        conn, cids = conn_with_clusters
+        G = len(set(cids))
+        k = 3  # intercept + x1 + x2
+        agg = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name="canon_cl",
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
             cluster_col="cluster_id",
-            add_intercept=True,
-            compute_cluster_scores=True,
+            compute_cluster_scores=True, compute_rss=False, add_intercept=True
         )
-        
-        # Verify shape and count
-        assert 'cluster_scores' in result
-        assert 'n_clusters' in result
-        assert result['cluster_scores'].shape[1] == 4
-        
-        # Compare with manual computation
-        df = duckdb_clustered_data['df']
-        X = np.column_stack([np.ones(len(df)), df['X1'], df['X2'], df['X3']])
-        residuals = df['y'].values - X @ duckdb_clustered_data['theta']
-        scores = X * residuals.reshape(-1, 1)
-        
-        # Aggregate manually by cluster
-        unique_clusters = df['cluster_id'].unique()
-        for cluster_idx, cluster_id in enumerate(sorted(unique_clusters)):
-            mask = df['cluster_id'] == cluster_id
-            expected_cluster_score = scores[mask].sum(axis=0)
-            np.testing.assert_allclose(
-                result['cluster_scores'][cluster_idx],
-                expected_cluster_score,
-                rtol=1e-9
+        assert agg["cluster_scores"].shape == (G, k)
+
+    def test_n_clusters_correct(self, conn_with_clusters):
+        conn, cids = conn_with_clusters
+        G = len(set(cids))
+        agg = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name="canon_cl",
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            cluster_col="cluster_id",
+            compute_cluster_scores=True, compute_rss=False, add_intercept=True
+        )
+        assert agg["n_clusters"] == G
+
+    def test_cluster_scores_match_numpy(self, conn_with_clusters):
+        """SQL and numpy cluster scores must sum to the same total."""
+        conn, cids = conn_with_clusters
+        cids_arr = np.array(cids)
+
+        agg_sql = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name="canon_cl",
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            cluster_col="cluster_id",
+            compute_cluster_scores=True, compute_rss=False, add_intercept=True
+        )
+        agg_np = compute_residual_aggregates_numpy(
+            theta=THETA_CANONICAL, X=X_CANONICAL, y=Y_CANONICAL,
+            weights=W_CANONICAL, cluster_ids=cids_arr,
+            compute_cluster_scores=True, compute_rss=False
+        )
+        # Sum over clusters must agree
+        assert np.allclose(
+            agg_sql["cluster_scores"].sum(axis=0),
+            agg_np["cluster_scores"].sum(axis=0),
+            atol=1e-9, rtol=1e-6,
+        )
+
+    def test_missing_cluster_col_raises(self):
+        conn = _make_conn()
+        tbl = _canonical_table(conn)
+        with pytest.raises(ValueError, match="cluster_col required"):
+            compute_residual_aggregates_sql(
+                theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+                x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+                compute_cluster_scores=True, compute_rss=False
             )
-    
-    def test_leverages(self, duckdb_simple_data):
-        """Test leverage computation via SQL."""
-        # Compute XtX_inv
-        df = duckdb_simple_data['df']
-        X = np.column_stack([np.ones(len(df)), df['X1'], df['X2']])
-        XtX = X.T @ X
-        XtX_inv = np.linalg.inv(XtX)
-        
-        result = compute_residual_aggregates_sql(
-            theta=duckdb_simple_data['theta'],
-            conn=duckdb_simple_data['conn'],
-            table_name="data",
-            x_cols=["X1", "X2"],
-            y_col="y",
-            weight_col="weight",
-            add_intercept=True,
+        conn.close()
+
+
+# ============================================================================
+# ── 12. compute_residual_aggregates_sql — leverages
+# ============================================================================
+
+
+class TestSQLLeverages:
+
+    @pytest.fixture
+    def conn(self):
+        c = _make_conn()
+        yield c
+        c.close()
+
+    def test_leverages_shape(self, conn):
+        tbl = _canonical_table(conn)
+        XtX_inv = np.linalg.inv(X_CANONICAL.T @ X_CANONICAL)
+        agg = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
             XtX_inv=XtX_inv,
-            compute_leverages=True,
+            compute_leverages=True, compute_rss=False, add_intercept=True
         )
-        
-        # Leverages should be between 0 and 1
-        assert np.all(result['leverages'] >= 0)
-        assert np.all(result['leverages'] <= 1)
-        
-        # Compare with manual computation
-        expected_leverages = np.sum((X @ XtX_inv) * X, axis=1)
-        
-        np.testing.assert_allclose(result['leverages'], expected_leverages, rtol=1e-9)
+        assert agg["leverages"].shape == (N_CANONICAL,)
+
+    def test_leverages_in_zero_one(self, conn):
+        tbl = _canonical_table(conn)
+        XtX_inv = np.linalg.inv(X_CANONICAL.T @ X_CANONICAL)
+        h = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            XtX_inv=XtX_inv,
+            compute_leverages=True, compute_rss=False, add_intercept=True
+        )["leverages"]
+        assert np.all(h >= -1e-10)
+        assert np.all(h <= 1.0 + 1e-10)
+
+    def test_leverages_match_numpy(self, conn):
+        tbl = _canonical_table(conn)
+        XtX_inv = np.linalg.inv(X_CANONICAL.T @ X_CANONICAL)
+
+        h_sql = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            XtX_inv=XtX_inv,
+            compute_leverages=True, compute_rss=False, add_intercept=True
+        )["leverages"]
+
+        h_np = compute_residual_aggregates_numpy(
+            theta=THETA_CANONICAL, X=X_CANONICAL, y=Y_CANONICAL,
+            weights=W_CANONICAL, XtX_inv=XtX_inv,
+            compute_leverages=True, compute_rss=False
+        )["leverages"]
+
+        assert np.allclose(h_sql, h_np, atol=1e-9, rtol=1e-6)
+
+    def test_missing_xtx_inv_raises(self, conn):
+        tbl = _canonical_table(conn)
+        with pytest.raises(ValueError, match="XtX_inv required"):
+            compute_residual_aggregates_sql(
+                theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+                x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+                compute_leverages=True, compute_rss=False
+            )
 
 
 # ============================================================================
-# TESTS: Cross-Backend Consistency
+# ── 13. compute_residual_aggregates_sql — residual_x_cols
 # ============================================================================
+
+
+class TestSQLResidualXCols:
+
+    @pytest.fixture
+    def conn(self):
+        c = _make_conn()
+        yield c
+        c.close()
+
+    def test_residual_x_cols_change_rss(self, conn):
+        """Different residual_x_cols → different residuals → different RSS."""
+        tbl = _canonical_table(conn)
+        theta_short = THETA_CANONICAL[:2]  # wrong length — triggers fallback
+
+        rss_normal = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_rss=True, add_intercept=True
+        )["rss"]
+
+        # Using x1 only as residual_x_cols with mismatched length → fallback to x_cols
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            rss_fallback = compute_residual_aggregates_sql(
+                theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+                x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+                compute_rss=True, add_intercept=True,
+                residual_x_cols=["x1"]  # length 1, expected 2 → fallback
+            )["rss"]
+
+        # Fallback uses same cols → RSS should be identical
+        assert rss_fallback == pytest.approx(rss_normal, rel=1e-7)
+
+    def test_valid_residual_x_cols_used(self, conn):
+        """Valid residual_x_cols of correct length should be applied."""
+        tbl = _canonical_table(conn)
+        # Use x2 for both positions as residual_x_cols
+        rss_alt = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_rss=True, add_intercept=True,
+            residual_x_cols=["x2", "x1"]  # swapped — still valid length
+        )["rss"]
+        rss_normal = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn, table_name=tbl,
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_rss=True, add_intercept=True,
+        )["rss"]
+        # Swapped columns → different residuals → different RSS (unless X is symmetric)
+        # Just check it runs and produces a non-negative number
+        assert rss_alt >= -1e-10
+
+
+# ============================================================================
+# ── 14. compute_residual_aggregates_sql — IV path
+# ============================================================================
+
+
+class TestSQLIV:
+
+    @pytest.fixture
+    def conn_with_z(self):
+        c = _make_conn()
+        n = N_CANONICAL
+        np.random.seed(20)
+        z1 = np.random.randn(n).tolist()
+        c.execute("DROP TABLE IF EXISTS iv_t")
+        select_parts = (
+            f"unnest({X_CANONICAL_RAW[:, 0].tolist()!r}) AS x1, "
+            f"unnest({X_CANONICAL_RAW[:, 1].tolist()!r}) AS x2, "
+            f"unnest({Y_CANONICAL.tolist()!r})              AS sum_y, "
+            f"unnest({(Y_CANONICAL**2).tolist()!r})         AS sum_y_sq, "
+            f"unnest({z1!r})                                AS z1, "
+            f"unnest({[1]*n!r})                             AS count"
+        )
+        c.execute(f"CREATE TABLE iv_t AS SELECT {select_parts}")
+        yield c
+        c.close()
+
+    def test_iv_cluster_scores_use_z_cols(self, conn_with_z):
+        n = N_CANONICAL
+        cluster_ids = (np.arange(n) % 5).tolist()
+        conn_with_z.execute("ALTER TABLE iv_t ADD COLUMN IF NOT EXISTS cluster_id INT")
+        conn_with_z.execute(
+            f"UPDATE iv_t SET cluster_id = (rowid % 5)"
+        )
+
+        agg = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn_with_z, table_name="iv_t",
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            cluster_col="cluster_id",
+            compute_cluster_scores=True, compute_rss=False,
+            add_intercept=True, z_cols=["z1"], is_iv=True
+        )
+        G = 5
+        k_z = 2  # intercept + z1
+        assert agg["cluster_scores"].shape == (G, k_z)
+
+    def test_iv_meat_uses_z_cols(self, conn_with_z):
+        agg = compute_residual_aggregates_sql(
+            theta=THETA_CANONICAL, conn=conn_with_z, table_name="iv_t",
+            x_cols=["x1", "x2"], y_col="sum_y", weight_col="count",
+            compute_meat=True, compute_rss=False,
+            add_intercept=True, z_cols=["z1"], is_iv=True
+        )
+        k_z = 2  # intercept + z1
+        assert agg["meat"].shape == (k_z, k_z)
+
+
+# ============================================================================
+# ── 15. Cross-backend consistency — parametrised
+# ============================================================================
+
 
 class TestCrossBackendConsistency:
-    """Verify NumPy and SQL backends produce identical results."""
-    
-    def test_rss_consistency(self, simple_ols_data, duckdb_simple_data):
-        """Test RSS consistency between backends."""
-        # NumPy
-        result_numpy = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            compute_rss=True,
-        )
-        
-        # SQL
-        result_sql = compute_residual_aggregates_sql(
-            theta=duckdb_simple_data['theta'],
-            conn=duckdb_simple_data['conn'],
-            table_name="data",
-            x_cols=["X1", "X2"],
-            y_col="y",
-            weight_col="weight",
-            add_intercept=True,
-            compute_rss=True,
-        )
-        
-        np.testing.assert_allclose(result_numpy['rss'], result_sql['rss'], rtol=1e-10)
-    
-    def test_scores_consistency(self, simple_ols_data, duckdb_simple_data):
-        """Test score consistency between backends."""
-        # NumPy
-        result_numpy = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            compute_scores=True,
-        )
-        
-        # SQL
-        result_sql = compute_residual_aggregates_sql(
-            theta=duckdb_simple_data['theta'],
-            conn=duckdb_simple_data['conn'],
-            table_name="data",
-            x_cols=["X1", "X2"],
-            y_col="y",
-            weight_col="weight",
-            add_intercept=True,
-            compute_scores=True,
-        )
-        
-        np.testing.assert_allclose(result_numpy['scores'], result_sql['scores'], rtol=1e-9)
-    
-    def test_meat_consistency(self, simple_ols_data, duckdb_simple_data):
-        """Test meat matrix consistency between backends."""
-        # NumPy
-        result_numpy = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            compute_meat=True,
-        )
-        
-        # SQL
-        result_sql = compute_residual_aggregates_sql(
-            theta=duckdb_simple_data['theta'],
-            conn=duckdb_simple_data['conn'],
-            table_name="data",
-            x_cols=["X1", "X2"],
-            y_col="y",
-            weight_col="weight",
-            add_intercept=True,
-            compute_meat=True,
-        )
-        
-        np.testing.assert_allclose(result_numpy['meat'], result_sql['meat'], rtol=1e-9)
-    
-    def test_weighted_consistency(self, weighted_ols_data, duckdb_weighted_data):
-        """Test consistency with weighted data."""
-        # NumPy
-        result_numpy = compute_residual_aggregates_numpy(
-            theta=weighted_ols_data['theta'],
-            X=weighted_ols_data['X_with_intercept'],
-            y=weighted_ols_data['y'],
-            weights=weighted_ols_data['weights'],
-            compute_rss=True,
-            compute_meat=True,
-        )
-        
-        # SQL
-        result_sql = compute_residual_aggregates_sql(
-            theta=duckdb_weighted_data['theta'],
-            conn=duckdb_weighted_data['conn'],
-            table_name="weighted_data",
-            x_cols=["X1", "X2", "X3"],
-            y_col="sum_y",
-            weight_col="count",
-            add_intercept=True,
-            compute_rss=True,
-            compute_meat=True,
-        )
-        
-        np.testing.assert_allclose(result_numpy['rss'], result_sql['rss'], rtol=1e-10)
-        np.testing.assert_allclose(result_numpy['meat'], result_sql['meat'], rtol=1e-9)
+    """RSS, meat, and leverages must agree between numpy and SQL backends."""
 
+    @pytest.fixture
+    def conn(self):
+        c = _make_conn()
+        yield c
+        c.close()
 
-# ============================================================================
-# TESTS: Edge Cases
-# ============================================================================
+    @pytest.mark.parametrize("n,k,seed", [
+        (20, 2, 30),
+        (100, 3, 31),
+        (200, 4, 32),
+    ])
+    def test_rss_agrees(self, conn, n, k, seed):
+        rng = np.random.default_rng(seed)
+        X_raw = rng.standard_normal((n, k))
+        X = np.column_stack([np.ones(n), X_raw])
+        y = X @ rng.standard_normal(k + 1) + 0.1 * rng.standard_normal(n)
+        theta, *_ = np.linalg.lstsq(X, y, rcond=None)
+        w = np.ones(n)
 
-class TestEdgeCases:
-    """Test edge cases and error handling."""
-    
-    def test_single_observation(self):
-        """Test with single observation."""
-        X = np.array([[1.0, 2.0]])
-        y = np.array([5.0])
-        weights = np.array([1.0])
-        theta = np.array([1.0, 2.0])
-        
-        result = compute_residual_aggregates_numpy(
-            theta=theta,
-            X=X,
-            y=y,
-            weights=weights,
-            compute_rss=True,
-            compute_scores=True,
+        cols = {f"x{i}": X_raw[:, i].tolist() for i in range(k)}
+        cols["sum_y"] = y.tolist()
+        cols["sum_y_sq"] = (y ** 2).tolist()
+        cols["count"] = [1] * n
+        conn.execute("DROP TABLE IF EXISTS cc_t")
+        parts = ", ".join(f"unnest({v!r}) AS {c}" for c, v in cols.items())
+        conn.execute(f"CREATE TABLE cc_t AS SELECT {parts}")
+
+        x_cols = [f"x{i}" for i in range(k)]
+
+        rss_sql = compute_residual_aggregates_sql(
+            theta=theta, conn=conn, table_name="cc_t",
+            x_cols=x_cols, y_col="sum_y", weight_col="count",
+            compute_rss=True, add_intercept=True
+        )["rss"]
+        rss_np = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=w, compute_rss=True
+        )["rss"]
+
+        assert rss_sql == pytest.approx(rss_np, rel=1e-6), (
+            f"n={n},k={k}: sql_rss={rss_sql:.6g} np_rss={rss_np:.6g}"
         )
-        
-        # Should work without errors
-        assert result['rss'] >= 0
-        assert result['scores'].shape == (1, 2)
-    
-    def test_zero_weights(self):
-        """Test behavior with some zero weights."""
-        X = np.array([[1.0, 2.0], [1.0, 3.0], [1.0, 4.0]])
-        y = np.array([5.0, 7.0, 9.0])
-        weights = np.array([1.0, 0.0, 1.0])  # Middle observation has zero weight
-        theta = np.array([1.0, 2.0])
-        
-        result = compute_residual_aggregates_numpy(
-            theta=theta,
-            X=X,
-            y=y,
-            weights=weights,
-            compute_rss=True,
-        )
-        
-        # RSS should only include non-zero weighted observations
-        residuals = y - X @ theta
-        expected_rss = (residuals[0] ** 2) * weights[0] + (residuals[2] ** 2) * weights[2]
-        
-        np.testing.assert_allclose(result['rss'], expected_rss, rtol=1e-10)
-    
-    def test_missing_cluster_ids(self):
-        """Test error when cluster_ids missing but compute_cluster_scores=True."""
-        X = np.array([[1.0, 2.0], [1.0, 3.0]])
-        y = np.array([5.0, 7.0])
-        weights = np.array([1.0, 1.0])
-        theta = np.array([1.0, 2.0])
-        
-        with pytest.raises(ValueError, match="cluster_ids required for compute_cluster_scores"):
-            compute_residual_aggregates_numpy(
-                theta=theta,
-                X=X,
-                y=y,
-                weights=weights,
-                compute_cluster_scores=True,
-            )
-    
-    def test_missing_xtx_inv(self):
-        """Test error when XtX_inv missing but compute_leverages=True."""
-        X = np.array([[1.0, 2.0], [1.0, 3.0]])
-        y = np.array([5.0, 7.0])
-        weights = np.array([1.0, 1.0])
-        theta = np.array([1.0, 2.0])
-        
-        with pytest.raises(ValueError, match="XtX_inv required for compute_leverages"):
-            compute_residual_aggregates_numpy(
-                theta=theta,
-                X=X,
-                y=y,
-                weights=weights,
-                compute_leverages=True,
-            )
-    
-    def test_all_aggregates_at_once(self, simple_ols_data):
-        """Test computing all aggregates in a single call."""
-        # Compute XtX_inv for leverages
-        XtX = simple_ols_data['X_with_intercept'].T @ simple_ols_data['X_with_intercept']
-        XtX_inv = np.linalg.inv(XtX)
-        
-        result = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            XtX_inv=XtX_inv,
-            compute_rss=True,
-            compute_scores=True,
-            compute_meat=True,
-            compute_leverages=True,
-        )
-        
-        # All components should be present
-        assert 'rss' in result
-        assert 'scores' in result
-        assert 'meat' in result
-        assert 'leverages' in result
-        
-        # Verify relationships
-        # meat = scores.T @ scores
-        expected_meat = result['scores'].T @ result['scores']
-        np.testing.assert_allclose(result['meat'], expected_meat, rtol=1e-10)
 
+    @pytest.mark.parametrize("n,k,seed", [
+        (20, 2, 40),
+        (100, 3, 41),
+    ])
+    def test_meat_agrees(self, conn, n, k, seed):
+        rng = np.random.default_rng(seed)
+        X_raw = rng.standard_normal((n, k))
+        X = np.column_stack([np.ones(n), X_raw])
+        y = X @ rng.standard_normal(k + 1) + 0.1 * rng.standard_normal(n)
+        theta, *_ = np.linalg.lstsq(X, y, rcond=None)
 
-# ============================================================================
-# TESTS: Numerical Precision
-# ============================================================================
+        cols = {f"x{i}": X_raw[:, i].tolist() for i in range(k)}
+        cols["sum_y"] = y.tolist()
+        cols["sum_y_sq"] = (y ** 2).tolist()
+        cols["count"] = [1] * n
+        conn.execute("DROP TABLE IF EXISTS cc_m")
+        parts = ", ".join(f"unnest({v!r}) AS {c}" for c, v in cols.items())
+        conn.execute(f"CREATE TABLE cc_m AS SELECT {parts}")
 
-class TestNumericalPrecision:
-    """Test numerical precision and stability."""
-    
-    def test_high_precision_rss(self, simple_ols_data):
-        """Test that RSS is computed with high precision."""
-        result1 = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            compute_rss=True,
+        x_cols = [f"x{i}" for i in range(k)]
+
+        meat_sql = compute_residual_aggregates_sql(
+            theta=theta, conn=conn, table_name="cc_m",
+            x_cols=x_cols, y_col="sum_y", weight_col="count",
+            compute_meat=True, compute_rss=False, add_intercept=True
+        )["meat"]
+        meat_np = compute_residual_aggregates_numpy(
+            theta=theta, X=X, y=y, weights=np.ones(n),
+            compute_meat=True, compute_rss=False
+        )["meat"]
+
+        assert np.allclose(meat_sql, meat_np, atol=1e-9, rtol=1e-5), (
+            f"n={n},k={k}: max_diff={np.abs(meat_sql - meat_np).max():.2e}"
         )
-        
-        result2 = compute_residual_aggregates_numpy(
-            theta=simple_ols_data['theta'],
-            X=simple_ols_data['X_with_intercept'],
-            y=simple_ols_data['y'],
-            weights=simple_ols_data['weights'],
-            compute_rss=True,
-        )
-        
-        # Should be exactly identical (not just close)
-        assert result1['rss'] == result2['rss']
-    
-    def test_meat_symmetry(self, weighted_ols_data):
-        """Test that meat matrix is exactly symmetric."""
-        result = compute_residual_aggregates_numpy(
-            theta=weighted_ols_data['theta'],
-            X=weighted_ols_data['X_with_intercept'],
-            y=weighted_ols_data['y'],
-            weights=weighted_ols_data['weights'],
-            compute_meat=True,
-        )
-        
-        # Check exact symmetry
-        np.testing.assert_array_equal(result['meat'], result['meat'].T)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

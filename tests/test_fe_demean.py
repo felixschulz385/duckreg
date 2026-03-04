@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pyfixest as pf
 from duckreg import duckreg
+import duckdb
+from duckreg.core.transformers import IterativeDemeanTransformer
 
 
 # ── constants ─────────────────────────────────────────────────────────────────
@@ -244,18 +246,19 @@ def check_merged_fe(df, path, *, fitter, dr_fe_part, pf_fe_part, vcov="HC1"):
 # Coef / SE accuracy tests
 # ============================================================================
 
-# 8 deep-FE tests: 2 balance × 2 IV × 2 vcov (demean only)
+# 16 deep-FE tests: 2 fitters × 2 balance × 2 IV × 2 vcov (demean only)
 @pytest.mark.parametrize("panel_balance", ["balanced", "unbalanced"])
 @pytest.mark.parametrize("has_iv", [False, True])
 @pytest.mark.parametrize("vcov", ["HC1", "CRV1"])
+@pytest.mark.parametrize("fitter", ["numpy", "duckdb"])
 def test_fe_deep(
     balanced_df, balanced_path, unbalanced_df, unbalanced_path,
-    has_iv, vcov, panel_balance,
+    fitter, has_iv, vcov, panel_balance,
 ):
-    """3-way FE demean: stresses MAP convergence and panel balance."""
+    """3-way FE demean: stresses MAP convergence, panel balance, and both fitters."""
     df   = balanced_df   if panel_balance == "balanced" else unbalanced_df
     path = balanced_path if panel_balance == "balanced" else unbalanced_path
-    check_fe(df, path, fitter="numpy", has_iv=has_iv, fe_depth=3,
+    check_fe(df, path, fitter=fitter, has_iv=has_iv, fe_depth=3,
              vcov=vcov, panel_balance=panel_balance)
 
 
@@ -419,6 +422,34 @@ class TestSSCAutoSelection:
                     se_method="HC1", fe_method="demean", fitter="duckdb")
         assert m.ssc_dict == m.vcov_spec.ssc.to_dict()
 
+    def test_ssc_kfixef_affects_se_numerically(self, panel_data):
+        """kfixef='full' must give larger SE than kfixef='none' when kfe > 0."""
+        from duckreg.core.vcov import SSCConfig, VcovContext, compute_iid_vcov
+        from duckreg.core.linalg import safe_inv, safe_solve
+
+        rng = np.random.default_rng(1)
+        n, k, kfe, nfe = 600, 3, 55, 2
+        X = np.column_stack([np.ones(n), rng.standard_normal((n, k - 1))])
+        y = X @ np.array([1.0, 0.5, -0.3]) + rng.standard_normal(n)
+        XtX = X.T @ X
+        theta = safe_solve(XtX, X.T @ y)
+        XtXinv = safe_inv(XtX, use_pinv=True)
+        rss = float(((y - X @ theta) ** 2).sum())
+
+        ctx = VcovContext(N=n, k=k, kfe=kfe, nfe=nfe)
+        cfg_none = SSCConfig.from_dict(
+            {'kadj': True, 'kfixef': 'none', 'Gadj': False, 'Gdf': 'conventional'})
+        cfg_full = SSCConfig.from_dict(
+            {'kadj': True, 'kfixef': 'full', 'Gadj': False, 'Gdf': 'conventional'})
+
+        vcov_none, _ = compute_iid_vcov(XtXinv, rss, ctx, cfg_none)
+        vcov_full, _ = compute_iid_vcov(XtXinv, rss, ctx, cfg_full)
+        se_none = np.sqrt(np.diag(vcov_none))
+        se_full = np.sqrt(np.diag(vcov_full))
+        assert np.all(se_full > se_none), (
+            "kfixef='full' must inflate SE relative to kfixef='none' when kfe > 0"
+        )
+
 
 # ============================================================================
 # TestCompressionCorrectness — nobs and round_strata (demean)
@@ -460,6 +491,143 @@ class TestCompressionCorrectness:
                 "not the residual or score computation."
             )
         )
+
+    def test_df_compressed_structure(self, panel_data):
+        """After fitting, df_compressed must contain the standard aggregation columns."""
+        m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
+                    se_method="iid", fe_method="demean", fitter="duckdb")
+        for col in ("count", "sum_y", "sum_y_sq"):
+            assert col in m.df_compressed.columns, f"Missing column: {col!r}"
+        assert m.df_compressed["count"].sum() == len(panel_data)
+
+
+# ============================================================================
+# TestDemeanConvergence — IterativeDemeanTransformer edge cases
+# ============================================================================
+
+class TestDemeanConvergence:
+    """Direct tests for IterativeDemeanTransformer convergence behaviour."""
+
+    def _make_conn(self) -> duckdb.DuckDBPyConnection:
+        """Fresh DuckDB connection with a small **unbalanced** panel.
+
+        An unbalanced panel is needed so that MAP (alternating projections)
+        requires more than one iteration to converge.  The balanced case
+        converges in a single pass (round-trip error < 1e-16).
+        """
+        rng = np.random.default_rng(5)
+        n_units, n_periods = 20, 10
+        n = n_units * n_periods
+        df = pd.DataFrame({
+            "x1":   rng.standard_normal(n),
+            "x2":   rng.standard_normal(n),
+            "y":    rng.standard_normal(n),
+            "unit": np.repeat(np.arange(n_units), n_periods),
+            "year": np.tile(np.arange(n_periods), n_units),
+        })
+        # Drop ~30 % of rows to make the panel unbalanced; MAP then needs
+        # multiple sweeps before the within-group means stabilise.
+        drop_mask = rng.random(len(df)) < 0.30
+        df = df[~drop_mask].reset_index(drop=True)
+        conn = duckdb.connect()
+        conn.register("panel", df)
+        return conn
+
+    def _transformer(self, conn, max_iterations=1000, tolerance=1e-8):
+        return IterativeDemeanTransformer(
+            conn=conn,
+            table_name="panel",
+            fe_cols=["unit", "year"],
+            remove_singletons=False,
+            max_iterations=max_iterations,
+            tolerance=tolerance,
+        )
+
+    def test_n_iterations_set_after_fit(self):
+        """n_iterations must be a positive integer after fit_transform."""
+        conn = self._make_conn()
+        t = self._transformer(conn)
+        t.fit_transform(["x1", "x2", "y"])
+        assert t.n_iterations is not None
+        assert t.n_iterations >= 1
+        conn.close()
+
+    def test_tight_tolerance_uses_more_iterations(self):
+        """Tighter convergence tolerance requires ≥ iterations than a loose one."""
+        conn_loose = self._make_conn()
+        conn_tight = self._make_conn()
+        t_loose = self._transformer(conn_loose, max_iterations=500, tolerance=1e-2)
+        t_tight = self._transformer(conn_tight, max_iterations=500, tolerance=1e-7)
+        t_loose.fit_transform(["x1", "x2", "y"])
+        t_tight.fit_transform(["x1", "x2", "y"])
+        assert t_tight.n_iterations >= t_loose.n_iterations, (
+            f"Expected tight ({t_tight.n_iterations}) ≥ loose ({t_loose.n_iterations}) iterations"
+        )
+        conn_loose.close()
+        conn_tight.close()
+
+    def test_max_iterations_exceeded_warns(self, caplog):
+        """Setting max_iterations=1 on a two-way panel must trigger a convergence warning."""
+        caplog.set_level(logging.WARNING)
+        conn = self._make_conn()
+        t = self._transformer(conn, max_iterations=1, tolerance=1e-12)
+        t.fit_transform(["x1", "x2", "y"])
+        assert any("MAP did not converge" in r.message for r in caplog.records), (
+            "Expected convergence warning when max_iterations is exhausted"
+        )
+        assert t.n_iterations == 1
+        conn.close()
+
+
+# ============================================================================
+# TestSingletonRemovalDemean — remove_singletons for iterative-demean FE
+# ============================================================================
+
+class TestSingletonRemovalDemean:
+    """Verify singleton group removal for DuckFE (demean method)."""
+
+    @pytest.fixture(scope="class")
+    def singleton_path(self, tmp_path_factory):
+        """Balanced panel (6 units × 5 years) plus one singleton unit (99)."""
+        rng = np.random.default_rng(13)
+        rows = [
+            {"unit": u, "year": t,
+             "x": float(rng.standard_normal()),
+             "y": float(rng.standard_normal())}
+            for u in range(6) for t in range(5)
+        ]
+        rows.append({"unit": 99, "year": 0,
+                     "x": float(rng.standard_normal()),
+                     "y": float(rng.standard_normal())})
+        df = pd.DataFrame(rows)
+        path = str(tmp_path_factory.mktemp("demean_singleton") / "data.parquet")
+        df.to_parquet(path)
+        return path, len(df)  # 31 rows
+
+    def test_removes_singleton_by_default(self, singleton_path):
+        path, total = singleton_path
+        m = duckreg("y ~ x | unit", data=path, fe_method="demean",
+                    fitter="numpy", se_method="none")
+        assert m.n_obs == total - 1
+
+    def test_keeps_singletons_when_disabled(self, singleton_path):
+        path, total = singleton_path
+        m = duckreg("y ~ x | unit", data=path, fe_method="demean",
+                    fitter="numpy", se_method="none", remove_singletons=False)
+        assert m.n_obs == total
+
+    def test_nrows_dropped_attribute_is_one(self, singleton_path):
+        path, _ = singleton_path
+        m = duckreg("y ~ x | unit", data=path, fe_method="demean",
+                    fitter="numpy", se_method="none")
+        assert m.n_rows_dropped_singletons == 1
+
+    def test_estimation_succeeds_after_removal(self, singleton_path):
+        path, _ = singleton_path
+        m = duckreg("y ~ x | unit", data=path, fe_method="demean",
+                    fitter="numpy", se_method="HC1")
+        assert m.point_estimate is not None
+        assert m.vcov is not None
 
 
 if __name__ == "__main__":

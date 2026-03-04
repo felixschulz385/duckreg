@@ -425,6 +425,25 @@ class TestNumpyFitterVcov:
         vcov, _, _ = self._fit_vcov(simple, 'HC1')
         assert np.all(np.diag(vcov) > 0)
 
+    def test_weighted_coef_differs_from_ols(self, weighted):
+        """Weighted OLS must give different coefs than unweighted on the same data."""
+        fitter = NumpyFitter()
+        w_ones = np.ones(len(weighted['y']))
+        res_unw = fitter.fit(weighted['X'], weighted['y'], w_ones)
+        res_w   = fitter.fit(weighted['X'], weighted['y'], weighted['w'])
+        assert not np.allclose(
+            res_unw.coefficients.flatten(),
+            res_w.coefficients.flatten(),
+            rtol=1e-3,
+        ), "Weighted and unweighted OLS agree — weights may be ignored."
+
+    def test_weighted_vcov_is_psd(self, weighted):
+        """VCov from weighted HC1 must be symmetric and positive semi-definite."""
+        vcov, _, _ = self._fit_vcov(weighted, 'HC1')
+        np.testing.assert_allclose(vcov, vcov.T, atol=1e-12)
+        eigvals = np.linalg.eigvalsh(vcov)
+        assert np.all(eigvals >= -1e-10), "Weighted HC1 VCov is not PSD"
+
 
 # ============================================================================
 # G. TestDuckDBFitterVcov
@@ -598,6 +617,78 @@ class TestVcovVsPyfixest:
                                    vcov={'CRV1': 'cluster'}).values[1:]
         np.testing.assert_allclose(our_se, ref_se, rtol=1e-3,
                                    err_msg="CRV1 SE mismatch vs pyfixest")
+
+    # ── HC2 ────────────────────────────────────────────────────────────────
+
+    def test_hc2_parity(self, simple):
+        """HC2 (leverage-corrected) SEs must match pyfixest to 0.1%."""
+        X, y, n, k = simple['X'], simple['y'], simple['n'], simple['k']
+        df = pd.DataFrame(X[:, 1:], columns=['x1', 'x2', 'x3'])
+        df['y'] = y
+        theta, XtXinv, resid, _ = ols(X, y)
+        ssc_dict = {'kadj': True, 'kfixef': 'full',
+                    'Gadj': True, 'Gdf': 'conventional'}
+        vcov, _, _ = compute_vcov_dispatch(
+            X=X, y=y.reshape(-1, 1), weights=simple['w'],
+            coefficients=theta, residuals=resid,
+            XtXinv=XtXinv, vcov_type='HC2',
+            cluster_ids=None, ssc_dict=ssc_dict,
+        )
+        our_se = np.sqrt(np.diag(vcov))[1:]
+        ref_se = self._pyfixest_se(df, 'y ~ x1 + x2 + x3', vcov='HC2').values[1:]
+        np.testing.assert_allclose(our_se, ref_se, rtol=1e-3,
+                                   err_msg="HC2 SE mismatch vs pyfixest")
+
+
+# ============================================================================
+# I. TestCompressionStructure — DuckRegression (no FE) compression properties
+# ============================================================================
+
+class TestCompressionStructure:
+    """Verify that DuckRegression (no FE) builds df_compressed correctly."""
+
+    def test_required_columns_present(self, balanced_path):
+        """df_compressed must contain count, sum_<outcome>, and sum_<outcome>_sq."""
+        m = duckreg("modis_median ~ ntl_harm + exog_control",
+                    data=balanced_path, round_strata=3, se_method="none")
+        for col in ("count", "sum_modis_median", "sum_modis_median_sq"):
+            assert col in m.df_compressed.columns, f"Missing column: {col!r}"
+
+    def test_count_sums_to_n(self, balanced_df, balanced_path):
+        """Sum of count column must equal the number of original rows."""
+        m = duckreg("modis_median ~ ntl_harm + exog_control",
+                    data=balanced_path, round_strata=3, se_method="none")
+        assert m.df_compressed["count"].sum() == len(balanced_df)
+
+    def test_higher_precision_more_strata(self, balanced_path):
+        """round_strata=5 must yield at least as many strata as round_strata=3."""
+        m3 = duckreg("modis_median ~ ntl_harm + exog_control",
+                     data=balanced_path, round_strata=3, se_method="none")
+        m5 = duckreg("modis_median ~ ntl_harm + exog_control",
+                     data=balanced_path, round_strata=5, se_method="none")
+        assert len(m5.df_compressed) >= len(m3.df_compressed)
+
+    def test_agg_query_is_valid_sql(self, balanced_path):
+        """agg_query attribute must be a non-empty SQL string."""
+        m = duckreg("modis_median ~ ntl_harm + exog_control",
+                    data=balanced_path, round_strata=3, se_method="none")
+        assert hasattr(m, "agg_query") and isinstance(m.agg_query, str)
+        q = m.agg_query.upper()
+        assert "SELECT" in q and "GROUP BY" in q
+
+    def test_cluster_column_preserved(self, balanced_path):
+        """When CRV1 is requested the cluster column must survive into df_compressed."""
+        m = duckreg("modis_median ~ ntl_harm + exog_control",
+                    data=balanced_path, round_strata=3,
+                    se_method={"CRV1": "country"})
+        assert "country" in m.df_compressed.columns
+
+    def test_remove_singletons_no_op_without_fe(self, balanced_df, balanced_path):
+        """remove_singletons=True must have no effect on a pooled OLS model."""
+        m = duckreg("modis_median ~ ntl_harm",
+                    data=balanced_path, round_strata=3, se_method="none",
+                    remove_singletons=True)
+        assert m.n_obs == len(balanced_df)
 
 
 if __name__ == "__main__":

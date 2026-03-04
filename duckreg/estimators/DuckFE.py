@@ -607,11 +607,10 @@ class DuckFE(DuckLinearModel):
         active = getattr(self._transformer, "_active_transformer", self._transformer)
         n_fe = len(active.fe_cols) if active is not None else len(self._transformer.fe_cols)
 
-        # Key fix: always return k_fe and n_fe; only gate nesting on clustering
+        # Always compute nesting regardless of SE method, as it affects DOF
         k_fe_nested = 0
         n_fe_fully_nested = 0
-        if is_clustered:
-            k_fe_nested, n_fe_fully_nested = self._compute_fe_nesting()
+        k_fe_nested, n_fe_fully_nested = self._compute_fe_nesting()
 
         return (
             self._transformer.df_correction,  # k_fe

@@ -16,9 +16,10 @@ import pandas as pd
 import logging
 from typing import Tuple, Optional, List, Dict, Any
 
-from ..core.demean import demean, _convert_to_int
 from .base import DuckEstimator, SEMethod
-from ..core.fitters import wls, NumpyFitter, DuckDBFitter, FitterResult
+from ..core.fitters.base import FitterResult
+from ..core.fitters.numpy_fitter import NumpyFitter
+from ..core.fitters.duckdb_fitter import DuckDBFitter, wls
 from ..utils.formula_parser import cast_if_boolean, needs_quoting, quote_identifier, _make_sql_safe_name
 
 # Import from refactored modules - Single Responsibility Principle
@@ -320,6 +321,16 @@ class DuckLinearModel(DuckEstimator):
         )
         
         self._update_coef_names()
+
+        # Populate df_compressed for downstream inspection / vcov helpers.
+        # This is a best-effort fetch; if the connection is already closed or
+        # the view no longer exists the attribute stays None.
+        if not getattr(self, '_data_fetched', False):
+            try:
+                self._ensure_data_fetched()
+            except Exception:
+                pass
+
         return self._fitter_result.coefficients
     
     def _get_y_col_for_duckdb(self) -> str:
@@ -388,7 +399,7 @@ class DuckLinearModel(DuckEstimator):
     # Variance-covariance
     # -------------------------------------------------------------------------
 
-    def fit_vcov(self):
+    def fit_vcov(self, se_method: str = None):
         """Compute variance-covariance matrix using self.vcov_spec."""
         if self.fitter == "duckdb":
             self._fit_vcov_duckdb()

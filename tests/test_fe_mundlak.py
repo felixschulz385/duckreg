@@ -29,6 +29,9 @@ from pathlib import Path
 
 import pyfixest as pf
 from duckreg import duckreg
+from duckreg.estimators import DuckFE
+from duckreg.utils.formula_parser import FormulaParser
+from duckreg.core.results import ModelSummary
 
 
 # ── constants ─────────────────────────────────────────────────────────────────
@@ -258,22 +261,43 @@ def test_mundlak_warning_logs(caplog, unbalanced_df, unbalanced_path):
     assert "not recommended for unbalanced panels" in caplog.text
 
 
+def test_unbalanced_accuracy_vs_demean(unbalanced_df, unbalanced_path,
+                                       balanced_df, balanced_path):
+    """Mundlak coef on an unbalanced panel should stay within 30% of the demean
+    estimate (both methods estimate the same within-group effect)."""
+    formula = "modis_median ~ ntl_harm + exog_control | country + year"
+    dr_demean  = duckreg(formula, data=unbalanced_path, fe_method="demean",
+                         se_method="HC1", fitter="numpy")
+    dr_mundlak = duckreg(formula, data=unbalanced_path, fe_method="mundlak",
+                         se_method="HC1", fitter="numpy")
+
+    coef_demean  = float(dr_demean.summary_df().loc["ntl_harm", "coefficient"])
+    coef_mundlak = float(dr_mundlak.summary_df().loc["ntl_harm", "coefficient"])
+
+    rtol = 0.30  # Mundlak is an approximation; allow 30% on unbalanced
+    assert abs(coef_mundlak - coef_demean) / (abs(coef_demean) + 1e-8) < rtol, (
+        f"Mundlak coef {coef_mundlak:.4f} deviates >{int(rtol * 100)}% "
+        f"from demean {coef_demean:.4f} on unbalanced panel"
+    )
+
+
 # ============================================================================
 # Coef / SE accuracy tests
 # ============================================================================
 
-# 8 deep-FE tests: 2 balance × 2 IV × 2 vcov (mundlak only)
+# 16 deep-FE tests: 2 fitters × 2 balance × 2 IV × 2 vcov (mundlak only)
 @pytest.mark.parametrize("panel_balance", ["balanced", "unbalanced"])
 @pytest.mark.parametrize("has_iv", [False, True])
 @pytest.mark.parametrize("vcov", ["HC1", "CRV1"])
+@pytest.mark.parametrize("fitter", ["numpy", "duckdb"])
 def test_fe_deep(
     balanced_df, balanced_path, unbalanced_df, unbalanced_path,
-    has_iv, vcov, panel_balance,
+    fitter, has_iv, vcov, panel_balance,
 ):
-    """3-way FE Mundlak: tests Mundlak approximation and panel balance."""
+    """3-way FE Mundlak: tests approximation, panel balance, and both fitters."""
     df   = balanced_df   if panel_balance == "balanced" else unbalanced_df
     path = balanced_path if panel_balance == "balanced" else unbalanced_path
-    check_fe(df, path, fitter="numpy", has_iv=has_iv, fe_depth=3,
+    check_fe(df, path, fitter=fitter, has_iv=has_iv, fe_depth=3,
              vcov=vcov, panel_balance=panel_balance)
 
 
@@ -463,6 +487,196 @@ class TestCompressionCorrectnessMundlak:
                 "not the residual or score computation."
             )
         )
+
+
+# ── Singleton fixtures (shared by the classes below) ───────────────────────────
+
+@pytest.fixture(scope="module")
+def singleton_panel():
+    """Balanced panel (6 units × 5 years) plus one singleton unit (99)."""
+    rng = np.random.default_rng(13)
+    rows = [
+        {"unit": u, "year": t,
+         "x": float(rng.standard_normal()),
+         "y": float(rng.standard_normal())}
+        for u in range(6) for t in range(5)
+    ]
+    rows.append({"unit": 99, "year": 0,
+                 "x": float(rng.standard_normal()),
+                 "y": float(rng.standard_normal())})
+    return pd.DataFrame(rows)  # 31 rows
+
+
+@pytest.fixture(scope="module")
+def singleton_panel_path(singleton_panel):
+    path = _write_parquet(singleton_panel)
+    yield path
+    _cleanup(path)
+
+
+# ============================================================================
+# TestMundlakCompressionStructure — df_compressed properties
+# ============================================================================
+
+class TestMundlakCompressionStructure:
+    """Verify that DuckFE (Mundlak) populates df_compressed correctly."""
+
+    def test_mundlak_means_in_df_compressed(self, balanced_path):
+        """Asymptotic FE (pixel_id, 1000 levels) must produce avg_*_feN columns."""
+        m = duckreg("modis_median ~ ntl_harm + exog_control | pixel_id",
+                    data=balanced_path, fe_method="mundlak",
+                    round_strata=3, se_method="none")
+        assert "avg_ntl_harm_fe0" in m.df_compressed.columns
+        assert "avg_exog_control_fe0" in m.df_compressed.columns
+
+    def test_rhs_cols_includes_means(self, balanced_path):
+        """_rhs_cols must list both raw covariates and their Mundlak means."""
+        m = duckreg("modis_median ~ ntl_harm + exog_control | pixel_id",
+                    data=balanced_path, fe_method="mundlak",
+                    round_strata=3, se_method="none", fitter="numpy")
+        assert hasattr(m, "_rhs_cols")
+        assert "ntl_harm" in m._rhs_cols
+        assert "avg_ntl_harm_fe0" in m._rhs_cols
+
+    def test_mixed_fe_types_count_preserved(self, balanced_df, balanced_path):
+        """pixel_id (asymptotic) + year (fixed dummies): count must still sum to N."""
+        m = duckreg("modis_median ~ ntl_harm | pixel_id + year",
+                    data=balanced_path, fe_method="mundlak",
+                    round_strata=3, se_method="none", fitter="numpy")
+        assert m.df_compressed["count"].sum() == len(balanced_df)
+        # Mundlak means for pixel_id and dummies for year must both be present
+        assert any("avg_ntl_harm" in c for c in m.df_compressed.columns)
+        assert any(c.startswith("dummy_year_") for c in m.df_compressed.columns)
+
+    def test_rounding_more_strata_higher_precision(self, balanced_path):
+        """round_strata=5 must yield at least as many Mundlak strata as round_strata=3."""
+        m3 = duckreg("modis_median ~ ntl_harm | pixel_id",
+                     data=balanced_path, fe_method="mundlak",
+                     round_strata=3, se_method="none")
+        m5 = duckreg("modis_median ~ ntl_harm | pixel_id",
+                     data=balanced_path, fe_method="mundlak",
+                     round_strata=5, se_method="none")
+        assert len(m5.df_compressed) >= len(m3.df_compressed)
+
+
+# ============================================================================
+# TestSingletonRemovalMundlak — remove_singletons for Mundlak FE
+# ============================================================================
+
+class TestSingletonRemovalMundlak:
+    """Verify singleton group removal for DuckFE (Mundlak method)."""
+
+    def test_removes_singleton_by_default(self, singleton_panel, singleton_panel_path):
+        m = duckreg("y ~ x | unit", data=singleton_panel_path, fe_method="mundlak",
+                    fitter="numpy", se_method="none")
+        assert m.n_obs == len(singleton_panel) - 1
+
+    def test_keeps_singletons_when_disabled(self, singleton_panel, singleton_panel_path):
+        m = duckreg("y ~ x | unit", data=singleton_panel_path, fe_method="mundlak",
+                    fitter="numpy", se_method="none", remove_singletons=False)
+        assert m.n_obs == len(singleton_panel)
+
+    def test_nrows_dropped_attribute_is_one(self, singleton_panel_path):
+        m = duckreg("y ~ x | unit", data=singleton_panel_path, fe_method="mundlak",
+                    fitter="numpy", se_method="none")
+        assert m.n_rows_dropped_singletons == 1
+
+    def test_multiple_fe_removal(self, singleton_panel_path):
+        """Singleton removal with two FE columns must still produce a valid estimate."""
+        m = duckreg("y ~ x | unit + year", data=singleton_panel_path, fe_method="mundlak",
+                    fitter="numpy", se_method="none", remove_singletons=True)
+        assert m.n_obs > 0 and m.point_estimate is not None
+
+    def test_estimation_succeeds_after_removal(self, singleton_panel_path):
+        m = duckreg("y ~ x | unit", data=singleton_panel_path, fe_method="mundlak",
+                    fitter="numpy", se_method="HC1")
+        assert m.point_estimate is not None
+        assert m.vcov is not None
+
+
+# ============================================================================
+# TestQualifyClauseGeneration — _build_qualify_singleton_filter on DuckFE
+# ============================================================================
+
+class TestQualifyClauseGeneration:
+    """Unit tests for the QUALIFY clause builder on the base estimator."""
+
+    def _make_fe(self, path, remove_singletons):
+        formula = FormulaParser().parse("y ~ x | unit")
+        return DuckFE(
+            db_name=":memory:",
+            table_name=f"read_parquet('{path}')",
+            formula=formula,
+            seed=42,
+            remove_singletons=remove_singletons,
+        )
+
+    def test_qualify_single_fe(self, singleton_panel_path):
+        model = self._make_fe(singleton_panel_path, remove_singletons=True)
+        clause = model._build_qualify_singleton_filter(["unit"])
+        assert "QUALIFY" in clause
+        assert "PARTITION BY" in clause
+        assert "unit" in clause
+        assert "> 1" in clause
+
+    def test_qualify_multiple_fe(self, singleton_panel_path):
+        formula = FormulaParser().parse("y ~ x | unit + year")
+        model = DuckFE(
+            db_name=":memory:",
+            table_name=f"read_parquet('{singleton_panel_path}')",
+            formula=formula,
+            seed=42,
+            remove_singletons=True,
+        )
+        clause = model._build_qualify_singleton_filter(["unit", "year"])
+        assert "PARTITION BY" in clause
+        assert "unit" in clause
+        assert "year" in clause
+
+    def test_qualify_disabled_returns_empty(self, singleton_panel_path):
+        model = self._make_fe(singleton_panel_path, remove_singletons=False)
+        clause = model._build_qualify_singleton_filter(["unit"])
+        assert clause == ""
+
+
+# ============================================================================
+# TestModelSummaryIntegration — n_rows_dropped_singletons in ModelSummary
+# ============================================================================
+
+class TestModelSummaryIntegration:
+    """Verify that n_rows_dropped_singletons flows through ModelSummary."""
+
+    def _fit_fe(self, singleton_panel_path, remove_singletons):
+        formula = FormulaParser().parse("y ~ x | unit")
+        model = DuckFE(
+            db_name=":memory:",
+            table_name=f"read_parquet('{singleton_panel_path}')",
+            formula=formula,
+            seed=42,
+            remove_singletons=remove_singletons,
+            fitter="numpy",
+        )
+        model.fit()
+        return model
+
+    def test_n_rows_dropped_tracked(self, singleton_panel, singleton_panel_path):
+        model = self._fit_fe(singleton_panel_path, remove_singletons=True)
+        summary = ModelSummary.from_estimator(model)
+        assert summary.n_rows_dropped_singletons == 1
+        assert summary.n_obs == len(singleton_panel) - 1
+
+    def test_to_dict_includes_dropped_rows(self, singleton_panel_path):
+        model = self._fit_fe(singleton_panel_path, remove_singletons=True)
+        summary = ModelSummary.from_estimator(model)
+        d = summary.to_dict()
+        assert "sample_info" in d
+        assert d["sample_info"]["n_rows_dropped_singletons"] == 1
+
+    def test_no_dropped_when_singletons_kept(self, singleton_panel, singleton_panel_path):
+        model = self._fit_fe(singleton_panel_path, remove_singletons=False)
+        summary = ModelSummary.from_estimator(model)
+        assert summary.n_rows_dropped_singletons == 0
+        assert summary.n_obs == len(singleton_panel)
 
 
 if __name__ == "__main__":

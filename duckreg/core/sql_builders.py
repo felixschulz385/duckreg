@@ -4,16 +4,19 @@ SQL expression builders for DuckDB queries.
 Organization:
 -------------
 1. Expression Builders: Pure, small functions that build SQL expression strings
-2. Query Builders: Functions that return complete SQL statements  
-3. Execution Helpers: Functions that execute queries and return numpy arrays
+2. Query Builders: Functions that return complete SQL statements
 
-This module is the single source of truth for all SQL query construction.
+This module is a *pure string-production* module: no function here accepts a
+``duckdb.DuckDBPyConnection`` or calls ``.execute()``.  All execution helpers
+that were previously in "Section 3" have been moved to ``suffstats.py``.
+
+This is the single source of truth for all SQL string construction.
 
 API Design Principles:
 ----------------------
-- All query builders accept consistent signatures: (table_name, cols..., weight_col, where_clause, add_intercept, round_strata)
+- All query builders accept consistent signatures:
+  (table_name, cols..., weight_col, where_clause, add_intercept)
 - All functions have type annotations and input validation
-- Execution helpers return numpy arrays with metadata (shapes, column ordering)
 - Column ordering is explicit and documented
 """
 
@@ -22,7 +25,6 @@ import numpy as np
 import pandas as pd
 import logging
 from typing import List, Optional, Tuple, Set, Dict, Any, Union
-import duckdb
 
 logger = logging.getLogger(__name__)
 
@@ -413,7 +415,7 @@ def build_xtx_query(
     for i in range(k):
         for j in range(i, k):
             xtx_parts.append(
-                f"SUM(({all_x_cols[i]}) * ({all_x_cols[j]}) * {quoted_weight}) AS xtx_{i}_{j}"
+                f"SUM(CAST(({all_x_cols[i]}) AS DOUBLE) * CAST(({all_x_cols[j]}) AS DOUBLE) * CAST({quoted_weight} AS DOUBLE)) AS xtx_{i}_{j}"
             )
     
     return f"""
@@ -486,7 +488,7 @@ def build_xty_query(
     
     all_x_cols = ["1"] + x_cols if add_intercept else x_cols
     xty_parts = [
-        f"SUM(({col}) * {quoted_y}) AS xty_{i}"
+        f"SUM(CAST(({col}) AS DOUBLE) * CAST({quoted_y} AS DOUBLE)) AS xty_{i}"
         for i, col in enumerate(all_x_cols)
     ]
     
@@ -654,9 +656,13 @@ def build_meat_query(
     
     for i in range(k):
         for j in range(i, k):
+            # Cast X columns to DOUBLE to prevent DECIMAL(38) overflow on
+            # columns that come from DuckDB aggregate / parquet sources.
+            col_i = f"CAST(({all_x_cols[i]}) AS DOUBLE)"
+            col_j = f"CAST(({all_x_cols[j]}) AS DOUBLE)"
             meat_parts.append(
-                f"SUM(({all_x_cols[i]}) * ({all_x_cols[j]}) * "
-                f"POW({residual_expr}, 2) * {weight_col}) AS meat_{i}_{j}"
+                f"SUM({col_i} * {col_j} * "
+                f"POW(CAST(({residual_expr}) AS DOUBLE), 2) * ({weight_col})) AS meat_{i}_{j}"
             )
     
     return f"""
@@ -899,13 +905,18 @@ def build_leverage_query(
 
 
 # ============================================================================
-# SECTION 3: Execution Helpers (SQL → Numpy)
+# SECTION 3: Pure Aggregation Helper
 # ============================================================================
-# These functions execute SQL queries and parse results into numpy arrays.
-# They document column ordering and return metadata for transparency.
+# build_exact_sum_y_sq_sql is a pure string builder that was previously in
+# suffstats.py.  It lives here because it belongs with the other SQL builders.
+
+def _execution_helpers_moved():
+    """Marker: execute_to_matrix and compute_cross_sufficient_stats_sql have
+    been moved to ``duckreg.core.suffstats`` to keep this module conn-free."""
+
 
 def execute_to_matrix(
-    conn: duckdb.DuckDBPyConnection,
+    conn,
     query: str,
     shape: Tuple[int, int],
     upper_triangle: bool = False
@@ -954,49 +965,15 @@ def execute_to_matrix(
     if shape[0] <= 0 or shape[1] <= 0:
         raise ValueError("shape dimensions must be positive")
     
-    result = conn.execute(query).fetchone()
-    if result is None:
-        raise ValueError("Query returned no results")
-    
-    rows, cols = shape
-    matrix = np.zeros(shape)
-    
-    if upper_triangle:
-        # Upper triangle format (symmetric matrix)
-        if rows != cols:
-            raise ValueError("upper_triangle=True requires square matrix")
-        
-        expected_len = (rows * (rows + 1)) // 2
-        if len(result) < expected_len:
-            raise ValueError(
-                f"Query returned {len(result)} values, expected at least {expected_len} for {rows}x{rows} upper triangle"
-            )
-        
-        idx = 0
-        for i in range(rows):
-            for j in range(i, cols):
-                matrix[i, j] = result[idx]
-                matrix[j, i] = result[idx]  # Symmetrize
-                idx += 1
-    else:
-        # Full matrix format
-        expected_len = rows * cols
-        if len(result) < expected_len:
-            raise ValueError(
-                f"Query returned {len(result)} values, expected at least {expected_len} for {rows}x{cols} matrix"
-            )
-        
-        idx = 0
-        for i in range(rows):
-            for j in range(cols):
-                matrix[i, j] = result[idx]
-                idx += 1
-    
-    return matrix
+    # Deprecated: this shim keeps the function importable from sql_builders
+    # but the real implementation now lives in duckreg.core.suffstats.
+    # It will be removed in a future version.
+    from .suffstats import execute_to_matrix as _real
+    return _real(conn, query, shape, upper_triangle)
 
 
 def compute_cross_sufficient_stats_sql(
-    conn: duckdb.DuckDBPyConnection,
+    conn,
     table_name: str,
     x_cols: List[str],
     z_cols: List[str],
@@ -1004,124 +981,51 @@ def compute_cross_sufficient_stats_sql(
     add_intercept: bool = True,
     where_clause: str = ""
 ) -> Dict[str, Any]:
-    """
-    Compute cross-product sufficient statistics for IV estimation.
-    
-    High-level wrapper that:
-    1. Builds the SQL query via build_cross_xtz_query
-    2. Executes the query
-    3. Parses results into numpy arrays (tXZ, tZZ)
-    4. Returns metadata about column ordering
-    
-    This is the recommended high-level API for IV sufficient statistics.
-    
+    """Deprecated shim — real implementation is in duckreg.core.suffstats."""
+    from .suffstats import compute_cross_sufficient_stats_sql as _real
+    return _real(conn, table_name, x_cols, z_cols, weight_col, add_intercept, where_clause)
+
+
+def build_exact_sum_y_sq_sql(
+    y_cols: List[str],
+    weight_col: str = "count"
+) -> List[str]:
+    """Build SQL expressions for exact sum(y^2) computation during compression.
+
+    Generates SQL expressions to include in GROUP BY queries so that exact
+    sum(y^2) is preserved for each outcome variable.  These columns can then
+    be passed to ``compute_sufficient_stats_sql`` via the ``sum_y_sq_col``
+    parameter.
+
     Parameters
     ----------
-    conn : duckdb.DuckDBPyConnection
-        Active DuckDB connection
-    table_name : str
-        Source table name
-    x_cols : List[str]
-        X column names (excludes intercept)
-    z_cols : List[str]
-        Z column names (excludes intercept)
-    weight_col : str, default 'count'
-        Weight column name (frequency weights)
-    add_intercept : bool, default True
-        Whether to include intercept in both X and Z.
-        If True, intercept ("1") is prepended to both x_cols and z_cols.
-    where_clause : str, optional
-        WHERE clause (must include 'WHERE' keyword if non-empty)
-        
+    y_cols : List[str]
+        Outcome variable column names (original, not sum_y format).
+    weight_col : str
+        Weight column name (default: ``'count'``).
+
     Returns
     -------
-    Dict[str, Any]
-        Dictionary with keys:
-        - 'tXZ': np.ndarray (k_x, k_z) - X'WZ cross-product
-        - 'tZZ': np.ndarray (k_z, k_z) - Z'WZ cross-product (symmetric)
-        - 'n_obs': int - Total observation count (sum of weights)
-        - 'x_order': List[str] - X column order (["1"] + x_cols or x_cols)
-        - 'z_order': List[str] - Z column order (["1"] + z_cols or z_cols)
-        
-        Column ordering:
-        - If add_intercept=True: ["1", x_cols[0], x_cols[1], ...]
-        - If add_intercept=False: [x_cols[0], x_cols[1], ...]
-        
-    Raises
-    ------
-    ValueError
-        If x_cols or z_cols is empty, or if table_name/conn is invalid
-        
+    List[str]
+        SQL expressions for each outcome:
+        ``"SUM(y * y * weight) AS sum_y_sq"``.
+
     Examples
     --------
-    >>> result = compute_cross_sufficient_stats_sql(
-    ...     conn, "data", ["age", "income"], ["education", "experience"],
-    ...     weight_col="count", add_intercept=True
-    ... )
-    >>> result['tXZ'].shape
-    (3, 3)  # 1 + 2 x_cols, 1 + 2 z_cols
-    >>> result['x_order']
-    ['1', 'age', 'income']
-    >>> result['z_order']
-    ['1', 'education', 'experience']
+    >>> sum_y_sq_parts = build_exact_sum_y_sq_sql(['temperature', 'rainfall'], 'count')
+    >>> sum_y_sq_parts[0]
+    'SUM((temperature) * (temperature) * count) AS sum_temperature_sq'
+
+    Notes
+    -----
+    For unweighted data (weight=1), this computes: ``SUM(y * y)``.
+    For weighted/compressed data: ``SUM(y * y * weight)``.
+    This ensures exact variance computation even after aggregation.
     """
-    if conn is None:
-        raise ValueError("conn cannot be None")
-    if not table_name or not table_name.strip():
-        raise ValueError("table_name cannot be empty")
-    if not x_cols:
-        raise ValueError("x_cols cannot be empty")
-    if not z_cols:
-        raise ValueError("z_cols cannot be empty")
-    
-    # Build column lists
-    all_x_cols = ["1"] + x_cols if add_intercept else x_cols
-    all_z_cols = ["1"] + z_cols if add_intercept else z_cols
-    
-    k_x = len(all_x_cols)
-    k_z = len(all_z_cols)
-    
-    # Build and execute query
-    query = build_cross_xtz_query(
-        table_name, x_cols, z_cols, weight_col, where_clause, add_intercept
-    )
-    
-    try:
-        result = conn.execute(query).fetchone()
-    except Exception as e:
-        logger.error(f"Query execution failed: {e}")
-        logger.debug(f"Query: {query}")
-        raise ValueError(f"Failed to execute cross-product query: {e}")
-    
-    if result is None:
-        raise ValueError("Query returned no results")
-    
-    # Parse tXZ (k_x x k_z, row-major)
-    tXZ = np.zeros((k_x, k_z))
-    idx = 0
-    for i in range(k_x):
-        for j in range(k_z):
-            tXZ[i, j] = result[idx]
-            idx += 1
-    
-    # Parse tZZ (k_z x k_z, upper triangle, symmetric)
-    tZZ = np.zeros((k_z, k_z))
-    for i in range(k_z):
-        for j in range(i, k_z):
-            tZZ[i, j] = result[idx]
-            tZZ[j, i] = result[idx]  # Symmetrize
-            idx += 1
-    
-    # Parse observation count
-    n_obs = int(result[idx])
-    
-    return {
-        'tXZ': tXZ,
-        'tZZ': tZZ,
-        'n_obs': n_obs,
-        'x_order': all_x_cols,
-        'z_order': all_z_cols
-    }
+    return [
+        f"SUM(({col}) * ({col}) * {weight_col}) AS sum_{col}_sq"
+        for col in y_cols
+    ]
 
 
 # ============================================================================
@@ -1297,69 +1201,10 @@ JOIN (
 # SECTION 6: FE Classification and Unbalanced Panel Support
 # ============================================================================
 
-def profile_fe_column(
-    conn: duckdb.DuckDBPyConnection,
-    table_name: str,
-    fe_col_sql_name: str
-) -> Dict[str, Any]:
-    """Profile a fixed effect column to determine if it's fixed or asymptotic.
-    
-    Computes metadata for classification heuristic:
-    - cardinality: number of unique levels
-    - singleton_share: proportion of levels with only 1 observation
-    - avg_obs_per_level: mean observations per level
-    - median_obs_per_level: median observations per level
-    
-    Parameters
-    ----------
-    conn : DuckDBPyConnection
-        Active database connection
-    table_name : str
-        Name of table (will be quoted if needed)
-    fe_col_sql_name : str
-        SQL-safe name of FE column (will be quoted if needed)
-        
-    Returns
-    -------
-    Dict[str, Any]
-        Profiling metadata with keys: 'cardinality', 'singleton_share',
-        'avg_obs_per_level', 'median_obs_per_level', 'total_obs'
-        
-    Examples
-    --------
-    >>> profile = profile_fe_column(conn, 'data', 'firm_id')
-    >>> profile['cardinality']
-    100
-    """
-    from ..utils.formula_parser import quote_identifier
-    
-    quoted_table = quote_identifier(table_name)
-    quoted_fe_col = quote_identifier(fe_col_sql_name)
-    
-    query = f"""
-    WITH fe_counts AS (
-        SELECT {quoted_fe_col}, COUNT(*) as n_obs
-        FROM {quoted_table}
-        GROUP BY {quoted_fe_col}
-    )
-    SELECT
-        COUNT(DISTINCT {quoted_fe_col}) as cardinality,
-        SUM(CASE WHEN n_obs = 1 THEN 1 ELSE 0 END)::FLOAT / COUNT(*) as singleton_share,
-        AVG(n_obs) as avg_obs_per_level,
-        MEDIAN(n_obs) as median_obs_per_level,
-        SUM(n_obs) as total_obs
-    FROM fe_counts
-    """
-    
-    result = conn.execute(query).fetchone()
-    
-    return {
-        'cardinality': int(result[0]),
-        'singleton_share': float(result[1]),
-        'avg_obs_per_level': float(result[2]),
-        'median_obs_per_level': float(result[3]),
-        'total_obs': int(result[4])
-    }
+def profile_fe_column(conn, table_name: str, fe_col_sql_name: str) -> Dict[str, Any]:
+    """Deprecated shim — real implementation is in duckreg.core.suffstats."""
+    from .suffstats import profile_fe_column as _real
+    return _real(conn, table_name, fe_col_sql_name)
 
 
 def classify_fe_type(
@@ -1520,111 +1365,29 @@ JOIN (
 """.strip()
 
 
-def get_fe_unique_levels(
-    conn: duckdb.DuckDBPyConnection,
-    table_name: str,
-    fe_col_sql_name: str,
-    max_levels: int = 1000
-) -> List[Any]:
-    """Get unique levels of a fixed effect column.
-    
-    Parameters
-    ----------
-    conn : DuckDBPyConnection
-        Active database connection
-    table_name : str
-        Name of table
-    fe_col_sql_name : str
-        SQL-safe name of FE column
-    max_levels : int, default=1000
-        Maximum levels to return (safety guard)
-        
-    Returns
-    -------
-    List[Any]
-        Sorted list of unique FE levels
-        
-    Raises
-    ------
-    ValueError
-        If number of levels exceeds max_levels
-    """
-    from ..utils.formula_parser import quote_identifier
-    
-    quoted_table = quote_identifier(table_name)
-    quoted_fe_col = quote_identifier(fe_col_sql_name)
-    
-    query = f"""
-    SELECT DISTINCT {quoted_fe_col}
-    FROM {quoted_table}
-    ORDER BY {quoted_fe_col}
-    LIMIT {max_levels + 1}
-    """
-    
-    result = conn.execute(query).fetchdf()
-    levels = result.iloc[:, 0].tolist()
-    
-    if len(levels) > max_levels:
-        raise ValueError(
-            f"FE column {fe_col_sql_name} has more than {max_levels} levels. "
-            f"This may cause column explosion. Consider reclassifying as asymptotic "
-            f"or increasing max_levels."
-        )
-    
-    return levels
+def get_fe_unique_levels(conn, table_name: str, fe_col_sql_name: str, max_levels: int = 1000) -> List[Any]:
+    """Deprecated shim — real implementation is in duckreg.core.suffstats."""
+    from .suffstats import get_fe_unique_levels as _real
+    return _real(conn, table_name, fe_col_sql_name, max_levels)
 
 
 # ============================================================================
-# SECTION 5: Utility Classes and Functions
+# SECTION 5: Utility Functions (pure — no conn dependency)
 # ============================================================================
-# Helper utilities for working with DuckDB and formulas
+# Helper utilities for working with formulas
+# Note: conn-requiring helpers (get_boolean_columns, get_table_columns) have
+# been moved to duckreg.core.suffstats.
 
-def get_boolean_columns(conn: duckdb.DuckDBPyConnection, 
-                       table_name: str, 
-                       column_names: List[str]) -> Set[str]:
-    """Get boolean columns from a table.
-    
-    Parameters
-    ----------
-    conn : duckdb.DuckDBPyConnection
-        Database connection
-    table_name : str
-        Table name to query
-    column_names : List[str]
-        Column names to check
-        
-    Returns
-    -------
-    Set[str]
-        Set of column names that are BOOLEAN type
-    """
-    cols_sql = ', '.join(f"'{c}'" for c in column_names)
-    query = f"""
-    SELECT column_name FROM (DESCRIBE SELECT * FROM {table_name})
-    WHERE column_name IN ({cols_sql}) AND column_type = 'BOOLEAN'
-    """
-    return set(conn.execute(query).fetchdf()['column_name'].tolist())
+def get_boolean_columns(conn, table_name: str, column_names: List[str]) -> Set[str]:
+    """Deprecated shim — real implementation is in duckreg.core.suffstats."""
+    from .suffstats import get_boolean_columns as _real
+    return _real(conn, table_name, column_names)
 
 
-def get_table_columns(conn: duckdb.DuckDBPyConnection, table_name: str) -> Set[str]:
-    """Get all column names from a table.
-    
-    Parameters
-    ----------
-    conn : duckdb.DuckDBPyConnection
-        Database connection
-    table_name : str
-        Table name to query
-        
-    Returns
-    -------
-    Set[str]
-        Set of column names
-    """
-    return set(
-        conn.execute(f"SELECT column_name FROM (DESCRIBE {table_name})")
-        .fetchdf()['column_name'].tolist()
-    )
+def get_table_columns(conn, table_name: str) -> Set[str]:
+    """Deprecated shim — real implementation is in duckreg.core.suffstats."""
+    from .suffstats import get_table_columns as _real
+    return _real(conn, table_name)
 
 
 def build_x_cols_for_duckdb(
@@ -1868,7 +1631,7 @@ __all__ = [
     'build_round_expr',
     'build_residual_expr',
     'build_fitted_expr',
-    
+
     # Section 2: Query Builders (SQL Statement Generators)
     'build_agg_columns',
     'build_strata_select_sql',
@@ -1879,16 +1642,18 @@ __all__ = [
     'build_exact_meat_query',
     'build_cluster_scores_query',
     'build_leverage_query',
-    
-    # Section 3: Execution Helpers (SQL → Numpy)
+
+    # Section 3: Pure string helper (execution helpers moved to suffstats)
+    'build_exact_sum_y_sq_sql',
+    # Deprecated shims (real implementations in duckreg.core.suffstats)
     'execute_to_matrix',
     'compute_cross_sufficient_stats_sql',
-    
+
     # Section 4: Mundlak Device SQL Builders
     'build_mundlak_avg_col_names',
     'build_add_mundlak_means_sql',
     'build_add_fitted_mundlak_means_sql',
-    
+
     # Section 5: Utility Functions
     'get_boolean_columns',
     'get_table_columns',
@@ -1896,8 +1661,9 @@ __all__ = [
     'build_z_cols_for_duckdb',
     'build_residual_x_cols_for_duckdb',
     'compute_mundlak_means_numpy',
-    
+
     # Section 6: FE Classification and Unbalanced Panel Support
+    # Deprecated shims (real implementations in duckreg.core.suffstats)
     'profile_fe_column',
     'classify_fe_type',
     'build_add_fixed_fe_dummy_means_sql',

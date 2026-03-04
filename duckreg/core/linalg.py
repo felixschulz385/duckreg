@@ -49,7 +49,7 @@ def safe_solve(
         if not _regularization_warned:
             logger.info("Using regularization for numerical stability in solve")
             _regularization_warned = True
-        regularized_A = A + alpha * multiplier * np.eye(A.shape[0])
+        regularized_A = A + max(alpha, DEFAULT_ALPHA) * multiplier * np.eye(A.shape[0])
         return np.linalg.solve(regularized_A, b)
 
 

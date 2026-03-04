@@ -43,6 +43,9 @@ def duckreg(
     fitter: str = "numpy",
     round_strata: int = None,
     seed: int = 42,
+    # ── FE classification settings ────────────────────────────────────────────
+    fe_types: Optional[Dict] = None,
+    max_fixed_fe_levels: Optional[int] = None,
     # ── DuckDB resource kwargs: threads, memory_limit, max_temp_directory_size
     **kwargs,
 ) -> "DuckEstimator":
@@ -149,6 +152,10 @@ def duckreg(
         )
         for k, v in kwargs.pop("duckdb_kwargs").items():
             kwargs.setdefault(k, v)
+        # Re-extract resource kwargs that the shim may have put back into kwargs
+        threads = int(kwargs.pop("threads", threads))
+        memory_limit = kwargs.pop("memory_limit", memory_limit)
+        max_temp_dir_size = kwargs.pop("max_temp_directory_size", max_temp_dir_size)
     if "n_bootstraps" in kwargs:
         warnings.warn(
             "'n_bootstraps' is deprecated; use bootstrap={'n': N} instead.",
@@ -270,7 +277,12 @@ def duckreg(
                 f"With fixed effects, fe_method must be '{FEMethod.MUNDLAK}' "
                 f"or '{FEMethod.DEMEAN}', got '{resolved_fe_method}'"
             )
-        estimator = DuckFE(**_common, method=fe_method_str)
+        _duckfe_extra = {}
+        if fe_types is not None:
+            _duckfe_extra["fe_types"] = fe_types
+        if max_fixed_fe_levels is not None:
+            _duckfe_extra["max_fixed_fe_levels"] = max_fixed_fe_levels
+        estimator = DuckFE(**_common, method=fe_method_str, **_duckfe_extra)
     else:
         estimator = DuckRegression(**_common)
 

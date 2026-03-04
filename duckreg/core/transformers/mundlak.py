@@ -10,6 +10,8 @@ from ...core.sql_builders import (
     build_add_fixed_fe_dummy_means_sql,
     build_add_mundlak_means_sql,
     classify_fe_type,
+)
+from ...core.suffstats import (
     get_fe_unique_levels,
     profile_fe_column,
 )

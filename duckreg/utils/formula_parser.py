@@ -162,33 +162,44 @@ def _normalize_variable_name(name: str) -> str:
 
 def _make_sql_safe_name(name: str) -> str:
     """Convert a variable name/expression to a SQL-safe identifier.
-    
+
     Removes special characters, replaces spaces/operators with underscores.
     Examples:
         'log(x+0.01)' -> 'log_x_0_01'
         'country*year' -> 'country_year'
         'L.gdp' -> 'L_gdp'
+        '(col == 190)' -> 'col_eq_190'
+        '(col != 0)' -> 'col_ne_0'
     """
     if name == '_intercept':
         return '_intercept'
-    
-    # Replace common patterns
-    safe = name.replace('(', '_').replace(')', '').replace('+', '_').replace('-', '_')
+
+    safe = name
+    # Handle multi-char comparison operators first (order matters)
+    safe = safe.replace('!=', '_ne_').replace('>=', '_gte_').replace('<=', '_lte_')
+    safe = safe.replace('==', '_eq_')
+    # Single-char operators
+    safe = safe.replace('>', '_gt_').replace('<', '_lt_')
+    safe = safe.replace('=', '_eq_').replace('!', '_not_')
+    # Structural / arithmetic characters
+    safe = safe.replace('(', '_').replace(')', '_').replace('+', '_').replace('-', '_')
     safe = safe.replace('*', '_').replace(':', '_').replace('.', '_').replace(' ', '_')
     safe = safe.replace('/', '_').replace(',', '_').replace(';', '_')
-    
-    # Remove consecutive underscores
+
+    # Collapse consecutive underscores and strip leading/trailing ones
     while '__' in safe:
         safe = safe.replace('__', '_')
-    
-    # Remove leading/trailing underscores
     safe = safe.strip('_')
-    
+
     # Ensure it doesn't start with a digit
     if safe and safe[0].isdigit():
         safe = 'x_' + safe
-    
+
     return safe
+
+
+# Regex used to extract plain column names from parenthesised expressions
+_EXPR_COLUMN_RE = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\b')
 
 
 @dataclass(frozen=True)
@@ -205,18 +216,23 @@ class Variable:
     def __post_init__(self):
         # Build display name from transform info
         if self.display_name is None:
-            display = self.name
-            if self.transform != TransformType.NONE:
-                if self.transform_shift != 0:
-                    sign = '+' if self.transform_shift > 0 else ''
-                    display = f"{self.transform.value}({self.name}{sign}{self.transform_shift})"
-                else:
-                    display = f"{self.transform.value}({self.name})"
-            if self.lag is not None:
-                prefix = 'L' if self.lag < 0 else 'F'
-                offset = abs(self.lag)
-                display = f"{prefix}{offset}.{display}" if offset > 1 else f"{prefix}.{display}"
-            object.__setattr__(self, 'display_name', display)
+            # For parenthesised expressions like (col == 190), use the
+            # SQL-safe alias (e.g. col_eq_190) as the display/coefficient name.
+            if self.name.startswith('('):
+                object.__setattr__(self, 'display_name', _make_sql_safe_name(self.name))
+            else:
+                display = self.name
+                if self.transform != TransformType.NONE:
+                    if self.transform_shift != 0:
+                        sign = '+' if self.transform_shift > 0 else ''
+                        display = f"{self.transform.value}({self.name}{sign}{self.transform_shift})"
+                    else:
+                        display = f"{self.transform.value}({self.name})"
+                if self.lag is not None:
+                    prefix = 'L' if self.lag < 0 else 'F'
+                    offset = abs(self.lag)
+                    display = f"{prefix}{offset}.{display}" if offset > 1 else f"{prefix}.{display}"
+                object.__setattr__(self, 'display_name', display)
         
         # Generate SQL-safe name if not provided
         if self.sql_name is None:
@@ -226,13 +242,22 @@ class Variable:
         """Check if this variable represents an intercept (constant 1)"""
         return self.name == '_intercept'
     
-    def get_sql_expression(self, unit_col: Optional[str] = None, 
-                          time_col: str = 'year') -> str:
+    def is_expr(self) -> bool:
+        """True when this variable is a parenthesised SQL expression, e.g. ``(col == 190)``."""
+        return self.name.startswith('(')
+
+    def get_sql_expression(self, unit_col: Optional[str] = None,
+                           time_col: str = 'year') -> str:
         """Generate SQL expression for this variable"""
         # Special case for intercept
         if self.is_intercept():
             return "1"
-        
+
+        # Parenthesised boolean / arithmetic expressions — return as-is after
+        # converting Python == to SQL = (DuckDB accepts == but = is safer).
+        if self.is_expr():
+            return re.sub(r'(?<![!<>=])={2}(?!=)', '=', self.name)
+
         # Build base expression with proper quoting
         base_expr = quote_identifier(self.name)
         
@@ -264,12 +289,17 @@ class Variable:
         """Get the SQL-safe name for use in SQL (no quoting needed)"""
         return self.sql_name
     
-    def get_select_sql(self, unit_col: Optional[str] = None, 
+    def get_select_sql(self, unit_col: Optional[str] = None,
                        time_col: str = 'year',
                        boolean_cols: Set[str] = None) -> str:
         """Generate SELECT clause fragment: expression AS sql_name"""
         expr = self.get_sql_expression(unit_col, time_col)
-        expr = cast_if_boolean(expr, self.name, boolean_cols or set())
+        if self.is_expr():
+            # Boolean expression result: always cast to SMALLINT so it can
+            # be used directly as a numeric covariate in regressions.
+            expr = f"CAST({expr} AS SMALLINT)"
+        else:
+            expr = cast_if_boolean(expr, self.name, boolean_cols or set())
         return f"{expr} AS {self.sql_name}"
 
 
@@ -338,6 +368,7 @@ class Formula:
     raw_formula: str
     endogenous: Tuple[Variable, ...] = ()
     instruments: Tuple[Variable, ...] = ()
+    mediators: Tuple[Variable, ...] = ()
     
     # -------------------------------------------------------------------------
     # Generic lookup helper
@@ -435,7 +466,19 @@ class Formula:
     def has_instruments(self) -> bool:
         """Check if formula has instrumental variables"""
         return len(self.instruments) > 0
-    
+
+    def get_mediator_names(self) -> List[str]:
+        """Get raw mediator variable names (from via(...) syntax)"""
+        return [var.name for var in self.mediators]
+
+    def get_mediator_display_names(self) -> List[str]:
+        """Get display names for mediator variables"""
+        return [var.display_name for var in self.mediators]
+
+    def has_mediators(self) -> bool:
+        """Check if formula contains mediator variables (via(...) syntax)"""
+        return len(self.mediators) > 0
+
     # -------------------------------------------------------------------------
     # Lookup methods (using generic helper)
     # -------------------------------------------------------------------------
@@ -491,11 +534,21 @@ class Formula:
     def get_source_columns_for_null_check(self) -> List[str]:
         """Get all source column names needed for NULL checking."""
         cols = set()
-        
+
         # Add names from simple variables (excluding intercept)
-        for var_list in (self.outcomes, self.covariates, self.fixed_effects, self.endogenous, self.instruments):
+        for var_list in (self.outcomes, self.covariates, self.fixed_effects,
+                         self.endogenous, self.instruments, self.mediators):
             for var in var_list:
-                if not var.is_intercept():
+                if var.is_intercept():
+                    continue
+                if var.is_expr():
+                    # Extract plain column names from the expression, e.g.
+                    # "(lccs_class == 190)" → {"lccs_class"}
+                    # Skip SQL reserved words to avoid spurious COLUMNS() entries.
+                    for ident in _EXPR_COLUMN_RE.findall(var.name):
+                        if ident.upper() not in _SQL_RESERVED_WORDS:
+                            cols.add(ident)
+                else:
                     cols.add(var.name)
         
         # Interaction components
@@ -690,7 +743,7 @@ class FormulaParser:
         if len(parts) > 4:
             raise ValueError("Formula can have at most 4 parts separated by |")
         
-        covariates, interactions = self._parse_covariates_with_interactions(parts[0]) if parts[0] else ([], [])
+        covariates, interactions, mediators = self._parse_covariates_with_interactions(parts[0]) if parts[0] else ([], [], [])
         fixed_effects, merged_fes = self._parse_fixed_effects(parts[1]) if len(parts) > 1 and parts[1].strip() != "0" else ([], [])
         
         # Parse instrumental variables (3rd pipe segment)
@@ -723,6 +776,7 @@ class FormulaParser:
             raw_formula=formula,
             endogenous=tuple(endogenous),
             instruments=tuple(instruments),
+            mediators=tuple(mediators),
         )
     
     def _split_terms(self, expr: str) -> List[str]:
@@ -751,31 +805,58 @@ class FormulaParser:
         return [self._parse_single_variable(term.strip(), role) 
                 for term in self._split_terms(var_string) if term.strip()]
     
-    def _parse_covariates_with_interactions(self, cov_string: str) -> Tuple[List[Variable], List[Interaction]]:
-        """Parse covariates including interaction terms"""
-        covariates, interactions = [], []
-        seen_names = set()
-        
+    # Pattern that matches via(M1, M2, ...) — the mediation marker
+    _VIA_PATTERN = re.compile(r'^via\s*\((.+)\)$', re.IGNORECASE)
+
+    def _parse_covariates_with_interactions(
+        self, cov_string: str
+    ) -> Tuple[List[Variable], List[Interaction], List[Variable]]:
+        """Parse covariates including interaction terms and optional via(...) mediators.
+
+        Returns
+        -------
+        (covariates, interactions, mediators)
+            *mediators* collects variables inside ``via(M1, M2, ...)``; these
+            are **excluded** from *covariates*.  Everything else is parsed as
+            before.
+        """
+        covariates, interactions, mediators = [], [], []
+        seen_names: set = set()
+
         for term in self._split_terms(cov_string):
             term = term.strip()
             if not term:
                 continue
-            
+
+            # ── via(M1, M2, ...) mediator marker ─────────────────────
+            via_match = self._VIA_PATTERN.match(term)
+            if via_match:
+                inner = via_match.group(1)
+                # Split on commas that are NOT inside nested parentheses so
+                # that expressions like (lccs_class == 190) are kept intact.
+                for med_name in self._split_comma_aware(inner):
+                    med_var = self._parse_single_variable(med_name, VariableRole.COVARIATE)
+                    if med_var.name not in seen_names:
+                        mediators.append(med_var)
+                        seen_names.add(med_var.name)
+                continue
+
+            # ── interaction terms ─────────────────────────────────────
             interaction_sep = self._find_interaction_separator(term)
-            
+
             if interaction_sep:
                 sep, include_main = interaction_sep
                 parts = [p.strip() for p in term.split(sep)]
                 if len(parts) == 2:
                     var1 = self._parse_single_variable(parts[0], VariableRole.COVARIATE)
                     var2 = self._parse_single_variable(parts[1], VariableRole.COVARIATE)
-                    
+
                     if include_main:
                         for var in (var1, var2):
                             if var.name not in seen_names:
                                 covariates.append(var)
                                 seen_names.add(var.name)
-                    
+
                     interaction_name = f"{var1.name}_x_{var2.name}"
                     interaction_sql_name = f"{var1.sql_name}_x_{var2.sql_name}"
                     interactions.append(Interaction(
@@ -786,11 +867,32 @@ class FormulaParser:
                 if var.name not in seen_names:
                     covariates.append(var)
                     seen_names.add(var.name)
-        
-        return covariates, interactions
+
+        return covariates, interactions, mediators
     
+    @staticmethod
+    def _split_comma_aware(s: str) -> List[str]:
+        """Split *s* on commas that are not inside any parentheses."""
+        parts, current, depth = [], [], 0
+        for char in s:
+            if char == '(':
+                depth += 1
+            elif char == ')':
+                depth -= 1
+            if char == ',' and depth == 0:
+                token = ''.join(current).strip()
+                if token:
+                    parts.append(token)
+                current = []
+            else:
+                current.append(char)
+        token = ''.join(current).strip()
+        if token:
+            parts.append(token)
+        return parts
+
     def _find_interaction_separator(self, term: str) -> Optional[Tuple[str, bool]]:
-        """Find interaction separator (* or :) and return (separator, include_main_effects)"""
+        """Find interaction separator (* or :) and return (separator, include_main_effects)."""
         if '*' in term:
             # Check it's not inside a cast (::)
             if '::' not in term or term.index('*') < term.index('::'):

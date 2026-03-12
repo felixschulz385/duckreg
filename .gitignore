@@ -44,3 +44,5 @@ devlog/*
 foreign/*
 .DS_Store
 .vscode/*
+.local/*
+.github/*

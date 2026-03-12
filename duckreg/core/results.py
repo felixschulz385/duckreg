@@ -536,3 +536,166 @@ class ModelSummary:
                 kwargs["first_stage_f_stats"] = estimator.get_first_stage_f_stats()
         
         return cls(**kwargs)
+
+
+# ============================================================================
+# Mediation result containers
+# ============================================================================
+
+@dataclass
+class MediationEffects:
+    """Decomposed mediation effects with delta-method standard errors.
+
+    All arrays are indexed by exposure (rows) and, where applicable, by
+    mediator (columns).
+
+    Parameters
+    ----------
+    exposure_names : List[str]
+        Display names of the exposure variables X.
+    mediator_names : List[str]
+        Display names of the mediator variables M.
+    direct : np.ndarray
+        Direct effects of each exposure on Y,  shape ``(n_exposures,)``.
+    direct_se : np.ndarray or None
+        Standard errors of ``direct``.
+    indirect : np.ndarray
+        Specific indirect effects IE[j, k] = A_k[j] * B[k],
+        shape ``(n_exposures, n_mediators)``.
+    indirect_se : np.ndarray or None
+        Delta-method SEs for ``indirect``.
+    total_indirect : np.ndarray
+        Total indirect effect per exposure = sum over mediators,
+        shape ``(n_exposures,)``.
+    total_indirect_se : np.ndarray or None
+        Delta-method SEs for ``total_indirect``.
+    total : np.ndarray
+        Total effect = direct + total_indirect, shape ``(n_exposures,)``.
+    total_se : np.ndarray or None
+        Delta-method SEs for ``total``.
+    """
+
+    exposure_names: List[str]
+    mediator_names: List[str]
+    direct: np.ndarray
+    direct_se: Optional[np.ndarray]
+    indirect: np.ndarray          # shape (n_exp, n_med)
+    indirect_se: Optional[np.ndarray]
+    total_indirect: np.ndarray
+    total_indirect_se: Optional[np.ndarray]
+    total: np.ndarray
+    total_se: Optional[np.ndarray]
+
+    # ------------------------------------------------------------------ #
+    # Tidy export                                                          #
+    # ------------------------------------------------------------------ #
+
+    def to_tidy_df(self) -> "pd.DataFrame":
+        """Return tidy DataFrame with one row per effect estimate.
+
+        Columns: ``effect_type``, ``exposure``, ``mediator`` (where
+        applicable), ``estimate``, ``std_error``, ``z_stat``, ``p_value``,
+        ``ci_lower``, ``ci_upper``.
+        """
+        from scipy import stats as _scipy_stats
+
+        rows = []
+
+        def _row(etype, exp, med, est, se):
+            if se is not None and np.isfinite(se) and se > 0:
+                z = est / se
+                p = float(2 * (1 - _scipy_stats.norm.cdf(abs(z))))
+                lo, hi = est - 1.96 * se, est + 1.96 * se
+            else:
+                z = p = lo = hi = np.nan
+            return {
+                "effect_type": etype,
+                "exposure": exp,
+                "mediator": med,
+                "estimate": float(est),
+                "std_error": float(se) if se is not None else np.nan,
+                "z_stat": z, "p_value": p,
+                "ci_lower": lo, "ci_upper": hi,
+            }
+
+        for j, exp in enumerate(self.exposure_names):
+            # Direct
+            se_de = float(self.direct_se[j]) if self.direct_se is not None else None
+            rows.append(_row("direct", exp, "", float(self.direct[j]), se_de))
+
+            # Specific indirect
+            for k, med in enumerate(self.mediator_names):
+                se_ie = float(self.indirect_se[j, k]) if self.indirect_se is not None else None
+                rows.append(_row("indirect", exp, med, float(self.indirect[j, k]), se_ie))
+
+            # Total indirect
+            se_tie = float(self.total_indirect_se[j]) if self.total_indirect_se is not None else None
+            rows.append(_row("total_indirect", exp, "", float(self.total_indirect[j]), se_tie))
+
+            # Total
+            se_te = float(self.total_se[j]) if self.total_se is not None else None
+            rows.append(_row("total", exp, "", float(self.total[j]), se_te))
+
+        import pandas as _pd
+        return _pd.DataFrame(rows)
+
+
+@dataclass
+class MediationResults:
+    """Top-level result container for a fitted :class:`~duckreg.estimators.DuckMediation` model.
+
+    Parameters
+    ----------
+    mediator_results : Dict[str, RegressionResults]
+        Equation-level OLS results keyed by mediator column name.
+    outcome_result : RegressionResults
+        OLS result for the outcome equation.
+    effects : MediationEffects or None
+        Decomposed direct / indirect / total effects (``None`` when vcov
+        has not yet been computed).
+    n_obs : int
+        Number of observations used.
+    se_type : str or None
+        Standard-error type label.
+    """
+
+    mediator_results: Dict[str, "RegressionResults"]
+    outcome_result: "RegressionResults"
+    effects: Optional[MediationEffects]
+    n_obs: Optional[int]
+    se_type: Optional[str]
+
+    # ------------------------------------------------------------------ #
+    # Convenience                                                          #
+    # ------------------------------------------------------------------ #
+
+    def equations_df(self) -> "pd.DataFrame":
+        """Tidy DataFrame with one row per coefficient across all equations.
+
+        Columns include ``equation``, ``variable``, ``estimate``,
+        ``std_error``, ``t_stat``, ``p_value``, ``ci_lower``, ``ci_upper``.
+        """
+        import pandas as _pd
+        frames = []
+        # mediator equations
+        for med_name, res in self.mediator_results.items():
+            df = res.to_tidy_df()
+            df.insert(0, "equation", f"mediator:{med_name}")
+            frames.append(df)
+        # outcome equation
+        df_out = self.outcome_result.to_tidy_df()
+        df_out.insert(0, "equation", "outcome")
+        frames.append(df_out)
+        return _pd.concat(frames, ignore_index=True) if frames else _pd.DataFrame()
+
+    def to_tidy_df(self) -> "pd.DataFrame":
+        """Combined tidy DataFrame: equation results + effect decomposition.
+
+        Stacks :meth:`equations_df` and, if available,
+        :meth:`~MediationEffects.to_tidy_df`.
+        """
+        import pandas as _pd
+        parts = [self.equations_df()]
+        if self.effects is not None:
+            parts.append(self.effects.to_tidy_df())
+        return _pd.concat(parts, ignore_index=True) if parts else _pd.DataFrame()

@@ -320,9 +320,16 @@ def build_strata_select_sql(
                formula.get_fe_by_name(col_name))
         
         if var:
-            col_expr = var.get_sql_expression(unit_col, 'year')
-            col_expr = cast_if_boolean(col_expr, var.name, boolean_cols)
-            select_expr, group_expr = build_round_expr(col_expr, var.sql_name, round_strata)
+            if var.is_expr():
+                # Parenthesised boolean / arithmetic expression: cast to SMALLINT
+                # and never apply ROUND (booleans are discrete; ROUND fails on them).
+                col_expr = f"CAST({var.get_sql_expression(unit_col, 'year')} AS SMALLINT)"
+                select_expr = f"{col_expr} AS {var.sql_name}"
+                group_expr = col_expr
+            else:
+                col_expr = var.get_sql_expression(unit_col, 'year')
+                col_expr = cast_if_boolean(col_expr, var.name, boolean_cols)
+                select_expr, group_expr = build_round_expr(col_expr, var.sql_name, round_strata)
         else:
             # Handle interactions or merged FEs
             interaction = formula.get_interaction_by_name(col_name)

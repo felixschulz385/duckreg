@@ -260,6 +260,53 @@ def duckreg(
         vcov_spec=vcov_spec,
     )
 
+    # ── Mediation model (via(...) syntax) ────────────────────────────
+    if parsed_formula.has_mediators():
+        from .estimators import DuckMediation
+
+        # All non-intercept, non-mediator covariates are treated as exposures.
+        med_names    = parsed_formula.get_mediator_names()
+        exposure_names = [
+            v for v in parsed_formula.get_non_intercept_simple_covariate_names()
+            if v not in med_names
+        ]
+
+        # Resolve cluster column (first cluster var from VcovSpec, if present)
+        _cluster_col: Optional[str] = None
+        if vcov_spec.is_clustered and vcov_spec.cluster_vars:
+            _cluster_col = vcov_spec.cluster_vars[0]
+
+        # Resolve fe_method for mediation: only 'demean' and 'mundlak' are
+        # supported; fall back to 'demean' when AUTO resolves to None.
+        _med_fe_method = resolved_fe_method or "demean"
+        if _med_fe_method not in ("demean", "mundlak"):
+            _med_fe_method = "demean"
+
+        estimator = DuckMediation(
+            db_name=resolved_db,
+            table_name=table_name,
+            outcome=parsed_formula.get_outcome_names()[0],
+            exposures=exposure_names,
+            mediators=med_names,
+            fe_cols=fe_cols,
+            fe_method=_med_fe_method,
+            cluster_col=_cluster_col,
+            vcov_spec=vcov_spec,
+            fitter=fitter,
+            subset=subset,
+            seed=seed,
+            remove_singletons=remove_singletons,
+            duckdb_kwargs=duckdb_kwargs or None,
+            formula=parsed_formula,
+        )
+
+        if obj_to_register is not None:
+            estimator.conn.register(_DUCKDB_VIEW_NAME, obj_to_register)
+
+        estimator.fit(se_method=se_method)
+        logger.debug("=== duckreg END (mediation) ===")
+        return estimator
+
     if has_iv:
         estimator = Duck2SLS(**_common, fe_method=resolved_fe_method)
     elif fe_cols:

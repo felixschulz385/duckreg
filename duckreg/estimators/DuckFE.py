@@ -307,15 +307,16 @@ class DuckFE(DuckLinearModel):
                 extra_select_exprs.append(mfe.get_select_sql())
 
             # Transformed outcome/covariate expressions
-            # (only needed when a transform is applied; plain columns already
+            # (only needed when a transform is applied or when the variable is
+            # a parenthesised expression like (col == 190); plain columns already
             # exist in the source table under their original name)
             for var in self.formula.outcomes:
-                if var.transform != TransformType.NONE:
+                if var.transform != TransformType.NONE or var.is_expr():
                     extra_select_exprs.append(
                         var.get_select_sql(unit_col, "year", boolean_cols)
                     )
             for var in self.formula.covariates:
-                if not var.is_intercept() and var.transform != TransformType.NONE:
+                if not var.is_intercept() and (var.transform != TransformType.NONE or var.is_expr()):
                     extra_select_exprs.append(
                         var.get_select_sql(unit_col, "year", boolean_cols)
                     )

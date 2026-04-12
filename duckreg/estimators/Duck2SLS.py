@@ -711,7 +711,7 @@ class Duck2SLS(DuckEstimator):
 
         group_by = ", ".join(group_cols)
         self.conn.execute(f"""
-        CREATE OR REPLACE VIEW {self._COMPRESSED_VIEW} AS
+        CREATE OR REPLACE TABLE {self._COMPRESSED_VIEW} AS
         SELECT {group_by}, {', '.join(agg_parts)}
         FROM {self._ss_result_table}
         GROUP BY {group_by}

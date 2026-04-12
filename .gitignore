@@ -31,6 +31,7 @@ benchmarks/results
 *.aux
 *.blg
 *.out
+*.tar
 *.synctex.gz
 *venv
 *newenv
@@ -44,3 +45,4 @@ devlog/*
 foreign/*
 .DS_Store
 .vscode/*
+benchmarks/logs/*

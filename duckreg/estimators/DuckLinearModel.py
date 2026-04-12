@@ -243,11 +243,20 @@ class DuckLinearModel(DuckEstimator):
         self._data_fetched = True
 
     def _create_compressed_view(self):
-        """Create a view for compressed data without fetching"""
+        """Materialise compressed data as a DuckDB table.
+
+        Using TABLE (not VIEW) means the aggregation over the source parquet
+        files is executed exactly once here.  Subsequent queries (sufficient
+        statistics, cluster-score residuals, data fetch for numpy fitter, …)
+        all hit the already-materialised in-process table rather than
+        re-scanning the source data from disk on every access.
+        """
         if self.agg_query is None:
             raise ValueError("agg_query must be set before creating view")
-        
-        self.conn.execute(f"CREATE OR REPLACE VIEW {self._COMPRESSED_VIEW} AS {self.agg_query}")
+
+        self.conn.execute(
+            f"CREATE OR REPLACE TABLE {self._COMPRESSED_VIEW} AS {self.agg_query}"
+        )
         
         result = self.conn.execute(f"""
             SELECT SUM(count) as n_obs, COUNT(*) as n_compressed 

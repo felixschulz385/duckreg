@@ -800,18 +800,20 @@ class TestDuckDBFitterFitVcov:
         assert vcov.shape == (3, 3)
         assert np.allclose(vcov, vcov.T, atol=ATOL)
 
-    def test_reuses_xtx_from_existing_result(self, fitter, large_table, mocker):
+    def test_reuses_xtx_from_existing_result(self, fitter, large_table):
         """fit_vcov must not recompute XtX when existing_result is provided."""
         result = fitter.fit(table_name=large_table,
                             x_cols=["x1", "x2"], y_col="sum_y")
-        spy = mocker.spy(fitter, "_fetch_suffstats")
-        fitter.fit_vcov(
-            table_name=large_table,
-            x_cols=["x1", "x2"], y_col="sum_y",
-            vcov_type="HC1",
-            coefficients=result.coefficients,
-            existing_result=result,
-        )
+        with patch.object(
+            fitter, "_fetch_suffstats", wraps=fitter._fetch_suffstats
+        ) as spy:
+            fitter.fit_vcov(
+                table_name=large_table,
+                x_cols=["x1", "x2"], y_col="sum_y",
+                vcov_type="HC1",
+                coefficients=result.coefficients,
+                existing_result=result,
+            )
         # _fetch_suffstats should NOT have been called (XtX already cached)
         spy.assert_not_called()
 

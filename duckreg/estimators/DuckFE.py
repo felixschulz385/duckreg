@@ -36,6 +36,7 @@ import pandas as pd
 
 from .DuckLinearModel import DuckLinearModel
 from ..core.transformers import AutoFETransformer, IterativeDemeanTransformer, MundlakTransformer
+from ..utils.formula_parser import TransformType
 
 logger = logging.getLogger(__name__)
 

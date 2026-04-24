@@ -148,7 +148,7 @@ class TestFormulaParserNullCheck:
         f = parser.parse("(y == 1) ~ x1 | fe1")
         assert f.outcomes[0].is_expression
         assert "(y == 1)" not in f.get_source_columns_for_null_check()
-        assert "(y == 1) IS NOT NULL" in f.get_where_clause_sql()
+        assert "((y = 1)) IS NOT NULL" in f.get_where_clause_sql()
 
 
 # ============================================================================

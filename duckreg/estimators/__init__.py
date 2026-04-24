@@ -41,6 +41,7 @@ from .Duck2SLS import Duck2SLS
 from .DuckMundlakEventStudy import DuckMundlakEventStudy
 from .DuckRidge import DuckRidge
 from .DuckFE import DuckFE
+from .DuckMediation import DuckMediation
 
 __all__ = [
     # Base classes

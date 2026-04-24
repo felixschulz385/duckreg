@@ -15,8 +15,9 @@ from .core.fitters.duckdb_fitter import (
     ridge_closed_form,
     ridge_closed_form_batch,
 )
-from .estimators import DuckRegression
-from .core.results import RegressionResults, FirstStageResults, ModelSummary
+from .estimators import DuckRegression, DuckMediation
+from .estimators.DuckMediation import EquationSpec
+from .core.results import RegressionResults, FirstStageResults, ModelSummary, MediationResults, MediationEffects
 
 __all__ = [
     # Version
@@ -31,10 +32,16 @@ __all__ = [
     "FEMethod",
     # Estimators
     "DuckRegression",
+    "DuckMediation",
+    # Mediation spec
+    "MediationSpec",
+    "EquationSpec",
     # Result containers
     "RegressionResults",
     "FirstStageResults",
     "ModelSummary",
+    "MediationResults",
+    "MediationEffects",
     # Fitters
     "wls",
     "wls_duckdb",

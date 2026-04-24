@@ -129,7 +129,7 @@ def fitted_duckdb(iv_parquet):
 
 class TestConstruction:
     def test_defaults(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)")
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)")
         assert m.method == "mundlak"
         assert m.fitter == "numpy"
         assert m.endogenous_vars == ["endog"]
@@ -137,21 +137,21 @@ class TestConstruction:
 
     def test_fe_method_compat_alias(self, iv_parquet):
         """fe_method= should map to method= for backward compatibility."""
-        m = _build(iv_parquet, "y ~ x | | endog (z)", fe_method="mundlak")
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", fe_method="mundlak")
         assert m.method == "mundlak"
 
     def test_method_demean_accepted(self, iv_parquet):
         """method='demean' is now a supported FE absorption strategy."""
-        m = _build(iv_parquet, "y ~ x | | endog (z)", method="demean")
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", method="demean")
         assert m.method == "demean"
 
     def test_invalid_method_raises(self, iv_parquet):
         """Unsupported method names must raise ValueError."""
         with pytest.raises(ValueError, match="mundlak"):
-            _build(iv_parquet, "y ~ x | | endog (z)", method="invalid")
+            _build(iv_parquet, "y ~ x | | (endog ~ z)", method="invalid")
 
     def test_internal_state_initialized_to_none(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)")
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)")
         assert m._ss_transformer is None
         assert m._exog_sql is None
         assert m._fitted_endog_sql is None
@@ -159,18 +159,18 @@ class TestConstruction:
         assert m._Z is None
 
     def test_formula_extractions(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | firm_id | endog (z)")
+        m = _build(iv_parquet, "y ~ x | firm_id | (endog ~ z)")
         assert "endog" in m.endogenous_vars
         assert "z" in m.instrument_vars
         assert "x" in m.exogenous_vars
         assert "firm_id" in m.fe_cols
 
     def test_first_stage_results_empty_before_fit(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)")
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)")
         assert m.first_stage == {}
 
     def test_results_none_before_fit(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)")
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)")
         assert m.results is None
 
 
@@ -180,7 +180,7 @@ class TestConstruction:
 
 class TestColumnNameHelpers:
     def test_get_exog_sql_excludes_endogenous(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)", remove_singletons=False)
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", remove_singletons=False)
         m.prepare_data()
         exog = m._get_exog_sql()
         # "x" should be present; "endog" must NOT be in exog
@@ -188,14 +188,14 @@ class TestColumnNameHelpers:
         assert not any("endog" in s for s in exog)
 
     def test_get_exog_sql_excludes_intercept(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)", remove_singletons=False)
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", remove_singletons=False)
         m.prepare_data()
         exog = m._get_exog_sql()
         assert "Intercept" not in exog
         assert "intercept" not in exog
 
     def test_get_inst_sql(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)", remove_singletons=False)
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", remove_singletons=False)
         m.prepare_data()
         inst = m._get_inst_sql()
         assert any("z" in s for s in inst)
@@ -292,7 +292,7 @@ class TestDisplayNameBuilders:
 
 class TestPrepareData:
     def test_staging_table_exists(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)", remove_singletons=False)
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", remove_singletons=False)
         m.prepare_data()
         count = m.conn.execute(
             f"SELECT COUNT(*) FROM {Duck2SLS._STAGING_TABLE}"
@@ -300,7 +300,7 @@ class TestPrepareData:
         assert count > 0
 
     def test_staging_table_has_row_idx(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)", remove_singletons=False)
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", remove_singletons=False)
         m.prepare_data()
         cols = set(
             m.conn.execute(
@@ -310,7 +310,7 @@ class TestPrepareData:
         assert "_row_idx" in cols
 
     def test_staging_table_row_idx_unique(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)", remove_singletons=False)
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", remove_singletons=False)
         m.prepare_data()
         total, unique = m.conn.execute(
             f"SELECT COUNT(*), COUNT(DISTINCT _row_idx) FROM {Duck2SLS._STAGING_TABLE}"
@@ -318,7 +318,7 @@ class TestPrepareData:
         assert total == unique, "_row_idx values must be unique"
 
     def test_staging_table_has_outcome_and_endog(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)", remove_singletons=False)
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", remove_singletons=False)
         m.prepare_data()
         cols = set(
             m.conn.execute(
@@ -330,7 +330,7 @@ class TestPrepareData:
         assert "z" in cols or any("z" in c for c in cols)
 
     def test_n_obs_set_after_prepare_data(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)", remove_singletons=False)
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", remove_singletons=False)
         m.prepare_data()
         assert m.n_obs == 80 * 8
 
@@ -341,7 +341,7 @@ class TestPrepareData:
 
 class TestAddFittedColumn:
     def test_fitted_column_appears_in_staging_after_first_stage(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)", remove_singletons=False)
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", remove_singletons=False)
         m.prepare_data()
         m._run_first_stages()
         cols = set(
@@ -354,7 +354,7 @@ class TestAddFittedColumn:
         assert len(fitted_cols) >= 1
 
     def test_fitted_column_has_no_nulls(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)", remove_singletons=False)
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", remove_singletons=False)
         m.prepare_data()
         m._run_first_stages()
         # Get the fitted column name dynamically
@@ -368,7 +368,7 @@ class TestAddFittedColumn:
         assert null_count == 0
 
     def test_row_idx_preserved_after_first_stage(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)", remove_singletons=False)
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", remove_singletons=False)
         m.prepare_data()
         n_before = m.conn.execute(
             f"SELECT COUNT(*) FROM {Duck2SLS._STAGING_TABLE}"
@@ -417,7 +417,7 @@ class TestFirstStage:
         df["z_weak"] = rng.standard_normal(len(df)) * 0.001   # tiny
         path = _make_parquet(df)
         try:
-            m = _build(path, "y ~ x | | endog (z_weak)", fitter="numpy",
+            m = _build(path, "y ~ x | | (endog ~ z_weak)", fitter="numpy",
                        remove_singletons=False)
             m.fit(se_method="HC1")
             assert m.has_weak_instruments() is True
@@ -449,7 +449,7 @@ class TestFirstStage:
 class TestProperties:
     def test_results_none_without_vcov(self, iv_parquet):
         """results property requires at least point_estimate."""
-        m = _build(iv_parquet, "y ~ x | | endog (z)", remove_singletons=False)
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", remove_singletons=False)
         assert m.results is None
 
     def test_results_not_none_after_fit(self, fitted_numpy):
@@ -593,7 +593,7 @@ class TestVCov:
         np.testing.assert_allclose(vcov, vcov.T, atol=1e-12)
 
     def test_fit_vcov_raises_before_compress_data(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)", remove_singletons=False)
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", remove_singletons=False)
         m.prepare_data()
         # point_estimate not set → _X_actual is None
         with pytest.raises(RuntimeError):
@@ -652,13 +652,13 @@ class TestOutputMethods:
         assert "variable" in df.columns
 
     def test_summary_df_empty_before_fit(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)")
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)")
         df = m.summary_df()
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 0
 
     def test_to_tidy_df_empty_before_fit(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | endog (z)")
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)")
         df = m.to_tidy_df()
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 0
@@ -702,7 +702,7 @@ class TestMultipleEndogenousVariables:
     def test_two_first_stage_results(self, multi_endog_parquet):
         m = _build(
             multi_endog_parquet,
-            "y ~ x | | endog1 + endog2 (z1 + z2)",
+            "y ~ x | | (endog1 + endog2 ~ z1 + z2)",
             fitter="numpy", remove_singletons=False,
         )
         m.fit(se_method="HC1")
@@ -711,7 +711,7 @@ class TestMultipleEndogenousVariables:
     def test_f_stats_for_both_endogenous(self, multi_endog_parquet):
         m = _build(
             multi_endog_parquet,
-            "y ~ x | | endog1 + endog2 (z1 + z2)",
+            "y ~ x | | (endog1 + endog2 ~ z1 + z2)",
             fitter="numpy", remove_singletons=False,
         )
         m.fit(se_method="HC1")
@@ -722,7 +722,7 @@ class TestMultipleEndogenousVariables:
     def test_coef_names_include_both_endog(self, multi_endog_parquet):
         m = _build(
             multi_endog_parquet,
-            "y ~ x | | endog1 + endog2 (z1 + z2)",
+            "y ~ x | | (endog1 + endog2 ~ z1 + z2)",
             fitter="numpy", remove_singletons=False,
         )
         m.fit(se_method="HC1")
@@ -732,7 +732,7 @@ class TestMultipleEndogenousVariables:
     def test_two_fitted_columns_in_staging(self, multi_endog_parquet):
         m = _build(
             multi_endog_parquet,
-            "y ~ x | | endog1 + endog2 (z1 + z2)",
+            "y ~ x | | (endog1 + endog2 ~ z1 + z2)",
             fitter="numpy", remove_singletons=False,
         )
         m.prepare_data()
@@ -752,7 +752,7 @@ class TestSubset:
     def test_subset_reduces_n_obs(self, iv_parquet, iv_panel_data):
         full_n = len(iv_panel_data)
         m = _build(
-            iv_parquet, "y ~ x | | endog (z)",
+            iv_parquet, "y ~ x | | (endog ~ z)",
             subset="year >= 2014", remove_singletons=False,
         )
         m.prepare_data()

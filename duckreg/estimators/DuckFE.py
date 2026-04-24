@@ -304,21 +304,17 @@ class DuckFE(DuckLinearModel):
             for mfe in self.formula.merged_fes:
                 extra_select_exprs.append(mfe.get_select_sql())
 
-            # Computed outcome/covariate/FE expressions
-            # (plain columns already exist in the source table under their
-            # original name)
-            for var in self.formula.fixed_effects:
-                if var.needs_select_alias():
-                    extra_select_exprs.append(
-                        var.get_select_sql(unit_col, "year", boolean_cols)
-                    )
+            # Transformed outcome/covariate expressions
+            # (only needed when a transform is applied or when the variable is
+            # a parenthesised expression like (col == 190); plain columns already
+            # exist in the source table under their original name)
             for var in self.formula.outcomes:
-                if var.needs_select_alias():
+                if var.transform != TransformType.NONE or var.is_expr():
                     extra_select_exprs.append(
                         var.get_select_sql(unit_col, "year", boolean_cols)
                     )
             for var in self.formula.covariates:
-                if not var.is_intercept() and var.needs_select_alias():
+                if not var.is_intercept() and (var.transform != TransformType.NONE or var.is_expr()):
                     extra_select_exprs.append(
                         var.get_select_sql(unit_col, "year", boolean_cols)
                     )

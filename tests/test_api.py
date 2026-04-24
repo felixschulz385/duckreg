@@ -144,6 +144,12 @@ class TestFormulaParserNullCheck:
         assert "_intercept" not in cols
         assert "1" not in cols
 
+    def test_expression_outcome_is_not_treated_as_source_column(self, parser):
+        f = parser.parse("(y == 1) ~ x1 | fe1")
+        assert f.outcomes[0].is_expression
+        assert "(y == 1)" not in f.get_source_columns_for_null_check()
+        assert "(y == 1) IS NOT NULL" in f.get_where_clause_sql()
+
 
 # ============================================================================
 # B. quote_identifier / needs_quoting helpers
@@ -228,6 +234,18 @@ class TestDuckregFE:
 
     def test_two_way_fe_runs(self, small_df):
         model = duckreg("y ~ x1 | fe1 + fe2", data=small_df, se_method="none")
+        assert model.point_estimate is not None
+
+    def test_fe_accepts_expression_outcome(self, small_df):
+        df = small_df.assign(y_class=(small_df["y"] > small_df["y"].median()).astype(int))
+        model = duckreg(
+            "(y_class == 1) ~ x1 | fe1 + fe2",
+            data=df,
+            se_method="none",
+            fe_method="demean",
+            fitter="duckdb",
+        )
+        assert model.n_obs == len(df)
         assert model.point_estimate is not None
 
     def test_mundlak_fe_method(self, small_df):

@@ -8,9 +8,9 @@
   `scripts/orchestrate.py` if necessary, and visualises the results.
 
 - `scripts/orchestrate.py` – builds the full grid of parameter combinations,
-  submits one `scripts/run_single_benchmark.sh` job per combo (throttled to a
-  configurable maximum), tracks submissions in `results/manifest.csv`, and upon
-  completion calls `scripts/collect_results.py` to merge JSON outputs.
+  submits one `run_single_benchmark.sh` job per combo (throttled to a
+  configurable maximum), tracks submissions in `manifest.csv`, and upon
+  completion calls `collect_results.py` to merge JSON outputs.
 
 - `scripts/run_single_benchmark.sh` – SLURM wrapper invoked by the orchestrator.
   It activates the conda environment and runs `run_single.py` with the

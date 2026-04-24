@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=duckreg_bench
-#SBATCH --output=./log/slurm-%j.log
-#SBATCH --error=./log/slurm-%j.err
+#SBATCH --output=./logs/slurm-%j.log
+#SBATCH --error=./logs/slurm-%j.err
 #SBATCH --partition=scicore
 #SBATCH --time=0-12:00:00
 #SBATCH --qos=1day
@@ -12,23 +12,25 @@
 eval "$(/scicore/home/meiera/schulz0022/miniforge-pypy3/bin/conda shell.bash hook)"
 conda activate gnt
 
-# compute root based on script location and cd there
-SCRIPT_DIR="$(dirname "$0")"
-ROOT_DIR="$(realpath "$SCRIPT_DIR/..")"
-cd "${ROOT_DIR}"
+# Determine benchmarks root.  When SLURM copies the script to
+# /var/spool/slurm/scripts the automatic `dirname $0` trick points there,
+# which is not what we want.  Instead trust the submission directory if
+# available, otherwise fall back to the hard-coded repository path.
+ROOT_DIR="${SLURM_SUBMIT_DIR:-/scicore/home/meiera/schulz0022/projects/duckreg/benchmarks}"
+cd "${ROOT_DIR}" || exit 1
 
-mkdir -p "${ROOT_DIR}/log"
+mkdir -p "${ROOT_DIR}/logs"
 
-# we accept an optional results directory argument; default is the standard CSV
-OUTPUT_DIR="${1:-results}"
-
-# orchestrate.py creates its own log directory and manifest; it writes JSON
-# results under $OUTPUT_DIR and then merges into a CSV named
-# benchmark_results_large.csv inside benchmarks/ when finished.
+# Optional: pass a run ID to resume or name a specific run.
+#   sbatch slurm_benchmark.sh [run_id]
+RUN_ID_ARG=""
+if [[ -n "$1" ]]; then
+    RUN_ID_ARG="--run-id $1"
+fi
 
 echo "Starting orchestration at $(date)"
-echo "Results directory: ${OUTPUT_DIR}"
+[[ -n "${RUN_ID_ARG}" ]] && echo "Run ID arg: ${RUN_ID_ARG}"
 
-python scripts/orchestrate.py --results-dir "${OUTPUT_DIR}"
+python scripts/orchestrate.py ${RUN_ID_ARG}
 
 echo "Orchestration finished at $(date)"

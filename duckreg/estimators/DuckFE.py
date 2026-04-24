@@ -298,24 +298,27 @@ class DuckFE(DuckLinearModel):
             # original columns remain accessible, plus extra aliases for each
             # computed expression so the transformer can reference them by
             # their sql_name.
-            from ..utils.formula_parser import TransformType
-
             extra_select_exprs = []
 
             # Merged FE expressions (e.g. country_year from country*year)
             for mfe in self.formula.merged_fes:
                 extra_select_exprs.append(mfe.get_select_sql())
 
-            # Transformed outcome/covariate expressions
-            # (only needed when a transform is applied; plain columns already
-            # exist in the source table under their original name)
+            # Computed outcome/covariate/FE expressions
+            # (plain columns already exist in the source table under their
+            # original name)
+            for var in self.formula.fixed_effects:
+                if var.needs_select_alias():
+                    extra_select_exprs.append(
+                        var.get_select_sql(unit_col, "year", boolean_cols)
+                    )
             for var in self.formula.outcomes:
-                if var.transform != TransformType.NONE:
+                if var.needs_select_alias():
                     extra_select_exprs.append(
                         var.get_select_sql(unit_col, "year", boolean_cols)
                     )
             for var in self.formula.covariates:
-                if not var.is_intercept() and var.transform != TransformType.NONE:
+                if not var.is_intercept() and var.needs_select_alias():
                     extra_select_exprs.append(
                         var.get_select_sql(unit_col, "year", boolean_cols)
                     )

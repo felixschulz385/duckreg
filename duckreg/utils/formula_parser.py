@@ -176,6 +176,9 @@ def _make_sql_safe_name(name: str) -> str:
     safe = name.replace('(', '_').replace(')', '').replace('+', '_').replace('-', '_')
     safe = safe.replace('*', '_').replace(':', '_').replace('.', '_').replace(' ', '_')
     safe = safe.replace('/', '_').replace(',', '_').replace(';', '_')
+    safe = safe.replace('=', '_eq_').replace('!', '_not_')
+    safe = safe.replace('<', '_lt_').replace('>', '_gt_')
+    safe = safe.replace('&', '_and_').replace('|', '_or_')
     
     # Remove consecutive underscores
     while '__' in safe:
@@ -201,6 +204,7 @@ class Variable:
     lag: Optional[int] = None
     display_name: Optional[str] = None
     sql_name: Optional[str] = None  # Clean SQL-safe identifier
+    is_expression: bool = False
     
     def __post_init__(self):
         # Build display name from transform info
@@ -232,6 +236,12 @@ class Variable:
         # Special case for intercept
         if self.is_intercept():
             return "1"
+
+        if self.is_expression:
+            expr = self.name.strip()
+            if expr.startswith("(") and expr.endswith(")"):
+                expr = expr[1:-1].strip()
+            return expr
         
         # Build base expression with proper quoting
         base_expr = quote_identifier(self.name)
@@ -271,6 +281,10 @@ class Variable:
         expr = self.get_sql_expression(unit_col, time_col)
         expr = cast_if_boolean(expr, self.name, boolean_cols or set())
         return f"{expr} AS {self.sql_name}"
+
+    def needs_select_alias(self) -> bool:
+        """Whether this variable must be materialised before alias-based use."""
+        return self.is_expression or self.transform != TransformType.NONE or self.lag is not None
 
 
 @dataclass(frozen=True)
@@ -495,7 +509,7 @@ class Formula:
         # Add names from simple variables (excluding intercept)
         for var_list in (self.outcomes, self.covariates, self.fixed_effects, self.endogenous, self.instruments):
             for var in var_list:
-                if not var.is_intercept():
+                if not var.is_intercept() and not var.is_expression:
                     cols.add(var.name)
         
         # Interaction components
@@ -513,6 +527,15 @@ class Formula:
             cols.add(self.cluster.name)
         
         return list(cols)
+
+    def get_expression_null_checks(self) -> List[str]:
+        """Get NULL-check predicates for SQL expression terms."""
+        checks = []
+        for var_list in (self.outcomes, self.covariates, self.fixed_effects, self.endogenous, self.instruments):
+            for var in var_list:
+                if var.is_expression:
+                    checks.append(f"({var.get_sql_expression()}) IS NOT NULL")
+        return checks
     
     # -------------------------------------------------------------------------
     # SQL generation methods
@@ -551,7 +574,7 @@ class Formula:
         
         for var in self.fixed_effects:
             expr = cast_if_boolean(var.get_sql_expression(), var.name, boolean_cols)
-            alias = quote_identifier(var.name)
+            alias = var.sql_name if var.needs_select_alias() else quote_identifier(var.name)
             parts.append(f"{expr} AS {alias}")
         
         parts.extend(mfe.get_select_sql(boolean_cols) for mfe in self.merged_fes)
@@ -583,7 +606,11 @@ class Formula:
         """Generate complete WHERE clause with NULL check and optional user subset"""
         cols = self.get_source_columns_for_null_check()
         # Use column names as strings in COLUMNS() function
-        null_check = f"COLUMNS([{', '.join(repr(c) for c in cols)}]) IS NOT NULL" if cols else "1=1"
+        null_checks = []
+        if cols:
+            null_checks.append(f"COLUMNS([{', '.join(repr(c) for c in cols)}]) IS NOT NULL")
+        null_checks.extend(self.get_expression_null_checks())
+        null_check = " AND ".join(null_checks) if null_checks else "1=1"
         
         if user_subset:
             return f"WHERE {null_check} AND ({user_subset})"
@@ -663,6 +690,7 @@ class FormulaParser:
     _TRANSFORM_PATTERN = re.compile(r'^(\w+)\((.*)\)$')
     _LAG_LEAD_PATTERN = re.compile(r'^(L|F)(\d*)\.(.+)$')
     _SHIFT_PATTERN = re.compile(r'^(.+?)\s*([+\-])\s*([0-9.]+)$')
+    _SIMPLE_IDENTIFIER_PATTERN = re.compile(r'^[A-Za-z_][A-Za-z0-9_\.]*$')
     
     def parse(self, formula: str) -> Formula:
         """Parse a formula string into a Formula object.
@@ -845,7 +873,22 @@ class FormulaParser:
         
         # Normalize variable name (e.g., '1' -> '_intercept')
         normalized_name = _normalize_variable_name(term_no_lag)
+        if self._is_sql_expression(normalized_name):
+            return Variable(
+                name=normalized_name,
+                role=role,
+                lag=lag_val,
+                display_name=normalized_name,
+                sql_name=_make_sql_safe_name(normalized_name),
+                is_expression=True,
+            )
         return Variable(name=normalized_name, role=role, lag=lag_val)
+
+    def _is_sql_expression(self, term: str) -> bool:
+        """Return True for formula terms that are SQL expressions, not columns."""
+        if term in ("_intercept", "1"):
+            return False
+        return self._SIMPLE_IDENTIFIER_PATTERN.match(term) is None
     
     def _parse_lag_lead(self, term: str) -> Tuple[str, Optional[int]]:
         """Parse lag/lead prefix"""

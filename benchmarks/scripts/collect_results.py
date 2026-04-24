@@ -1,11 +1,18 @@
 """
-Collect individual JSON result files into a single CSV.  This helper
-is kept under `scripts/`; it should be invoked from the benchmarks root or via
-`scripts/orchestrate.py`.  Results and the optional manifest are expected to
-live inside the supplied `results-dir`.
+Collect individual JSON result files into a single CSV.
+
+Artefacts for a given run live under three sibling directories:
+
+    benchmarks/results/<run_id>/     – per-combination JSON result files
+    benchmarks/manifests/<run_id>/   – manifest.csv tracking submitted jobs
+    benchmarks/logs/<run_id>/        – SLURM .log / .err files
 
 Usage:
-    python collect_results.py [--results-dir results] [--output benchmark_results_large.csv]
+    python collect_results.py --run-id 20260305_143022
+    python collect_results.py --run-id 20260305_143022 --output my_results.csv
+    # Override base directories if needed:
+    python collect_results.py --run-id ID --results-base results \
+        --manifests-base manifests --logs-base logs
 """
 import argparse
 import json
@@ -14,33 +21,57 @@ from pathlib import Path
 
 import pandas as pd
 
-# relocate to benchmarks root so that results and log dirs are siblings
 SCRIPT_DIR = Path(__file__).parent
-BENCH_DIR = SCRIPT_DIR.parent
+BENCH_DIR  = SCRIPT_DIR.parent
 OOM_PATTERN = re.compile(r"Detected \d+ oom_kill event", re.IGNORECASE)
+# Lines in .err files that indicate a memory-related failure.
+_ERR_PATTERNS = re.compile(
+    r"(oom_kill|Killed|MemoryError|Out of memory|Cannot allocate|bad_alloc"
+    r"|std::bad_alloc|memory exhausted|Traceback|Error:|Exception:)",
+    re.IGNORECASE,
+)
+_MAX_ERR_LINES = 10  # max lines to capture per job
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def load_manifest(results_path: Path) -> pd.DataFrame:
-    manifest_csv = results_path / "manifest.csv"
+def load_manifest(manifests_path: Path) -> pd.DataFrame:
+    manifest_csv = manifests_path / "manifest.csv"
     if not manifest_csv.exists():
-        return pd.DataFrame(columns=["package", "model_type", "N", "K", "nFE1", "nFE2", "job_id"])
+        return pd.DataFrame(
+            columns=["package", "model_type", "N", "K", "nFE1", "nFE2",
+                     "vcov", "threads", "job_id"]
+        )
     return pd.read_csv(manifest_csv, dtype={"job_id": str})
 
 
-def check_err_for_oom(log_dir: Path, job_id: str) -> bool:
-    """Return True if the .err file for job_id contains an OOM kill event."""
-    err_file = log_dir / f"slurm-{job_id}.err"
+def read_err_info(logs_path: Path, job_id: str) -> tuple[bool, str | None]:
+    """Read the SLURM .err file for *job_id*.
+
+    Returns
+    -------
+    (is_oom, err_snippet)
+        *is_oom*      – True when an OOM kill event was detected.
+        *err_snippet* – Up to _MAX_ERR_LINES relevant lines joined by ``|``,
+                        or None when no matching lines were found.
+    """
+    err_file = logs_path / f"slurm-{job_id}.err"
     if not err_file.exists():
-        return False
+        return False, None
     try:
         content = err_file.read_text(errors="replace")
-        return bool(OOM_PATTERN.search(content))
     except Exception:
-        return False
+        return False, None
+    is_oom   = bool(OOM_PATTERN.search(content))
+    relevant = [
+        line.strip()
+        for line in content.splitlines()
+        if _ERR_PATTERNS.search(line)
+    ]
+    snippet = " | ".join(relevant[:_MAX_ERR_LINES]) or None
+    return is_oom, snippet
 
 
 def load_json_result(path: Path) -> dict:
@@ -55,10 +86,15 @@ def load_json_result(path: Path) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
-def collect(results_dir: str, output_csv: str):
-    results_path = BENCH_DIR / results_dir
-    log_dir = BENCH_DIR / "log"
-    manifest = load_manifest(results_path)
+def collect(run_id: str, output_csv: str,
+            results_base: str  = "results",
+            manifests_base: str = "manifests",
+            logs_base: str     = "logs"):
+    results_path   = BENCH_DIR / results_base   / run_id
+    manifests_path = BENCH_DIR / manifests_base / run_id
+    logs_path      = BENCH_DIR / logs_base      / run_id
+
+    manifest = load_manifest(manifests_path)
 
     records = []
 
@@ -71,22 +107,36 @@ def collect(results_dir: str, output_csv: str):
         data = load_json_result(jf)
         if "_load_error" not in data:
             records.append(data)
-            key = (data.get("package"), data.get("model_type"),
-                   data.get("N"), data.get("K"), data.get("nFE1"))
+            key = (
+                data.get("package"),
+                data.get("model_type"),
+                data.get("N"),
+                data.get("K"),
+                data.get("nFE1"),
+                data.get("vcov", "HC1"),
+                data.get("threads", 1),
+            )
             completed_keys.add(key)
 
     # --- 2. Find missing runs from manifest and check for OOM ---
-    oom_count = 0
+    oom_count     = 0
     missing_count = 0
     if not manifest.empty:
         for _, row in manifest.iterrows():
-            key = (row["package"], row["model_type"],
-                   int(row["N"]), int(row["K"]), int(row["nFE1"]))
+            key = (
+                row["package"],
+                row["model_type"],
+                int(row["N"]),
+                int(row["K"]),
+                int(row["nFE1"]),
+                row.get("vcov", "HC1"),
+                int(row.get("threads", 1)),
+            )
             if key in completed_keys:
                 continue  # already have result
 
             job_id = str(row.get("job_id", ""))
-            is_oom = check_err_for_oom(log_dir, job_id) if job_id else False
+            is_oom, slurm_err_snippet = read_err_info(logs_path, job_id) if job_id else (False, None)
             status = "oom_killed" if is_oom else "missing"
             if is_oom:
                 oom_count += 1
@@ -100,19 +150,32 @@ def collect(results_dir: str, output_csv: str):
                 "K":            int(row["K"]),
                 "nFE1":         int(row["nFE1"]),
                 "nFE2":         int(row.get("nFE2", row["nFE1"])),
+                "vcov":         row.get("vcov", "HC1"),
+                "threads":      int(row.get("threads", 1)),
                 "job_id":       job_id,
                 "status":       status,
                 "time_seconds": None,
                 "error":        "OOM killed" if is_oom else "No result file found",
+                "slurm_error":  slurm_err_snippet,
             })
 
-    # --- 3. Also scan ALL .err files for any OOM events (summary) ---
-    all_err_files = sorted(log_dir.glob("slurm-*.err"))
+    # --- 3. Scan ALL .err files in logs_path; attach slurm_error to existing records ---
+    # Also collect a set of OOM job IDs for the summary print.
     oom_job_ids = []
-    for err_file in all_err_files:
-        job_id = err_file.stem.replace("slurm-", "")
-        if check_err_for_oom(log_dir, job_id):
-            oom_job_ids.append(job_id)
+    job_err_map: dict[str, str | None] = {}   # job_id -> snippet
+    if logs_path.exists():
+        for err_file in sorted(logs_path.glob("slurm-*.err")):
+            jid = err_file.stem.replace("slurm-", "")
+            is_oom, snippet = read_err_info(logs_path, jid)
+            if is_oom:
+                oom_job_ids.append(jid)
+            if snippet:
+                job_err_map[jid] = snippet
+
+    # Back-fill slurm_error on records loaded from JSON (they don't have it).
+    for rec in records:
+        if "slurm_error" not in rec:
+            rec["slurm_error"] = job_err_map.get(str(rec.get("job_id", "")), None)
 
     # --- 4. Build DataFrame and save ---
     df = pd.DataFrame(records)
@@ -122,14 +185,15 @@ def collect(results_dir: str, output_csv: str):
         return df
 
     # Ensure consistent column order
-    cols = ["package", "model_type", "N", "K", "nFE1", "nFE2",
-            "job_id", "status", "time_seconds", "error"]
+    cols = ["package", "model_type", "N", "K", "nFE1", "nFE2", "vcov", "threads",
+            "job_id", "status", "time_seconds", "error", "slurm_error"]
     for c in cols:
         if c not in df.columns:
             df[c] = None
     df = df[cols]
 
     out_path = BENCH_DIR / output_csv
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_path, index=False)
 
     # --- 5. Summary ---
@@ -141,7 +205,7 @@ def collect(results_dir: str, output_csv: str):
     print(f"  Missing        : {(df['status'] == 'missing').sum()}")
 
     if oom_job_ids:
-        print(f"\n  OOM events detected in .err files (job IDs): {', '.join(oom_job_ids)}")
+        print(f"\n  OOM events in .err files (job IDs): {', '.join(oom_job_ids)}")
 
     return df
 
@@ -152,11 +216,26 @@ def collect(results_dir: str, output_csv: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collect benchmark JSON results into CSV")
-    parser.add_argument("--results-dir", default="results")
-    parser.add_argument("--output",      default="benchmark_results_large.csv")
+    parser.add_argument("--run-id",          required=True,
+                        help="Run ID (e.g. 20260305_143022)")
+    parser.add_argument("--results-base",    default="results")
+    parser.add_argument("--manifests-base",  default="manifests")
+    parser.add_argument("--logs-base",       default="logs")
+    parser.add_argument("--output",          default=None,
+                        help="Output CSV path relative to benchmarks root "
+                             "(default: benchmark_results_<run_id>.csv)")
     args = parser.parse_args()
 
-    df = collect(args.results_dir, args.output)
+    output_csv = args.output or f"benchmark_results_{args.run_id}.csv"
+
+    df = collect(
+        run_id=args.run_id,
+        output_csv=output_csv,
+        results_base=args.results_base,
+        manifests_base=args.manifests_base,
+        logs_base=args.logs_base,
+    )
     if df is not None and not df.empty:
         print("\nStatus breakdown:")
-        print(df.groupby(["package", "status"]).size().to_string())
+        print(df.groupby(["package", "threads", "vcov", "status"]).size().to_string())
+

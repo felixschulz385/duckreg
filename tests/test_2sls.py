@@ -998,7 +998,7 @@ class TestSSCAutoSelection2SLS:
 # ===========================================================================
 
 class TestCompressionCorrectness2SLS:
-    """Verify nobs tracking and round_strata stability for the 2SLS path.
+    """Verify nobs tracking and compression stability for the 2SLS path.
 
     Mirrors :class:`TestCompressionCorrectness` in *test_fe_demean.py*.
     """
@@ -1020,15 +1020,15 @@ class TestCompressionCorrectness2SLS:
         m.fit(se_method="iid")
         assert m.vcov_meta.get('N', m.n_obs) == len(iv_panel_data)
 
-    def test_round_strata_se_stability(self, iv_parquet):
-        """round_strata=5 must not shift SEs by more than 1 %."""
+    def test_compression_se_stability(self, iv_parquet):
+        """compression=5 must not shift SEs by more than 1 %."""
         m_exact = _build(iv_parquet, "y ~ x | firm_id | (endog ~ z)",
-                         fitter="numpy", remove_singletons=False)
+                   fitter="numpy", remove_singletons=False)
         m_exact.fit(se_method="HC1")
 
         m_rounded = _build(iv_parquet, "y ~ x | firm_id | (endog ~ z)",
                            fitter="numpy", remove_singletons=False,
-                           round_strata=5)
+                           compression=5)
         m_rounded.fit(se_method="HC1")
 
         se_exact   = np.sqrt(np.diag(m_exact.vcov))
@@ -1037,7 +1037,7 @@ class TestCompressionCorrectness2SLS:
         np.testing.assert_allclose(
             se_rounded, se_exact, rtol=0.01,
             err_msg=(
-                "round_strata=5 caused >1 % SE deviation for Duck2SLS. "
+                "compression=5 caused >1 % SE deviation for Duck2SLS. "
                 "Check that rounding affects strata formation only, "
                 "not the residual or score computation."
             ),
@@ -1053,6 +1053,13 @@ class TestCompressionCorrectness2SLS:
                 f"Missing column {col!r} in df_compressed"
             )
         assert m.df_compressed["count"].sum() == m.n_obs
+
+    def test_compression_minus_one_disables_grouping(self, iv_parquet, iv_panel_data):
+        m = _build(iv_parquet, "y ~ x | firm_id | (endog ~ z)",
+                   fitter="duckdb", remove_singletons=False, compression=-1)
+        m.fit(se_method="iid")
+        assert m.n_compressed_rows == len(iv_panel_data)
+        assert np.all(m.df_compressed["count"].values == 1)
 
     def test_no_fe_nobs_is_full_dataset(self, iv_parquet, iv_panel_data):
         """Even without FE, n_obs must equal total observations."""

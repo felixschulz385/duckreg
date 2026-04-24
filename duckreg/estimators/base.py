@@ -33,6 +33,7 @@ class DuckEstimator(ABC):
         n_bootstraps: int = 0,
         fitter: str = "numpy",
         keep_connection_open: bool = False,
+        compression: int = None,
         round_strata: int = None,
         duckdb_kwargs: dict = None,
         remove_singletons: bool = True,
@@ -45,7 +46,19 @@ class DuckEstimator(ABC):
         self.seed = seed
         self.fitter = fitter
         self.keep_connection_open = keep_connection_open
-        self.round_strata = round_strata
+        if compression is not None and round_strata is not None and compression != round_strata:
+            raise ValueError(
+                "compression and round_strata specify different settings. "
+                "Use only one, or make them equal."
+            )
+        resolved_compression = compression if compression is not None else round_strata
+        if resolved_compression is not None:
+            if not isinstance(resolved_compression, int) or resolved_compression < -1:
+                raise ValueError(
+                    f"compression must be an integer >= -1 or None, got {resolved_compression!r}"
+                )
+        self.compression = resolved_compression
+        self.round_strata = None if resolved_compression == -1 else resolved_compression
         self.duckdb_kwargs = duckdb_kwargs
         self.remove_singletons = remove_singletons
         
@@ -60,6 +73,11 @@ class DuckEstimator(ABC):
         self.n_rows_dropped_singletons: int = 0
         
         self._init_connection()
+
+    @property
+    def compression_disabled(self) -> bool:
+        """Whether row-level compression has been disabled entirely."""
+        return self.compression == -1
 
     def _init_connection(self):
         """Initialize DuckDB connection and RNG"""
@@ -106,7 +124,12 @@ class DuckEstimator(ABC):
         self._compute_standard_errors(se_method)
         
         # Cleanup
-        if not self.keep_connection_open:
+        should_keep_open_for_lazy_fetch = (
+            self.fitter == "duckdb"
+            and hasattr(self, "_data_fetched")
+            and not getattr(self, "_data_fetched")
+        )
+        if not self.keep_connection_open and not should_keep_open_for_lazy_fetch:
             self.conn.close()
         
         logger.debug(f"fit() END")

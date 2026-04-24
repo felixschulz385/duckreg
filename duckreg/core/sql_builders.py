@@ -692,7 +692,7 @@ def build_exact_meat_query(
     """
     Build SQL query for exact meat matrix using stored per-stratum sum-of-squares.
 
-    When data are compressed into strata (e.g. via ``round_strata``), each stratum
+    When data are compressed into strata (e.g. via ``compression`` rounding), each stratum
     may contain observations with different y values.  The standard approach of
     using the mean residual ``(mean_y - x@theta)`` underestimates the true meat
     because it ignores within-stratum y variation.

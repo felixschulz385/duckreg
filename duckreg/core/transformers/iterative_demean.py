@@ -362,10 +362,11 @@ class IterativeDemeanTransformer(FETransformer):
         # MAX(ABS(...)) works across all variables.  This reduces the number
         # of full scans from |fe_cols| × |resid_cols| to |fe_cols|.
         # Groups by integer code — avoids string/BIGINT comparison overhead.
-        _sample_clause = (
-            f"USING SAMPLE {self.convergence_sample * 100} PERCENT (bernoulli)"
+        _sample_from = (
+            f"(SELECT * FROM _resid_store USING SAMPLE {self.convergence_sample * 100} "
+            f"PERCENT (bernoulli)) _sample"
             if self.convergence_sample < 1.0
-            else ""
+            else "_resid_store"
         )
         # When convergence_sample < 1.0 each FE dimension samples _resid_store
         # independently (different random draws).  This is intentional: correlated
@@ -379,7 +380,7 @@ class IterativeDemeanTransformer(FETransformer):
                 "FROM ("
                 "SELECT " +
                 ", ".join(f"AVG({rc}) AS avg_{rc}" for rc in resid_cols) +
-                f" FROM _resid_store {_sample_clause} "
+                f" FROM {_sample_from} "
                 f"GROUP BY _code_{fe}"
                 ") _agg"
             )

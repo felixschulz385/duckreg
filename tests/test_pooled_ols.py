@@ -261,7 +261,7 @@ def _dr_coef_se(m, var: str = "ntl_harm"):
 
 def _duckreg(formula, path, vcov, fitter):
     return duckreg(formula=formula, data=path, seed=42,
-                   round_strata=5, se_method=vcov, fitter=fitter)
+                   compression=5, se_method=vcov, fitter=fitter)
 
 
 def _dr_se(vcov):
@@ -650,28 +650,28 @@ class TestCompressionStructure:
     def test_required_columns_present(self, balanced_path):
         """df_compressed must contain count, sum_<outcome>, and sum_<outcome>_sq."""
         m = duckreg("modis_median ~ ntl_harm + exog_control",
-                    data=balanced_path, round_strata=3, se_method="none")
+                    data=balanced_path, compression=3, se_method="none")
         for col in ("count", "sum_modis_median", "sum_modis_median_sq"):
             assert col in m.df_compressed.columns, f"Missing column: {col!r}"
 
     def test_count_sums_to_n(self, balanced_df, balanced_path):
         """Sum of count column must equal the number of original rows."""
         m = duckreg("modis_median ~ ntl_harm + exog_control",
-                    data=balanced_path, round_strata=3, se_method="none")
+                    data=balanced_path, compression=3, se_method="none")
         assert m.df_compressed["count"].sum() == len(balanced_df)
 
     def test_higher_precision_more_strata(self, balanced_path):
-        """round_strata=5 must yield at least as many strata as round_strata=3."""
+        """compression=5 must yield at least as many strata as compression=3."""
         m3 = duckreg("modis_median ~ ntl_harm + exog_control",
-                     data=balanced_path, round_strata=3, se_method="none")
+                     data=balanced_path, compression=3, se_method="none")
         m5 = duckreg("modis_median ~ ntl_harm + exog_control",
-                     data=balanced_path, round_strata=5, se_method="none")
+                     data=balanced_path, compression=5, se_method="none")
         assert len(m5.df_compressed) >= len(m3.df_compressed)
 
     def test_agg_query_is_valid_sql(self, balanced_path):
         """agg_query attribute must be a non-empty SQL string."""
         m = duckreg("modis_median ~ ntl_harm + exog_control",
-                    data=balanced_path, round_strata=3, se_method="none")
+                    data=balanced_path, compression=3, se_method="none")
         assert hasattr(m, "agg_query") and isinstance(m.agg_query, str)
         q = m.agg_query.upper()
         assert "SELECT" in q and "GROUP BY" in q
@@ -679,16 +679,23 @@ class TestCompressionStructure:
     def test_cluster_column_preserved(self, balanced_path):
         """When CRV1 is requested the cluster column must survive into df_compressed."""
         m = duckreg("modis_median ~ ntl_harm + exog_control",
-                    data=balanced_path, round_strata=3,
+                    data=balanced_path, compression=3,
                     se_method={"CRV1": "country"})
         assert "country" in m.df_compressed.columns
 
     def test_remove_singletons_no_op_without_fe(self, balanced_df, balanced_path):
         """remove_singletons=True must have no effect on a pooled OLS model."""
         m = duckreg("modis_median ~ ntl_harm",
-                    data=balanced_path, round_strata=3, se_method="none",
+                    data=balanced_path, compression=3, se_method="none",
                     remove_singletons=True)
         assert m.n_obs == len(balanced_df)
+
+    def test_compression_minus_one_disables_grouping(self, balanced_df, balanced_path):
+        m = duckreg("modis_median ~ ntl_harm + exog_control",
+                    data=balanced_path, compression=-1, se_method="none")
+        assert m.n_compressed_rows == len(balanced_df)
+        assert len(m.df_compressed) == len(balanced_df)
+        assert np.all(m.df_compressed["count"].values == 1)
 
 
 if __name__ == "__main__":

@@ -96,6 +96,7 @@ class Duck2SLS(DuckEstimator):
         formula,
         seed: int = 42,
         n_bootstraps: int = 0,
+        compression: int = None,
         round_strata: int = None,
         duckdb_kwargs: dict = None,
         subset: str = None,
@@ -123,6 +124,7 @@ class Duck2SLS(DuckEstimator):
             table_name=table_name,
             seed=seed,
             n_bootstraps=n_bootstraps,
+            compression=compression,
             round_strata=round_strata,
             duckdb_kwargs=duckdb_kwargs,
             fitter=fitter,
@@ -698,24 +700,39 @@ class Duck2SLS(DuckEstimator):
             + ([cluster_col] if cluster_col else [])
         )
 
-        agg_parts = ["COUNT(*) AS count"]
-        for sql_name in self._outcome_sql:
-            agg_parts.append(f"SUM({sql_name}) AS sum_{sql_name}")
-            agg_parts.append(f"SUM({sql_name} * {sql_name}) AS sum_{sql_name}_sq")
-        # Aggregate actual endogenous for residual computation;
-        # expose cell mean as the original column name for residual_x_cols.
-        for sql_name in self._actual_endog_sql:
-            agg_parts.append(f"SUM({sql_name}) AS sum_{sql_name}")
-            agg_parts.append(f"SUM({sql_name} * {sql_name}) AS sum_{sql_name}_sq")
-            agg_parts.append(f"SUM({sql_name}) / NULLIF(COUNT(*), 0) AS {sql_name}")
+        if self.compression_disabled:
+            select_parts = list(group_cols) + ["1 AS count"]
+            for sql_name in self._outcome_sql:
+                select_parts.append(f"{sql_name} AS sum_{sql_name}")
+                select_parts.append(f"{sql_name} * {sql_name} AS sum_{sql_name}_sq")
+            for sql_name in self._actual_endog_sql:
+                select_parts.append(f"{sql_name} AS sum_{sql_name}")
+                select_parts.append(f"{sql_name} * {sql_name} AS sum_{sql_name}_sq")
+                select_parts.append(f"{sql_name} AS {sql_name}")
+            self.conn.execute(f"""
+            CREATE OR REPLACE TABLE {self._COMPRESSED_VIEW} AS
+            SELECT {', '.join(select_parts)}
+            FROM {self._ss_result_table}
+            """)
+        else:
+            agg_parts = ["COUNT(*) AS count"]
+            for sql_name in self._outcome_sql:
+                agg_parts.append(f"SUM({sql_name}) AS sum_{sql_name}")
+                agg_parts.append(f"SUM({sql_name} * {sql_name}) AS sum_{sql_name}_sq")
+            # Aggregate actual endogenous for residual computation;
+            # expose cell mean as the original column name for residual_x_cols.
+            for sql_name in self._actual_endog_sql:
+                agg_parts.append(f"SUM({sql_name}) AS sum_{sql_name}")
+                agg_parts.append(f"SUM({sql_name} * {sql_name}) AS sum_{sql_name}_sq")
+                agg_parts.append(f"SUM({sql_name}) / NULLIF(COUNT(*), 0) AS {sql_name}")
 
-        group_by = ", ".join(group_cols)
-        self.conn.execute(f"""
-        CREATE OR REPLACE TABLE {self._COMPRESSED_VIEW} AS
-        SELECT {group_by}, {', '.join(agg_parts)}
-        FROM {self._ss_result_table}
-        GROUP BY {group_by}
-        """)
+            group_by = ", ".join(group_cols)
+            self.conn.execute(f"""
+            CREATE OR REPLACE TABLE {self._COMPRESSED_VIEW} AS
+            SELECT {group_by}, {', '.join(agg_parts)}
+            FROM {self._ss_result_table}
+            GROUP BY {group_by}
+            """)
 
         result = self.conn.execute(
             f"SELECT SUM(count), COUNT(*) FROM {self._COMPRESSED_VIEW}"

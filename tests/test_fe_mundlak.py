@@ -13,7 +13,7 @@ VCOV / inference infrastructure:
   - TestDuckFEVcovParamsMundlak  — get_vcov_fe_params() returns (0,0,0,0) for Mundlak
   - TestEndToEndSEParityMundlak  — SE ≈ pyfixest for HC1 / iid / CRV1 (two-way FE)
   - TestSSCAutoSelectionMundlak  — auto SSC from formula: kfixef, Gdf per vcov type
-  - TestCompressionCorrectnessMundlak — nobs == len(data), round_strata stability
+  - TestCompressionCorrectnessMundlak — nobs == len(data), compression stability
 
 Note: Mundlak is an approximation of within-estimator FE absorption.
       Coefficient and SE tolerances are wider than for the exact demean method.
@@ -184,7 +184,7 @@ def _dr_coef_se(m, var: str = "ntl_harm"):
 
 
 def _duckreg(formula, path, vcov, fitter="numpy", fe_method=_FE_METHOD):
-    return duckreg(formula=formula, data=path, seed=42, round_strata=5,
+    return duckreg(formula=formula, data=path, seed=42, compression=5,
                    se_method=vcov, fitter=fitter, fe_method=fe_method)
 
 
@@ -448,7 +448,7 @@ class TestSSCAutoSelectionMundlak:
 
 
 # ============================================================================
-# TestCompressionCorrectnessMundlak — nobs and round_strata (Mundlak)
+# TestCompressionCorrectnessMundlak — nobs and compression (Mundlak)
 # ============================================================================
 
 class TestCompressionCorrectnessMundlak:
@@ -465,16 +465,16 @@ class TestCompressionCorrectnessMundlak:
         )
         assert model.vcov_meta.get('N', model.nobs) == len(panel_data)
 
-    def test_round_strata_se_stability(self, panel_data):
+    def test_compression_se_stability(self, panel_data):
         dr_exact = duckreg(
             "y ~ x1 + x2 | unit + year", data=panel_data,
             se_method="HC1", fe_method="mundlak", fitter="duckdb",
-            round_strata=None,
+            compression=None,
         )
         dr_rounded = duckreg(
             "y ~ x1 + x2 | unit + year", data=panel_data,
             se_method="HC1", fe_method="mundlak", fitter="duckdb",
-            round_strata=5,
+            compression=5,
         )
         se_exact   = np.sqrt(np.diag(dr_exact.vcov))
         se_rounded = np.sqrt(np.diag(dr_rounded.vcov))
@@ -482,8 +482,8 @@ class TestCompressionCorrectnessMundlak:
         np.testing.assert_allclose(
             se_rounded, se_exact, rtol=0.01,
             err_msg=(
-                "round_strata=5 caused >1% SE deviation (Mundlak). "
-                "Check that rounding affects strata formation only, "
+                "compression=5 caused >1% SE deviation (Mundlak). "
+                "Check that grouped compression affects strata formation only, "
                 "not the residual or score computation."
             )
         )
@@ -525,7 +525,7 @@ class TestMundlakCompressionStructure:
         """Asymptotic FE (pixel_id, 1000 levels) must produce avg_*_feN columns."""
         m = duckreg("modis_median ~ ntl_harm + exog_control | pixel_id",
                     data=balanced_path, fe_method="mundlak",
-                    round_strata=3, se_method="none")
+                    compression=3, se_method="none")
         assert "avg_ntl_harm_fe0" in m.df_compressed.columns
         assert "avg_exog_control_fe0" in m.df_compressed.columns
 
@@ -533,7 +533,7 @@ class TestMundlakCompressionStructure:
         """_rhs_cols must list both raw covariates and their Mundlak means."""
         m = duckreg("modis_median ~ ntl_harm + exog_control | pixel_id",
                     data=balanced_path, fe_method="mundlak",
-                    round_strata=3, se_method="none", fitter="numpy")
+                    compression=3, se_method="none", fitter="numpy")
         assert hasattr(m, "_rhs_cols")
         assert "ntl_harm" in m._rhs_cols
         assert "avg_ntl_harm_fe0" in m._rhs_cols
@@ -542,20 +542,20 @@ class TestMundlakCompressionStructure:
         """pixel_id (asymptotic) + year (fixed dummies): count must still sum to N."""
         m = duckreg("modis_median ~ ntl_harm | pixel_id + year",
                     data=balanced_path, fe_method="mundlak",
-                    round_strata=3, se_method="none", fitter="numpy")
+                    compression=3, se_method="none", fitter="numpy")
         assert m.df_compressed["count"].sum() == len(balanced_df)
         # Mundlak means for pixel_id and dummies for year must both be present
         assert any("avg_ntl_harm" in c for c in m.df_compressed.columns)
         assert any(c.startswith("dummy_year_") for c in m.df_compressed.columns)
 
     def test_rounding_more_strata_higher_precision(self, balanced_path):
-        """round_strata=5 must yield at least as many Mundlak strata as round_strata=3."""
+        """compression=5 must yield at least as many Mundlak strata as compression=3."""
         m3 = duckreg("modis_median ~ ntl_harm | pixel_id",
                      data=balanced_path, fe_method="mundlak",
-                     round_strata=3, se_method="none")
+                     compression=3, se_method="none")
         m5 = duckreg("modis_median ~ ntl_harm | pixel_id",
                      data=balanced_path, fe_method="mundlak",
-                     round_strata=5, se_method="none")
+                     compression=5, se_method="none")
         assert len(m5.df_compressed) >= len(m3.df_compressed)
 
 

@@ -281,7 +281,7 @@ def compute_residual_aggregates_sql(
         cols_for_scores = z_cols if (is_iv and z_cols is not None) else x_cols
 
         # When sum_y_sq_col is available and not IV, use exact meat formula that
-        # accounts for within-stratum y variation (round_strata compression).
+        # accounts for within-stratum y variation under grouped compression.
         if sum_y_sq_col is not None and not is_iv:
             query = build_exact_meat_query(
                 table_name=table_name,
@@ -335,5 +335,4 @@ def compute_residual_aggregates_sql(
         result['leverages'] = conn.execute(query).fetchdf()['leverage'].values
     
     return result
-
 

@@ -12,7 +12,7 @@ VCOV / inference infrastructure:
   - TestDuckFEVcovParams   — get_vcov_fe_params() one-way, two-way, nested
   - TestEndToEndSEParity   — SE == pyfixest for HC1 / iid / CRV1 (two-way FE)
   - TestSSCAutoSelection   — auto SSC from formula: kfixef, Gdf per vcov type
-  - TestCompressionCorrectness — nobs == len(data), round_strata stability
+  - TestCompressionCorrectness — nobs == len(data), compression stability
 """
 
 import os
@@ -22,11 +22,13 @@ import numpy as np
 import pandas as pd
 import pytest
 from pathlib import Path
+from unittest.mock import patch
 
 import pyfixest as pf
 from duckreg import duckreg
 import duckdb
 from duckreg.core.transformers import IterativeDemeanTransformer
+from duckreg.estimators.DuckLinearModel import DuckLinearModel
 
 
 # ── constants ─────────────────────────────────────────────────────────────────
@@ -179,7 +181,7 @@ def _dr_coef_se(m, var: str = "ntl_harm"):
 
 
 def _duckreg(formula, path, vcov, fitter="numpy", fe_method=_FE_METHOD):
-    return duckreg(formula=formula, data=path, seed=42, round_strata=5,
+    return duckreg(formula=formula, data=path, seed=42, compression=5,
                    se_method=vcov, fitter=fitter, fe_method=fe_method)
 
 
@@ -452,7 +454,7 @@ class TestSSCAutoSelection:
 
 
 # ============================================================================
-# TestCompressionCorrectness — nobs and round_strata (demean)
+# TestCompressionCorrectness — nobs and compression (demean)
 # ============================================================================
 
 class TestCompressionCorrectness:
@@ -469,16 +471,16 @@ class TestCompressionCorrectness:
         )
         assert model.vcov_meta.get('N', model.nobs) == len(panel_data)
 
-    def test_round_strata_se_stability(self, panel_data):
+    def test_compression_se_stability(self, panel_data):
         dr_exact = duckreg(
             "y ~ x1 + x2 | unit + year", data=panel_data,
             se_method="HC1", fe_method="demean", fitter="duckdb",
-            round_strata=None,
+            compression=None,
         )
         dr_rounded = duckreg(
             "y ~ x1 + x2 | unit + year", data=panel_data,
             se_method="HC1", fe_method="demean", fitter="duckdb",
-            round_strata=5,
+            compression=5,
         )
         se_exact   = np.sqrt(np.diag(dr_exact.vcov))
         se_rounded = np.sqrt(np.diag(dr_rounded.vcov))
@@ -486,7 +488,7 @@ class TestCompressionCorrectness:
         np.testing.assert_allclose(
             se_rounded, se_exact, rtol=0.01,
             err_msg=(
-                "round_strata=5 caused >1% SE deviation (demean). "
+                "compression=5 caused >1% SE deviation (demean). "
                 "Check that rounding affects strata formation only, "
                 "not the residual or score computation."
             )
@@ -495,10 +497,73 @@ class TestCompressionCorrectness:
     def test_df_compressed_structure(self, panel_data):
         """After fitting, df_compressed must contain the standard aggregation columns."""
         m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
-                    se_method="iid", fe_method="demean", fitter="duckdb")
+                    se_method="iid", fe_method="demean", fitter="numpy")
         for col in ("count", "sum_y", "sum_y_sq"):
             assert col in m.df_compressed.columns, f"Missing column: {col!r}"
         assert m.df_compressed["count"].sum() == len(panel_data)
+
+
+class TestDuckDBMemoryBehavior:
+    """Regression tests for the out-of-core FE path."""
+
+    def test_fe_duckdb_does_not_eagerly_populate_df_compressed(self, panel_data):
+        m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
+                    se_method="HC1", fe_method="demean", fitter="duckdb")
+        assert m.point_estimate is not None
+        assert m.vcov is not None
+        assert m._data_fetched is False
+        assert m._df_compressed is None
+
+    def test_fe_duckdb_fit_and_vcov_avoid_fetch_path(self, panel_data):
+        with patch.object(
+            DuckLinearModel, "_ensure_data_fetched",
+            side_effect=AssertionError("DuckDB FE path should stay out-of-core"),
+        ):
+            m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
+                        se_method="HC1", fe_method="demean", fitter="duckdb")
+        assert m.point_estimate is not None
+        assert m.vcov is not None
+        assert m._data_fetched is False
+
+    def test_large_fetch_guard_skips_automatic_materialization(self, panel_data):
+        m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
+                    se_method="HC1", fe_method="demean", fitter="duckdb")
+        m._DUCKDB_AUTO_FETCH_MAX_ROWS = 1
+        m._ensure_data_fetched(force=False)
+        assert m._data_fetched is False
+        assert m._df_compressed is None
+
+    def test_df_compressed_property_fetches_on_demand(self, panel_data):
+        m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
+                    se_method="iid", fe_method="demean", fitter="duckdb")
+        df = m.df_compressed
+        assert df is not None
+        for col in ("count", "sum_y", "sum_y_sq"):
+            assert col in df.columns, f"Missing column: {col!r}"
+        assert df["count"].sum() == len(panel_data)
+
+    def test_low_compression_warns_when_compression_unset(self, panel_data, caplog):
+        with caplog.at_level(logging.WARNING):
+            duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
+                    se_method="none", fe_method="demean", fitter="duckdb",
+                    compression=None)
+        assert any("consider setting compression" in r.message for r in caplog.records)
+
+    def test_fe_tuning_knobs_reach_transformer(self, panel_data):
+        m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
+                    se_method="none", fe_method="demean", fitter="duckdb",
+                    check_interval=7, convergence_sample=0.25)
+        assert m._transformer.check_interval == 7
+        assert m._transformer.convergence_sample == pytest.approx(0.25)
+
+    def test_compression_minus_one_disables_grouping(self, panel_data):
+        m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
+                    se_method="none", fe_method="demean", fitter="duckdb",
+                    compression=-1)
+        df = m.df_compressed
+        assert m.n_compressed_rows == len(panel_data)
+        assert len(df) == len(panel_data)
+        assert np.all(df["count"].values == 1)
 
 
 # ============================================================================

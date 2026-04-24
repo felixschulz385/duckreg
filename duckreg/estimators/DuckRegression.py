@@ -96,14 +96,28 @@ class DuckRegression(DuckLinearModel):
             group_by_parts.append(cluster_expr)
         
         agg_parts = self._build_agg_columns(self.formula.outcomes, boolean_cols, unit_col)
-        
-        self.agg_query = f"""
-        SELECT {', '.join(select_parts)}, {', '.join(agg_parts)}
-        FROM {self.table_name}
-        {self._build_where_clause(self.subset)}
-        GROUP BY {', '.join(group_by_parts)}
-        HAVING count IS NOT NULL
-        """
+
+        if self.compression_disabled:
+            outcome_parts = []
+            for var in self.formula.outcomes:
+                col_expr = var.get_sql_expression(unit_col, 'year')
+                col_expr = cast_if_boolean(col_expr, var.name, boolean_cols)
+                outcome_parts.append(f"{col_expr} AS sum_{var.sql_name}")
+                outcome_parts.append(f"({col_expr}) * ({col_expr}) AS sum_{var.sql_name}_sq")
+            leading_select = f"{', '.join(select_parts)}, " if select_parts else ""
+            self.agg_query = f"""
+            SELECT {leading_select}1 AS count, {', '.join(outcome_parts)}
+            FROM {self.table_name}
+            {self._build_where_clause(self.subset)}
+            """
+        else:
+            self.agg_query = f"""
+            SELECT {', '.join(select_parts)}, {', '.join(agg_parts)}
+            FROM {self.table_name}
+            {self._build_where_clause(self.subset)}
+            GROUP BY {', '.join(group_by_parts)}
+            HAVING count IS NOT NULL
+            """
         
         self._create_compressed_view()
         

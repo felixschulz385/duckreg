@@ -55,6 +55,12 @@ class DuckFE(DuckLinearModel):
     tolerance : float
         *(Iterative demean only)* Convergence criterion
         (max absolute residual change).
+    check_interval : int
+        *(Iterative demean only)* Evaluate the convergence criterion every
+        ``check_interval`` MAP iterations.
+    convergence_sample : float
+        *(Iterative demean only)* Fraction of rows sampled for convergence
+        checks. Reduces convergence-check I/O on large jobs.
     fe_types : Dict[str, str], optional
         *(Mundlak only)* Override automatic FE classification:
         ``{fe_col: 'fixed' | 'asymptotic'}``.
@@ -71,10 +77,10 @@ class DuckFE(DuckLinearModel):
         ``map_kwargs``).
     **kwargs
         Keyword arguments forwarded to :class:`DuckLinearModel`.  Includes
-        ``round_strata`` (int or ``None``) from :func:`duckreg`: when set,
-        demeaned covariate columns are rounded to that many decimal places
-        before grouping, increasing strata deduplication at the cost of a
-        small approximation error.
+        ``compression`` / legacy ``round_strata`` from :func:`duckreg`:
+        ``None`` keeps exact compression, non-negative integers round
+        demeaned covariate columns before grouping, and ``-1`` disables
+        compression entirely.
     """
 
     _CLUSTER_ALIAS = "__cluster__"
@@ -86,6 +92,8 @@ class DuckFE(DuckLinearModel):
         method: str = "iterative_demean",
         max_iterations: int = 1000,
         tolerance: float = 1e-8,
+        check_interval: int = 10,
+        convergence_sample: float = 0.1,
         fe_types: Optional[Dict[str, str]] = None,
         cardinality_threshold: int = 50,
         singleton_threshold: float = 0.1,
@@ -118,6 +126,8 @@ class DuckFE(DuckLinearModel):
         # the routing is deliberate — suppress the blanket warning.
         self.max_iterations = max_iterations
         self.tolerance = tolerance
+        self.check_interval = check_interval
+        self.convergence_sample = convergence_sample
         self.fe_types = fe_types or {}
         self.cardinality_threshold = cardinality_threshold
         self.singleton_threshold = singleton_threshold
@@ -193,6 +203,8 @@ class DuckFE(DuckLinearModel):
                 **common,
                 max_iterations=self.max_iterations,
                 tolerance=self.tolerance,
+                check_interval=self.check_interval,
+                convergence_sample=self.convergence_sample,
             )
         elif self.method == "auto_fe":
             return AutoFETransformer(
@@ -363,7 +375,7 @@ class DuckFE(DuckLinearModel):
         as weighted sums.  For **mundlak** this typically yields large
         compression ratios on repeated covariate patterns.  For **iterative
         demean**, demeaned floating-point variables rarely produce exact
-        duplicate rows; set ``round_strata`` to round covariate columns
+        duplicate rows; set ``compression`` to round covariate columns
         before grouping to improve deduplication at the cost of a small
         approximation.
         """
@@ -377,11 +389,64 @@ class DuckFE(DuckLinearModel):
 
         _uses_map_path = not self._is_pure_mundlak()
 
-        if _uses_map_path:
+        if self.compression_disabled:
+            if _uses_map_path:
+                transformed_select = self._transformer.transform_query(all_variables + extra)
+                eff_cluster = self._effective_cluster_col
+                cluster_part_select = (
+                    f", {eff_cluster}" if eff_cluster else ""
+                )
+                rhs_cols = cov_sql + extra
+
+                self.strata_cols = list(rhs_cols)
+                self._rhs_cols = list(rhs_cols)
+
+                outcome_select = []
+                for v in self.formula.outcomes:
+                    outcome_select.append(f"{v.sql_name} AS sum_{v.sql_name}")
+                    outcome_select.append(
+                        f"{v.sql_name} * {v.sql_name} AS sum_{v.sql_name}_sq"
+                    )
+                select_cols = list(rhs_cols)
+                if eff_cluster:
+                    select_cols.append(eff_cluster)
+                leading_select = f"{', '.join(select_cols)}, " if select_cols else ""
+                self.agg_query = f"""
+                SELECT {leading_select}1 AS count,
+                       {', '.join(outcome_select)}
+                FROM (
+                    SELECT {transformed_select}{cluster_part_select}
+                    FROM {self._result_table}
+                ) _t
+                """
+            else:
+                _eff = self._effective_cluster_col
+                cluster_alias = (
+                    self._CLUSTER_ALIAS if self.method == "mundlak" and _eff
+                    else _eff if self.method == "auto_fe" and _eff
+                    else None
+                )
+                rhs_cols = cov_sql + extra
+                self.strata_cols = list(rhs_cols)
+                self._rhs_cols = list(rhs_cols)
+                select_cols = rhs_cols + ([cluster_alias] if cluster_alias else [])
+                outcome_select = []
+                for v in self.formula.outcomes:
+                    outcome_select.append(f"{v.sql_name} AS sum_{v.sql_name}")
+                    outcome_select.append(
+                        f"{v.sql_name} * {v.sql_name} AS sum_{v.sql_name}_sq"
+                    )
+                leading_select = f"{', '.join(select_cols)}, " if select_cols else ""
+                self.agg_query = f"""
+                SELECT {leading_select}1 AS count,
+                       {', '.join(outcome_select)}
+                FROM {self._result_table}
+                """
+        elif _uses_map_path:
             # Group the demeaned data by unique covariate patterns (strata).
             # transform_query aliases resid_v → v, so the subquery exposes
             # original column names that the GROUP BY can reference directly.
-            # round_strata (inherited from DuckEstimator) is applied here to
+            # compression rounding (inherited from DuckEstimator) is applied here to
             # improve deduplication of demeaned continuous covariates.
             from ..core.sql_builders import build_round_expr
             # Include extra_regressors in transform_query so that Mundlak-added
@@ -459,12 +524,71 @@ class DuckFE(DuckLinearModel):
             """
 
         self._create_compressed_view()
+        self._maybe_warn_low_compression()
         # Invalidate any cached sum_sq values from a previous run.
         self._sum_sq_cache: Dict[str, float] = {}
         logger.debug(
             f"Compressed view: {self.n_compressed_rows} strata, "
             f"{self.n_obs} observations"
         )
+
+    def _maybe_warn_low_compression(self) -> None:
+        """Warn when MAP compression is effectively row-preserving.
+
+        Demeaned continuous covariates rarely deduplicate exactly, so MAP
+        compression can end up materialising nearly one stratum per
+        observation.  Warn only when the model is on a MAP path, rounding is
+        disabled, and the compression ratio is extremely weak.
+        """
+        if self.compression_disabled:
+            return
+        if self.round_strata is not None:
+            return
+        if self.n_obs is None or self.n_obs == 0 or self.n_compressed_rows is None:
+            return
+        if self._is_pure_mundlak():
+            return
+        if not self._has_likely_continuous_rhs():
+            return
+        compression_ratio = self.n_compressed_rows / self.n_obs
+        if compression_ratio < 0.95:
+            return
+        logger.warning(
+            "Weak FE compression after demeaning (%s strata for %s observations). "
+            "If the RHS contains continuous covariates, consider setting "
+            "compression to improve memory use.",
+            self.n_compressed_rows,
+            self.n_obs,
+        )
+
+    def _has_likely_continuous_rhs(self) -> bool:
+        """Heuristic detection for continuous RHS columns.
+
+        Exact detection is not always possible because transformed expressions
+        are materialised through staging views.  Treat expressions and unknown
+        source columns as continuous so the warning errs on the side of being
+        informative.
+        """
+        integer_like = {
+            "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
+            "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT",
+            "BOOLEAN",
+        }
+        source_types = {
+            row[0]: row[1]
+            for row in self.conn.execute(
+                f"SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM {self.table_name})"
+            ).fetchall()
+        }
+        for var in self.formula.covariates:
+            if var.is_intercept():
+                continue
+            if var.transform != TransformType.NONE or var.is_expr():
+                return True
+            col_type = source_types.get(var.sql_name)
+            if col_type is None or col_type.upper() not in integer_like:
+                return True
+        return False
 
     def _compute_sum_sq(self, outcome_sql_name: str) -> float:
         """Return ``SUM(y * y)`` for *outcome_sql_name*, computed on demand.
@@ -835,6 +959,8 @@ class DuckFE(DuckLinearModel):
                         self._transformer, "n_iterations", None
                     ),
                     "tolerance": self.tolerance,
+                    "check_interval": self.check_interval,
+                    "convergence_sample": self.convergence_sample,
                     "max_iterations": self.max_iterations,
                     "converged": (
                         self._transformer.n_iterations < self.max_iterations

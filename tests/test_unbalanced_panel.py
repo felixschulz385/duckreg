@@ -130,7 +130,7 @@ class TestFEClassificationAndFeatureGeneration:
                 fe_method="mundlak",
                 fitter=fitter,
                 se_method="none",
-                round_strata=5
+                compression=5
             )
             
             # Check FE classification
@@ -185,7 +185,7 @@ class TestFEClassificationAndFeatureGeneration:
                 fe_method="mundlak",
                 fitter=fitter,
                 se_method="none",
-                round_strata=5
+                compression=5
             )
             
             # Check FE classification

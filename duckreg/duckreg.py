@@ -41,8 +41,11 @@ def duckreg(
     db_name: str = None,
     # ── Engine settings ──────────────────────────────────────────────────────
     fitter: str = "numpy",
+    compression: Optional[int] = None,
     round_strata: int = None,
     seed: int = 42,
+    check_interval: int = 10,
+    convergence_sample: float = 0.1,
     # ── FE classification settings ────────────────────────────────────────────
     fe_types: Optional[Dict] = None,
     max_fixed_fe_levels: Optional[int] = None,
@@ -95,9 +98,18 @@ def duckreg(
         db_name: Full path to a persistent DuckDB database file.
         fitter: Estimation backend – ``'numpy'`` (default, in-memory) or
             ``'duckdb'`` (out-of-core).
-        round_strata: Round demeaned covariate columns to this many decimal
-            places before grouping (improves compression; slight approximation).
+        compression: Compression setting for grouping duplicate strata.
+            ``None`` means exact compression, non-negative integers round
+            continuous strata columns before grouping, and ``-1`` disables
+            compression entirely.
+        round_strata: Deprecated alias for ``compression``.
         seed: Global random seed for reproducibility.
+        check_interval: For FE demeaning, evaluate convergence every
+            ``check_interval`` MAP iterations. Higher values reduce
+            convergence-check overhead on large jobs.
+        convergence_sample: For FE demeaning, fraction of rows sampled when
+            checking MAP convergence. Lower values reduce convergence-check
+            I/O on large jobs.
         **kwargs: DuckDB resource settings passed directly as keyword arguments:
 
             * ``threads`` (int) – number of DuckDB threads; also controls
@@ -182,6 +194,35 @@ def duckreg(
     # ------------------------------------------------------------------
     # 2. Bootstrap settings
     # ------------------------------------------------------------------
+    if round_strata is not None:
+        warnings.warn(
+            "'round_strata' is deprecated; use 'compression' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    if compression is not None and not isinstance(compression, int):
+        raise TypeError(
+            f"compression must be an integer or None, got {type(compression)!r}"
+        )
+    if round_strata is not None and (not isinstance(round_strata, int)):
+        raise TypeError(
+            f"round_strata must be an integer or None, got {type(round_strata)!r}"
+        )
+    if compression is not None and compression < -1:
+        raise ValueError(
+            f"compression must be >= -1 or None, got {compression!r}"
+        )
+    if round_strata is not None and round_strata < -1:
+        raise ValueError(
+            f"round_strata must be >= -1 or None, got {round_strata!r}"
+        )
+    if compression is not None and round_strata is not None and compression != round_strata:
+        raise ValueError(
+            "compression and round_strata specify different compression settings. "
+            "Use only one, or make them equal."
+        )
+    compression = compression if compression is not None else round_strata
+
     is_bs = isinstance(se_method, str) and se_method == SEMethod.BS
     if is_bs:
         _bs = bootstrap or {}
@@ -251,6 +292,7 @@ def duckreg(
         formula=parsed_formula,
         subset=subset,
         n_bootstraps=n_bootstraps,
+        compression=compression,
         round_strata=round_strata,
         seed=seed,
         duckdb_kwargs=duckdb_kwargs or None,
@@ -329,6 +371,8 @@ def duckreg(
             _duckfe_extra["fe_types"] = fe_types
         if max_fixed_fe_levels is not None:
             _duckfe_extra["max_fixed_fe_levels"] = max_fixed_fe_levels
+        _duckfe_extra["check_interval"] = check_interval
+        _duckfe_extra["convergence_sample"] = convergence_sample
         estimator = DuckFE(**_common, method=fe_method_str, **_duckfe_extra)
     else:
         estimator = DuckRegression(**_common)
@@ -346,5 +390,3 @@ def duckreg(
 
 # Backward compatibility alias
 compressed_ols = duckreg
-
-

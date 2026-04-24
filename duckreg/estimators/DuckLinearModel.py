@@ -54,6 +54,7 @@ class DuckLinearModel(DuckEstimator):
     """
     
     _COMPRESSED_VIEW = "_compressed_view"
+    _DUCKDB_AUTO_FETCH_MAX_ROWS = 250_000
     
     def __init__(
         self,
@@ -62,6 +63,7 @@ class DuckLinearModel(DuckEstimator):
         seed: int,
         formula=None,
         n_bootstraps: int = 0,
+        compression: int = None,
         round_strata: int = None,
         duckdb_kwargs: dict = None,
         subset: str = None,
@@ -87,6 +89,7 @@ class DuckLinearModel(DuckEstimator):
             table_name=table_name,
             seed=seed,
             n_bootstraps=n_bootstraps,
+            compression=compression,
             round_strata=round_strata,
             duckdb_kwargs=duckdb_kwargs,
             fitter=fitter,
@@ -105,7 +108,7 @@ class DuckLinearModel(DuckEstimator):
         self._boolean_cols: Optional[set] = None
         self._fitter_result: Optional[FitterResult] = None
         self._data_fetched: bool = False
-        self.df_compressed: Optional[pd.DataFrame] = None
+        self._df_compressed: Optional[pd.DataFrame] = None
         self.agg_query: Optional[str] = None
         self.n_compressed_rows: Optional[int] = None
         self._results: Optional[RegressionResults] = None
@@ -146,6 +149,18 @@ class DuckLinearModel(DuckEstimator):
             se_type=getattr(self, 'se', None),
         )
         return self._results
+
+    @property
+    def df_compressed(self) -> Optional[pd.DataFrame]:
+        """Compressed data, fetched lazily for DuckDB-backed workflows."""
+        if not self._data_fetched and self.agg_query is not None and self.conn is not None:
+            self._ensure_data_fetched(force=True)
+        return self._df_compressed
+
+    @df_compressed.setter
+    def df_compressed(self, value: Optional[pd.DataFrame]) -> None:
+        self._df_compressed = value
+        self._data_fetched = value is not None
 
     # -------------------------------------------------------------------------
     # Shared utilities
@@ -229,18 +244,33 @@ class DuckLinearModel(DuckEstimator):
         """Number of observations (sum of weights / strata counts)."""
         return getattr(self, 'n_obs', 0)
 
-    def _ensure_data_fetched(self):
+    def _should_skip_auto_fetch(self) -> bool:
+        """Whether automatic pandas materialisation should be suppressed."""
+        return (
+            self.fitter == "duckdb"
+            and self.n_compressed_rows is not None
+            and self.n_compressed_rows > self._DUCKDB_AUTO_FETCH_MAX_ROWS
+        )
+
+    def _ensure_data_fetched(self, force: bool = False):
         """Fetch compressed data to memory if not already done"""
         if self._data_fetched:
             return
         
         if self.agg_query is None:
             raise ValueError("compress_data must be called before fetching data")
+
+        if not force and self._should_skip_auto_fetch():
+            logger.debug(
+                "Skipping automatic fetch of compressed data for large DuckDB FE job "
+                "(n_compressed_rows=%s).",
+                self.n_compressed_rows,
+            )
+            return
         
         self.df_compressed = self.conn.execute(
             f"SELECT * FROM {self._COMPRESSED_VIEW}"
         ).fetchdf()
-        self._data_fetched = True
 
     def _create_compressed_view(self):
         """Materialise compressed data as a DuckDB table.
@@ -330,15 +360,6 @@ class DuckLinearModel(DuckEstimator):
         )
         
         self._update_coef_names()
-
-        # Populate df_compressed for downstream inspection / vcov helpers.
-        # This is a best-effort fetch; if the connection is already closed or
-        # the view no longer exists the attribute stays None.
-        if not getattr(self, '_data_fetched', False):
-            try:
-                self._ensure_data_fetched()
-            except Exception:
-                pass
 
         return self._fitter_result.coefficients
     

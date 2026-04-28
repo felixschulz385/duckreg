@@ -455,11 +455,9 @@ class Duck2SLS(DuckEstimator):
         x_sql = exog_sql + inst_sql + transformer.extra_regressors
         y_sql = endog_var_obj.sql_name
 
-        # For MAP/hybrid paths the transformer stores columns as resid_v instead
-        # of v.  Materialise a normalised table with original-name columns so
-        # _ols_numpy/_ols_duckdb and _add_fitted_column can access y_sql/x_sql
-        # directly.  transform_query() is identity for Mundlak, so this is a
-        # no-op for that path and safe to do unconditionally.
+        # MAP/hybrid paths keep transformed columns under internal residual
+        # names. Materialise a normalized table with original-name columns so
+        # downstream OLS helpers can always refer to y_sql/x_sql directly.
         _FS_NORM = "_fs_first_stage_norm"
         all_vars_to_rename = variables + transformer.extra_regressors
         rename_expr = transformer.transform_query(all_vars_to_rename)
@@ -513,9 +511,9 @@ class Duck2SLS(DuckEstimator):
 
         Runs the transformer once on the union of outcomes, exogenous
         regressors, endogenous variables, and instruments.  The result is
-        stored in the ``demeaned_data`` temp table.  A renaming view
+        stored in the ``demeaned_data`` temp table. A renaming view
         ``_demeaned_staging`` is created so that downstream SQL uses the
-        original column names (``resid_v AS v``).
+        original column names again.
 
         Sets ``self._demean_transformer``, ``self._demean_result_table``, and
         ``self._df_correction`` (total absorbed FE levels).
@@ -546,7 +544,7 @@ class Duck2SLS(DuckEstimator):
         self._demean_transformer  = transformer
         self._df_correction       = transformer.df_correction
 
-        # Build a renaming view so downstream SQL uses original column names
+        # Build a renaming view so downstream SQL uses original column names.
         rename_fragment = transformer.transform_query(variables)
         fe_sql_names    = self._resolve_fe_sql_names()
         select_parts    = []
@@ -771,7 +769,7 @@ class Duck2SLS(DuckEstimator):
         if cluster_col:
             select_parts.append(cluster_col)
         select_parts.append(rename_fragment)
-        # Expose fitted columns directly (not resid_-prefixed)
+        # Expose fitted columns directly.
         for fc in fitted_endog_sql:
             select_parts.append(fc)
 
@@ -925,11 +923,10 @@ class Duck2SLS(DuckEstimator):
         so it exposes the new ``fitted_`` column to downstream queries.
         """
         fitted_col   = f"fitted_{endog_sql}"
-        resid_prefix = "resid_"
-
         if x_sql:
             expr_parts = [
-                f"({float(coefs[i])} * {quote_identifier(resid_prefix + col)})"
+                f"({float(coefs[i])} * "
+                f"{quote_identifier(self._demean_transformer.residual_column_name(col))})"
                 for i, col in enumerate(x_sql)
             ]
             fitted_expr = " + ".join(expr_parts)

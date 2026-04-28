@@ -1,7 +1,7 @@
 import os
+import duckdb
 import numpy as np
 import pandas as pd
-import duckdb
 
 
 # Generate sample data
@@ -23,8 +23,6 @@ def create_duckdb_database(df, db_name="test_dataset.db", table="data"):
     try:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
         conn.execute(f"CREATE TABLE {table} AS SELECT * FROM df")
-        result = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
-        print(f"Created table '{table}' with {result[0]} rows in database: {db_path}")
     finally:
         conn.close()
     return db_path

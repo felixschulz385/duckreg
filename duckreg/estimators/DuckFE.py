@@ -93,7 +93,7 @@ class DuckFE(DuckLinearModel):
         max_iterations: int = 1000,
         tolerance: float = 1e-8,
         check_interval: int = 10,
-        convergence_sample: float = 0.1,
+        convergence_sample: float = 1.0,
         fe_types: Optional[Dict[str, str]] = None,
         cardinality_threshold: int = 50,
         singleton_threshold: float = 0.1,

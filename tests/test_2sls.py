@@ -23,6 +23,7 @@ import pytest
 
 from duckreg.estimators.Duck2SLS import Duck2SLS
 from duckreg.utils.formula_parser import FormulaParser
+from tests.helpers import make_iv_panel_data
 
 
 # ---------------------------------------------------------------------------
@@ -69,34 +70,14 @@ def iv_panel_data():
         y = 2.0*endog + 1.0*x + firm_fe + eps
     True *causal* coefficient on endog: 2.0
     """
-    rng = np.random.default_rng(0)
-    n_firms, n_years = 80, 8
-    index = pd.MultiIndex.from_product(
-        [np.arange(n_firms), np.arange(2010, 2010 + n_years)],
-        names=["firm_id", "year"],
-    ).to_frame(index=False)
-
-    firm_fe = rng.standard_normal(n_firms)
-    n = len(index)
-
-    index["x"]     = rng.standard_normal(n)
-    index["z"]     = rng.standard_normal(n)
-    index["endog"] = 0.8 * index["z"] + rng.standard_normal(n) * 0.5
-    index["y"]     = (
-        2.0 * index["endog"]
-        + 1.0 * index["x"]
-        + firm_fe[index["firm_id"]]
-        + rng.standard_normal(n) * 0.5
-    )
-    return index
+    return make_iv_panel_data(n_firms=80, n_years=8, seed=0)
 
 
 @pytest.fixture(scope="module")
-def iv_parquet(iv_panel_data):
-    path = _make_parquet(iv_panel_data)
-    yield path
-    if os.path.exists(path):
-        os.unlink(path)
+def iv_parquet(iv_panel_data, tmp_path_factory):
+    path = tmp_path_factory.mktemp("test_2sls") / "iv_panel.parquet"
+    iv_panel_data.to_parquet(path, index=False)
+    return str(path)
 
 
 @pytest.fixture(scope="module")

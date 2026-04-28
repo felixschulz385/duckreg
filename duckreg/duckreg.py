@@ -45,7 +45,7 @@ def duckreg(
     round_strata: int = None,
     seed: int = 42,
     check_interval: int = 10,
-    convergence_sample: float = 0.1,
+    convergence_sample: float = 1.0,
     # ── FE classification settings ────────────────────────────────────────────
     fe_types: Optional[Dict] = None,
     max_fixed_fe_levels: Optional[int] = None,

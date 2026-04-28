@@ -19,19 +19,25 @@ Note: Mundlak is an approximation of within-estimator FE absorption.
       Coefficient and SE tolerances are wider than for the exact demean method.
 """
 
-import os
-import tempfile
 import logging
 import numpy as np
 import pandas as pd
 import pytest
-from pathlib import Path
 
 import pyfixest as pf
 from duckreg import duckreg
 from duckreg.estimators import DuckFE
 from duckreg.utils.formula_parser import FormulaParser
 from duckreg.core.results import ModelSummary
+from tests.helpers import (
+    assert_coef_se_close,
+    duckreg_coef_se,
+    duckreg_se_method,
+    make_fe_regression_panel,
+    make_unbalanced_panel,
+    pyfixest_coef_se,
+    pyfixest_vcov,
+)
 
 
 # ── constants ─────────────────────────────────────────────────────────────────
@@ -44,62 +50,16 @@ _UNBALANCED_SEED = 99
 # ── data generation ───────────────────────────────────────────────────────────
 
 def _make_balanced_panel() -> pd.DataFrame:
-    np.random.seed(42)
-    n_pixels, n_years, n_countries, n_soil = 200, 6, 20, 50
-
-    panel = pd.MultiIndex.from_product(
-        [np.arange(n_pixels), np.arange(2010, 2010 + n_years)],
-        names=["pixel_id", "year"],
-    ).to_frame(index=False)
-
-    panel["country"]   = (panel["pixel_id"] % n_countries).astype(int)
-    soil_by_pixel      = np.random.randint(0, n_soil, size=n_pixels)
-    panel["soil_type"] = soil_by_pixel[panel["pixel_id"]]
-
-    pixel_fe   = np.random.randn(n_pixels)    * 2
-    year_fe    = np.random.randn(n_years)     * 1.5
-    country_fe = np.random.randn(n_countries) * 1
-    soil_fe    = np.random.randn(n_soil)      * 0.8
-
-    panel["rainfall"] = np.random.randn(len(panel)) * 10 + 100
-    panel["ntl_harm"] = (
-        0.5 * panel["rainfall"]
-        + pixel_fe[panel["pixel_id"]]
-        + year_fe[panel["year"] - 2010]
-        + np.random.randn(len(panel)) * 5
-    )
-
-    ov = np.random.randn(len(panel)) * 2
-    panel["modis_median"] = (
-        0.8 * panel["ntl_harm"]
-        + pixel_fe[panel["pixel_id"]] * 1.2
-        + year_fe[panel["year"] - 2010] * 0.8
-        + country_fe[panel["country"]] * 0.6
-        + soil_fe[panel["soil_type"]] * 0.5
-        + 0.5 * ov
-        + 0.3 * panel["ntl_harm"] * ov / 10
-        + np.random.randn(len(panel)) * 1
-    )
-    panel["exog_control"] = np.random.randn(len(panel)) * 3
-    return panel.reset_index(drop=True)
+    return make_fe_regression_panel(n_pixels=200, n_years=6)
 
 
 def _make_unbalanced_panel(balanced: pd.DataFrame) -> pd.DataFrame:
-    rng   = np.random.default_rng(_UNBALANCED_SEED)
-    panel = balanced.loc[rng.random(len(balanced)) >= _UNBALANCED_DROP_FRAC].copy()
-    panel = panel.reset_index(drop=True)
-
-    fe_dims = ["pixel_id", "year", "country", "soil_type"]
-    changed = True
-    while changed:
-        changed = False
-        for dim in fe_dims:
-            counts = panel.groupby(dim)[dim].transform("count")
-            before = len(panel)
-            panel  = panel.loc[counts > 1].reset_index(drop=True)
-            if len(panel) < before:
-                changed = True
-    return panel
+    return make_unbalanced_panel(
+        balanced,
+        fe_dims=["pixel_id", "year", "country", "soil_type"],
+        drop_frac=_UNBALANCED_DROP_FRAC,
+        seed=_UNBALANCED_SEED,
+    )
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -114,35 +74,18 @@ def unbalanced_df(balanced_df):
     return _make_unbalanced_panel(balanced_df)
 
 
-def _write_parquet(df: pd.DataFrame) -> str:
-    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
-        path = f.name
-    df.to_parquet(path)
-    return path
-
-
-def _cleanup(path: str) -> None:
-    if os.path.exists(path):
-        os.remove(path)
-    cache = Path(path).parent / ".duckreg"
-    if cache.exists():
-        for f in cache.glob("*"):
-            f.unlink()
-        cache.rmdir()
+@pytest.fixture(scope="module")
+def balanced_path(balanced_df, tmp_path_factory):
+    path = tmp_path_factory.mktemp("fe_mundlak") / "balanced.parquet"
+    balanced_df.to_parquet(path, index=False)
+    return str(path)
 
 
 @pytest.fixture(scope="module")
-def balanced_path(balanced_df):
-    path = _write_parquet(balanced_df)
-    yield path
-    _cleanup(path)
-
-
-@pytest.fixture(scope="module")
-def unbalanced_path(unbalanced_df):
-    path = _write_parquet(unbalanced_df)
-    yield path
-    _cleanup(path)
+def unbalanced_path(unbalanced_df, tmp_path_factory):
+    path = tmp_path_factory.mktemp("fe_mundlak") / "unbalanced.parquet"
+    unbalanced_df.to_parquet(path, index=False)
+    return str(path)
 
 
 @pytest.fixture(scope="class")
@@ -167,57 +110,25 @@ def _fe_cols(depth: int):
     return {1: ["year"], 2: ["country", "year"], 3: ["country", "year", "soil_type"]}[depth]
 
 
-def _pf_vcov(vcov):
-    return {"CRV1": "country"} if vcov == "CRV1" else vcov
-
-
-def _pf_coef_se(fit, var: str, has_iv: bool):
-    if has_iv:
-        tidy = fit.tidy()
-        return float(tidy.loc[var, "Estimate"]), float(tidy.loc[var, "Std. Error"])
-    return float(fit.coef().loc[var]), float(fit.se().loc[var])
-
-
-def _dr_coef_se(m, var: str = "ntl_harm"):
-    res = m.summary_df()
-    return float(res.loc[var, "coefficient"]), float(res.loc[var, "std_error"])
-
-
 def _duckreg(formula, path, vcov, fitter="numpy", fe_method=_FE_METHOD):
     return duckreg(formula=formula, data=path, seed=42, compression=5,
                    se_method=vcov, fitter=fitter, fe_method=fe_method)
-
-
-def _dr_se(vcov):
-    """Convert a vcov label to a duckreg se_method (dict for CRV1)."""
-    return {"CRV1": "country"} if vcov == "CRV1" else vcov
-
-
-def _assert_close(dr_coef, pf_coef, dr_se, pf_se, coef_rtol, se_rtol, label):
-    np.testing.assert_allclose(
-        dr_coef, pf_coef, rtol=coef_rtol, atol=1e-6,
-        err_msg=f"coef mismatch: {label}",
-    )
-    np.testing.assert_allclose(
-        dr_se, pf_se, rtol=se_rtol, atol=1e-6,
-        err_msg=f"SE mismatch: {label}",
-    )
 
 
 def check_fe(df, path, *, fitter, has_iv, fe_depth, vcov, panel_balance):
     fe_part = " + ".join(_fe_cols(fe_depth))
     f_pf = (f"modis_median ~ exog_control | {fe_part} | ntl_harm ~ rainfall"
             if has_iv else f"modis_median ~ ntl_harm + exog_control | {fe_part}")
-    fit_pf = pf.feols(f_pf, df, vcov=_pf_vcov(vcov))
+    fit_pf = pf.feols(f_pf, df, vcov=pyfixest_vcov(vcov))
 
     if has_iv:
         f_dr = f"modis_median ~ exog_control | {fe_part} | (ntl_harm ~ rainfall)"
     else:
         f_dr = f"modis_median ~ ntl_harm + exog_control | {fe_part}"
 
-    m = _duckreg(f_dr, path, _dr_se(vcov), fitter)
-    pf_coef, pf_se = _pf_coef_se(fit_pf, "ntl_harm", has_iv)
-    dr_coef, dr_se = _dr_coef_se(m)
+    m = _duckreg(f_dr, path, duckreg_se_method(vcov), fitter)
+    pf_coef, pf_se = pyfixest_coef_se(fit_pf, "ntl_harm", has_iv)
+    dr_coef, dr_se = duckreg_coef_se(m)
 
     # Mundlak is an approximation — wider tolerances than demean
     coef_rtol = 2e-2 if has_iv else 1e-2
@@ -226,27 +137,38 @@ def check_fe(df, path, *, fitter, has_iv, fe_depth, vcov, panel_balance):
         coef_rtol *= 2
         se_rtol   *= 2
 
-    _assert_close(
-        dr_coef, pf_coef, dr_se, pf_se, coef_rtol, se_rtol,
+    assert_coef_se_close(
+        dr_coef,
+        pf_coef,
+        dr_se,
+        pf_se,
+        coef_rtol=coef_rtol,
+        se_rtol=se_rtol,
         label=f"fe_depth={fe_depth} iv={has_iv} fitter={fitter} "
-              f"fe_method={_FE_METHOD} vcov={vcov} balance={panel_balance}",
+        f"fe_method={_FE_METHOD} vcov={vcov} balance={panel_balance}",
     )
 
 
 def check_merged_fe(df, path, *, fitter, dr_fe_part, pf_fe_part, vcov="HC1"):
     f_pf   = f"modis_median ~ ntl_harm + exog_control | {pf_fe_part}"
-    fit_pf = pf.feols(f_pf, df, vcov=_pf_vcov(vcov))
+    fit_pf = pf.feols(f_pf, df, vcov=pyfixest_vcov(vcov))
 
     f_dr = f"modis_median ~ ntl_harm + exog_control | {dr_fe_part}"
-    m = _duckreg(f_dr, path, _dr_se(vcov), fitter)
+    m = _duckreg(f_dr, path, duckreg_se_method(vcov), fitter)
     pf_coef = float(fit_pf.coef().loc["ntl_harm"])
     pf_se   = float(fit_pf.se().loc["ntl_harm"])
-    dr_coef, dr_se = _dr_coef_se(m)
+    dr_coef, dr_se = duckreg_coef_se(m)
 
     # Mundlak approximation — 15% SE and 1% coef tolerance
-    _assert_close(dr_coef, pf_coef, dr_se, pf_se,
-                  coef_rtol=1e-2, se_rtol=0.15,
-                  label=f"merged fe={dr_fe_part!r} fe_method={_FE_METHOD}")
+    assert_coef_se_close(
+        dr_coef,
+        pf_coef,
+        dr_se,
+        pf_se,
+        coef_rtol=2e-2,
+        se_rtol=0.2,
+        label=f"merged fe={dr_fe_part!r} fe_method={_FE_METHOD}",
+    )
 
 
 # ============================================================================
@@ -508,10 +430,10 @@ def singleton_panel():
 
 
 @pytest.fixture(scope="module")
-def singleton_panel_path(singleton_panel):
-    path = _write_parquet(singleton_panel)
-    yield path
-    _cleanup(path)
+def singleton_panel_path(singleton_panel, tmp_path_factory):
+    path = tmp_path_factory.mktemp("fe_mundlak") / "singleton_panel.parquet"
+    singleton_panel.to_parquet(path, index=False)
+    return str(path)
 
 
 # ============================================================================

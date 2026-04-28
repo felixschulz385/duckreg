@@ -19,9 +19,6 @@ import pyfixest as pf
 
 from duckreg.core.transformers import AutoFETransformer
 
-
-import pytest
-
 # AutoFE tests are currently disabled; re-enable once stability issues are
 # resolved.
 pytest.skip("auto_fe testing temporarily disabled", allow_module_level=True)

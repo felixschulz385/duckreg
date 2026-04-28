@@ -18,14 +18,10 @@ FE-method-specific tests live in:
   - tests/test_duck2sls.py    (2SLS)
 """
 
-import os
-import sys
-import tempfile
 import duckdb
 import numpy as np
 import pandas as pd
 import pytest
-from pathlib import Path
 
 import pyfixest as pf
 from duckreg import duckreg
@@ -43,6 +39,14 @@ from duckreg.core.fitters import (
     NumpyFitter,
     DuckDBFitter,
     compute_vcov_dispatch,
+)
+from tests.helpers import (
+    assert_coef_se_close,
+    duckreg_coef_se,
+    duckreg_se_method,
+    make_fe_regression_panel,
+    pyfixest_coef_se,
+    pyfixest_vcov,
 )
 
 FITTERS = ["numpy", "duckdb"]
@@ -170,61 +174,7 @@ def duckdb_conn():
 # ============================================================================
 
 def _make_balanced_panel() -> pd.DataFrame:
-    np.random.seed(42)
-    n_pixels, n_years, n_countries, n_soil = 1000, 10, 20, 50
-
-    panel = pd.MultiIndex.from_product(
-        [np.arange(n_pixels), np.arange(2010, 2010 + n_years)],
-        names=["pixel_id", "year"],
-    ).to_frame(index=False)
-
-    panel["country"]   = (panel["pixel_id"] % n_countries).astype(int)
-    soil_by_pixel      = np.random.randint(0, n_soil, size=n_pixels)
-    panel["soil_type"] = soil_by_pixel[panel["pixel_id"]]
-
-    pixel_fe   = np.random.randn(n_pixels)    * 2
-    year_fe    = np.random.randn(n_years)     * 1.5
-    country_fe = np.random.randn(n_countries) * 1
-    soil_fe    = np.random.randn(n_soil)      * 0.8
-
-    panel["rainfall"] = np.random.randn(len(panel)) * 10 + 100
-    panel["ntl_harm"] = (
-        0.5 * panel["rainfall"]
-        + pixel_fe[panel["pixel_id"]]
-        + year_fe[panel["year"] - 2010]
-        + np.random.randn(len(panel)) * 5
-    )
-
-    ov = np.random.randn(len(panel)) * 2
-    panel["modis_median"] = (
-        0.8 * panel["ntl_harm"]
-        + pixel_fe[panel["pixel_id"]] * 1.2
-        + year_fe[panel["year"] - 2010] * 0.8
-        + country_fe[panel["country"]] * 0.6
-        + soil_fe[panel["soil_type"]] * 0.5
-        + 0.5 * ov
-        + 0.3 * panel["ntl_harm"] * ov / 10
-        + np.random.randn(len(panel)) * 1
-    )
-    panel["exog_control"] = np.random.randn(len(panel)) * 3
-    return panel.reset_index(drop=True)
-
-
-def _write_parquet(df: pd.DataFrame) -> str:
-    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
-        path = f.name
-    df.to_parquet(path)
-    return path
-
-
-def _cleanup(path: str) -> None:
-    if os.path.exists(path):
-        os.remove(path)
-    cache = Path(path).parent / ".duckreg"
-    if cache.exists():
-        for f in cache.glob("*"):
-            f.unlink()
-        cache.rmdir()
+    return make_fe_regression_panel(n_pixels=1000, n_years=10)
 
 
 @pytest.fixture(scope="module")
@@ -233,71 +183,42 @@ def balanced_df():
 
 
 @pytest.fixture(scope="module")
-def balanced_path(balanced_df):
-    path = _write_parquet(balanced_df)
-    yield path
-    _cleanup(path)
+def balanced_path(balanced_df, tmp_path_factory):
+    path = tmp_path_factory.mktemp("pooled_ols") / "balanced.parquet"
+    balanced_df.to_parquet(path, index=False)
+    return str(path)
 
 
 # ============================================================================
 # D. TestPooledCoef — coefficient / SE parity vs pyfixest
 # ============================================================================
 
-def _pf_vcov(vcov: str):
-    return {"CRV1": "country"} if vcov == "CRV1" else vcov
-
-
-def _pf_coef_se(fit, var: str, has_iv: bool):
-    if has_iv:
-        tidy = fit.tidy()
-        return float(tidy.loc[var, "Estimate"]), float(tidy.loc[var, "Std. Error"])
-    return float(fit.coef().loc[var]), float(fit.se().loc[var])
-
-
-def _dr_coef_se(m, var: str = "ntl_harm"):
-    res = m.summary_df()
-    return float(res.loc[var, "coefficient"]), float(res.loc[var, "std_error"])
-
-
 def _duckreg(formula, path, vcov, fitter):
     return duckreg(formula=formula, data=path, seed=42,
                    compression=5, se_method=vcov, fitter=fitter)
 
 
-def _dr_se(vcov):
-    """Convert a vcov label to a duckreg se_method (dict for CRV1)."""
-    return {"CRV1": "country"} if vcov == "CRV1" else vcov
-
-
-def _assert_close(dr_coef, pf_coef, dr_se, pf_se, coef_rtol, se_rtol, label):
-    np.testing.assert_allclose(
-        dr_coef, pf_coef, rtol=coef_rtol, atol=1e-6,
-        err_msg=f"coef mismatch: {label}",
-    )
-    np.testing.assert_allclose(
-        dr_se, pf_se, rtol=se_rtol, atol=1e-6,
-        err_msg=f"SE mismatch: {label}",
-    )
-
-
 def check_pooled(df, path, *, fitter, has_iv, vcov):
     f_pf = ("modis_median ~ exog_control | ntl_harm ~ rainfall"
             if has_iv else "modis_median ~ ntl_harm + exog_control")
-    fit_pf = pf.feols(f_pf, df, vcov=_pf_vcov(vcov))
+    fit_pf = pf.feols(f_pf, df, vcov=pyfixest_vcov(vcov))
 
     if has_iv:
         f_dr = "modis_median ~ exog_control | 0 | (ntl_harm ~ rainfall)"
     else:
         f_dr = "modis_median ~ ntl_harm + exog_control"
 
-    m = _duckreg(f_dr, path, _dr_se(vcov), fitter)
-    pf_coef, pf_se = _pf_coef_se(fit_pf, "ntl_harm", has_iv)
-    dr_coef, dr_se = _dr_coef_se(m)
+    m = _duckreg(f_dr, path, duckreg_se_method(vcov), fitter)
+    pf_coef, pf_se = pyfixest_coef_se(fit_pf, "ntl_harm", has_iv)
+    dr_coef, dr_se = duckreg_coef_se(m)
 
-    _assert_close(
-        dr_coef, pf_coef, dr_se, pf_se,
+    assert_coef_se_close(
+        dr_coef,
+        pf_coef,
+        dr_se,
+        pf_se,
         coef_rtol=1e-3 if has_iv else 1e-4,
-        se_rtol=1e-2   if has_iv else 5e-3,
+        se_rtol=1e-2 if has_iv else 5e-3,
         label=f"pooled iv={has_iv} fitter={fitter} vcov={vcov}",
     )
 

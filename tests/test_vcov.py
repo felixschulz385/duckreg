@@ -48,8 +48,6 @@ from duckreg.core.vcov import (
 from duckreg.core.linalg import safe_solve, safe_inv
 
 # ── pyfixest reference ────────────────────────────────────────────────────────
-import sys
-sys.path.insert(0, '/scicore/home/meiera/schulz0022/projects/duckreg/foreign')
 from pyfixest.utils import get_ssc as pyfixest_get_ssc
 
 
@@ -855,4 +853,3 @@ class TestTwoWayCluster:  # name kept for readability
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

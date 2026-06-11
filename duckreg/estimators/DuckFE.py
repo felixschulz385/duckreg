@@ -62,6 +62,24 @@ class DuckFE(DuckLinearModel):
     convergence_sample : float
         *(Iterative demean only)* Fraction of rows sampled for convergence
         checks. Reduces convergence-check I/O on large jobs.
+    min_iterations_before_check : int
+        *(Iterative demean only)* Minimum number of MAP iterations before
+        non-final convergence checks are allowed.
+    check_interval_growth : bool
+        *(Iterative demean only)* Whether convergence checks become less
+        frequent after early iterations.
+    max_check_interval : int
+        *(Iterative demean only)* Upper bound for adaptive convergence-check
+        intervals.
+    singleton_pruning : {'iterative', 'one_pass'}
+        *(Iterative demean only)* Singleton pruning strategy.
+    fe_order : {'input', 'ascending_groups', 'descending_groups'}
+        *(Iterative demean only)* Order in which FE dimensions are applied
+        inside each MAP sweep.
+    drop_constant_variables : bool
+        *(Iterative demean only)* Skip constant residual columns during MAP.
+    residual_type : {'DOUBLE', 'FLOAT'}
+        *(Iterative demean only)* Storage type for residual columns.
     fe_types : Dict[str, str], optional
         *(Mundlak only)* Override automatic FE classification:
         ``{fe_col: 'fixed' | 'asymptotic'}``.
@@ -95,6 +113,13 @@ class DuckFE(DuckLinearModel):
         tolerance: float = 1e-8,
         check_interval: int = 10,
         convergence_sample: float = 1.0,
+        min_iterations_before_check: int = 5,
+        check_interval_growth: bool = True,
+        max_check_interval: int = 25,
+        singleton_pruning: str = "iterative",
+        fe_order: str = "input",
+        drop_constant_variables: bool = False,
+        residual_type: str = "DOUBLE",
         fe_types: Optional[Dict[str, str]] = None,
         cardinality_threshold: int = 50,
         singleton_threshold: float = 0.1,
@@ -124,6 +149,13 @@ class DuckFE(DuckLinearModel):
         self.tolerance = tolerance
         self.check_interval = check_interval
         self.convergence_sample = convergence_sample
+        self.min_iterations_before_check = min_iterations_before_check
+        self.check_interval_growth = check_interval_growth
+        self.max_check_interval = max_check_interval
+        self.singleton_pruning = singleton_pruning
+        self.fe_order = fe_order
+        self.drop_constant_variables = drop_constant_variables
+        self.residual_type = residual_type
         self.fe_types = fe_types or {}
         self.cardinality_threshold = cardinality_threshold
         self.singleton_threshold = singleton_threshold
@@ -201,6 +233,13 @@ class DuckFE(DuckLinearModel):
                 tolerance=self.tolerance,
                 check_interval=self.check_interval,
                 convergence_sample=self.convergence_sample,
+                min_iterations_before_check=self.min_iterations_before_check,
+                check_interval_growth=self.check_interval_growth,
+                max_check_interval=self.max_check_interval,
+                singleton_pruning=self.singleton_pruning,
+                fe_order=self.fe_order,
+                drop_constant_variables=self.drop_constant_variables,
+                residual_type=self.residual_type,
             )
         elif self.method == "auto_fe":
             return AutoFETransformer(
@@ -942,6 +981,13 @@ class DuckFE(DuckLinearModel):
                     "tolerance": self.tolerance,
                     "check_interval": self.check_interval,
                     "convergence_sample": self.convergence_sample,
+                    "min_iterations_before_check": self.min_iterations_before_check,
+                    "check_interval_growth": self.check_interval_growth,
+                    "max_check_interval": self.max_check_interval,
+                    "singleton_pruning": self.singleton_pruning,
+                    "fe_order": self.fe_order,
+                    "drop_constant_variables": self.drop_constant_variables,
+                    "residual_type": self.residual_type,
                     "max_iterations": self.max_iterations,
                     "converged": (
                         self._transformer.n_iterations < self.max_iterations

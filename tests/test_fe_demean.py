@@ -514,9 +514,28 @@ class TestDuckDBMemoryBehavior:
     def test_fe_tuning_knobs_reach_transformer(self, panel_data):
         m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
                     se_method="none", fe_method="demean", fitter="duckdb",
-                    check_interval=7, convergence_sample=0.25)
+                    max_iterations=123,
+                    tolerance=1e-5,
+                    check_interval=7,
+                    convergence_sample=0.25,
+                    min_iterations_before_check=3,
+                    check_interval_growth=False,
+                    max_check_interval=17,
+                    singleton_pruning="one_pass",
+                    fe_order="ascending_groups",
+                    drop_constant_variables=True,
+                    residual_type="FLOAT")
+        assert m._transformer.max_iterations == 123
+        assert m._transformer.tolerance == pytest.approx(1e-5)
         assert m._transformer.check_interval == 7
         assert m._transformer.convergence_sample == pytest.approx(0.25)
+        assert m._transformer.min_iterations_before_check == 3
+        assert m._transformer.check_interval_growth is False
+        assert m._transformer.max_check_interval == 17
+        assert m._transformer.singleton_pruning == "one_pass"
+        assert m._transformer.fe_order == "ascending_groups"
+        assert m._transformer.drop_constant_variables is True
+        assert m._transformer.residual_type == "FLOAT"
 
     def test_compression_minus_one_disables_grouping(self, panel_data):
         m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,

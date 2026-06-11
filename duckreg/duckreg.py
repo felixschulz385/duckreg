@@ -49,8 +49,17 @@ def duckreg(
     compression: Optional[int] = None,
     round_strata: int = None,
     seed: int = 42,
+    max_iterations: int = 1000,
+    tolerance: float = 1e-8,
     check_interval: int = 10,
     convergence_sample: float = 1.0,
+    min_iterations_before_check: int = 5,
+    check_interval_growth: bool = True,
+    max_check_interval: int = 25,
+    singleton_pruning: str = "iterative",
+    fe_order: str = "input",
+    drop_constant_variables: bool = False,
+    residual_type: str = "DOUBLE",
     # ── FE classification settings ────────────────────────────────────────────
     fe_types: Optional[Dict] = None,
     max_fixed_fe_levels: Optional[int] = None,
@@ -109,12 +118,31 @@ def duckreg(
             compression entirely.
         round_strata: Deprecated alias for ``compression``.
         seed: Global random seed for reproducibility.
+        max_iterations: For FE demeaning, maximum MAP iterations.
+        tolerance: For FE demeaning, exact maximum absolute remaining
+            FE-group mean required for convergence.
         check_interval: For FE demeaning, evaluate convergence every
             ``check_interval`` MAP iterations. Higher values reduce
             convergence-check overhead on large jobs.
         convergence_sample: For FE demeaning, fraction of rows sampled when
             checking MAP convergence. Lower values reduce convergence-check
             I/O on large jobs.
+        min_iterations_before_check: For FE demeaning, minimum number of MAP
+            iterations before non-final convergence checks are allowed.
+        check_interval_growth: For FE demeaning, whether convergence checks
+            become less frequent after early iterations.
+        max_check_interval: For FE demeaning, upper bound for adaptive
+            convergence-check intervals.
+        singleton_pruning: For FE demeaning, singleton pruning strategy:
+            ``"iterative"`` for cascading pruning or ``"one_pass"`` for a
+            single pruning pass.
+        fe_order: For FE demeaning, MAP sweep order: ``"input"``,
+            ``"ascending_groups"``, or ``"descending_groups"``.
+        drop_constant_variables: For FE demeaning, skip variables that are
+            constant after filtering and set them to zero when FEs are present.
+        residual_type: For FE demeaning, storage type for residual columns:
+            ``"DOUBLE"`` or ``"FLOAT"``. ``"FLOAT"`` requires a relaxed
+            tolerance.
         **kwargs: DuckDB resource settings passed directly as keyword arguments:
 
             * ``threads`` (int) – number of DuckDB threads; also controls
@@ -359,7 +387,12 @@ def duckreg(
         return estimator
 
     if has_iv:
-        estimator = Duck2SLS(**_common, fe_method=resolved_fe_method)
+        estimator = Duck2SLS(
+            **_common,
+            fe_method=resolved_fe_method,
+            max_iterations=max_iterations,
+            tolerance=tolerance,
+        )
     elif fe_cols:
         if resolved_fe_method == FEMethod.MUNDLAK:
             raise NotImplementedError(MUNDLAK_DISABLED_MESSAGE)
@@ -380,8 +413,17 @@ def duckreg(
             _duckfe_extra["fe_types"] = fe_types
         if max_fixed_fe_levels is not None:
             _duckfe_extra["max_fixed_fe_levels"] = max_fixed_fe_levels
+        _duckfe_extra["max_iterations"] = max_iterations
+        _duckfe_extra["tolerance"] = tolerance
         _duckfe_extra["check_interval"] = check_interval
         _duckfe_extra["convergence_sample"] = convergence_sample
+        _duckfe_extra["min_iterations_before_check"] = min_iterations_before_check
+        _duckfe_extra["check_interval_growth"] = check_interval_growth
+        _duckfe_extra["max_check_interval"] = max_check_interval
+        _duckfe_extra["singleton_pruning"] = singleton_pruning
+        _duckfe_extra["fe_order"] = fe_order
+        _duckfe_extra["drop_constant_variables"] = drop_constant_variables
+        _duckfe_extra["residual_type"] = residual_type
         estimator = DuckFE(**_common, method=fe_method_str, **_duckfe_extra)
     else:
         estimator = DuckRegression(**_common)

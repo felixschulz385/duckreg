@@ -23,7 +23,7 @@ import pytest
 
 from duckreg.estimators.Duck2SLS import Duck2SLS
 from duckreg.utils.formula_parser import FormulaParser
-from tests.helpers import make_iv_panel_data
+from tests.helpers import assert_coef_near_true, make_iv_panel_data
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +91,13 @@ def fitted_numpy(iv_parquet):
 @pytest.fixture(scope="module")
 def fitted_numpy_fe(iv_parquet):
     """Duck2SLS, numpy fitter, one FE (firm_id), fitted."""
-    m = _build(iv_parquet, "y ~ x | firm_id | (endog ~ z)", fitter="numpy", remove_singletons=False)
+    m = _build(
+        iv_parquet,
+        "y ~ x | firm_id | (endog ~ z)",
+        fitter="numpy",
+        method="demean",
+        remove_singletons=False,
+    )
     m.fit(se_method="HC1")
     return m
 
@@ -415,8 +421,8 @@ class TestFirstStage:
     def test_first_stage_coef_count_with_fe(self, fitted_numpy_fe):
         fs = fitted_numpy_fe.first_stage["endog"]
         coef_flat = fs.results.coefficients.flatten()
-        # intercept + x + z + mundlak_means_per_FE  (>= 3)
-        assert len(coef_flat) >= 3
+        # Demean FE path: no intercept, only x and z remain in the first stage.
+        assert len(coef_flat) == 2
 
     def test_first_stage_n_obs_matches_panel(self, fitted_numpy):
         fs = fitted_numpy.first_stage["endog"]
@@ -557,6 +563,12 @@ class TestCoefficientSanity:
                 f"2SLS endog coef {dr_coef:.4f} deviates >5% "
                 f"from pyfixest oracle {pf_coef:.4f}"
             ),
+        )
+        assert_coef_near_true(
+            dr_coef,
+            2.0,
+            rtol=0.25,
+            label="2SLS pooled endog vs DGP",
         )
 
 
@@ -724,6 +736,24 @@ class TestMultipleEndogenousVariables:
         fitted = [c for c in cols if c.startswith("fitted_")]
         assert len(fitted) == 2
 
+    def test_demean_path_two_first_stage_results(self, multi_endog_data):
+        df = multi_endog_data.copy()
+        df["firm_id"] = np.repeat(np.arange(50), 10)
+        path = _make_parquet(df)
+        try:
+            m = _build(
+                path,
+                "y ~ x | firm_id | (endog1 + endog2 ~ z1 + z2)",
+                fitter="numpy", method="demean", remove_singletons=False,
+            )
+            m.fit(se_method="HC1")
+            assert set(m.first_stage.keys()) == {"endog1", "endog2"}
+            assert "endog1" in m.coef_names_
+            assert "endog2" in m.coef_names_
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
 
 # ===========================================================================
 # Subset / WHERE clause
@@ -802,10 +832,10 @@ class TestOveridentification:
 # ===========================================================================
 
 class TestEndToEndSEParity2SLS:
-    """Numerical SE parity: Duck2SLS (mundlak FE) vs pyfixest.feols, one-way FE.
+    """Numerical SE parity: Duck2SLS (demean FE) vs pyfixest.feols, one-way FE.
 
     Uses the module-level *iv_panel_data* fixture (80 firms × 8 years, strong
-    instrument).  For the Mundlak path the FE is firm_id; pyfixest absorbs the
+    instrument).  The FE is firm_id; pyfixest absorbs the
     same FE via within-transformation so coefficients and SEs must agree within
     tight tolerances.
     """
@@ -838,6 +868,12 @@ class TestEndToEndSEParity2SLS:
                 f"2SLS endog coef {dr_coef:.4f} diverges from "
                 f"pyfixest oracle {pf_coef:.4f}"
             ),
+        )
+        assert_coef_near_true(
+            dr_coef,
+            2.0,
+            rtol=0.25,
+            label="2SLS FE endog vs DGP",
         )
 
     @pytest.mark.parametrize("pf_vcov,dr_vcov,rtol", [
@@ -906,7 +942,7 @@ class TestSSCAutoSelection2SLS:
     """Verify SSC is automatically determined from formula/se_method for Duck2SLS.
 
     Mirrors :class:`TestSSCAutoSelection` in *test_fe_demean.py* but exercises
-    the 2SLS code path (Duck2SLS with mundlak FE).
+    the 2SLS code path with demeaned FE absorption.
     """
 
     def _fit(self, iv_parquet, se_method):
@@ -1034,6 +1070,15 @@ class TestCompressionCorrectness2SLS:
                 f"Missing column {col!r} in df_compressed"
             )
         assert m.df_compressed["count"].sum() == m.n_obs
+
+    def test_duckdb_df_compressed_fetches_lazily(self, iv_parquet):
+        m = _build(iv_parquet, "y ~ x | firm_id | (endog ~ z)",
+                   fitter="duckdb", remove_singletons=False)
+        m.fit(se_method="iid")
+        assert m._df_compressed is None
+        assert not m._data_fetched
+        assert m.df_compressed is not None
+        assert m._data_fetched
 
     def test_compression_minus_one_disables_grouping(self, iv_parquet, iv_panel_data):
         m = _build(iv_parquet, "y ~ x | firm_id | (endog ~ z)",

@@ -10,7 +10,12 @@ from typing import Any, Dict, Optional, Union
 
 from .core.vcov import parse_vcov_specification, parse_cluster_vars, VcovTypeNotSupportedError, VcovSpec
 from .estimators.base import DuckEstimator, SEMethod
-from .utils.api import FEMethod, _resolve_data_source, _DUCKDB_VIEW_NAME
+from .utils.api import (
+    FEMethod,
+    MUNDLAK_DISABLED_MESSAGE,
+    _resolve_data_source,
+    _DUCKDB_VIEW_NAME,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -264,9 +269,12 @@ def duckreg(
     resolved_fe_method = fe_method
     if fe_method == FEMethod.AUTO:
         resolved_fe_method = (
-            FEMethod.MUNDLAK if has_iv
+            FEMethod.DEMEAN if has_iv and fe_cols
             else (FEMethod.DEMEAN if fe_cols else None)
         )
+
+    if fe_cols and resolved_fe_method == FEMethod.MUNDLAK:
+        raise NotImplementedError(MUNDLAK_DISABLED_MESSAGE)
 
     # ------------------------------------------------------------------
     # 6. Build VcovSpec (once at the API boundary)
@@ -318,11 +326,12 @@ def duckreg(
         if vcov_spec.is_clustered and vcov_spec.cluster_vars:
             _cluster_col = vcov_spec.cluster_vars[0]
 
-        # Resolve fe_method for mediation: only 'demean' and 'mundlak' are
-        # supported; fall back to 'demean' when AUTO resolves to None.
+        # Mediation currently supports only the demean FE path.
         _med_fe_method = resolved_fe_method or "demean"
         if _med_fe_method not in ("demean", "mundlak"):
             _med_fe_method = "demean"
+        if fe_cols and _med_fe_method == FEMethod.MUNDLAK:
+            raise NotImplementedError(MUNDLAK_DISABLED_MESSAGE)
 
         estimator = DuckMediation(
             db_name=resolved_db,
@@ -353,7 +362,7 @@ def duckreg(
         estimator = Duck2SLS(**_common, fe_method=resolved_fe_method)
     elif fe_cols:
         if resolved_fe_method == FEMethod.MUNDLAK:
-            fe_method_str = "mundlak"
+            raise NotImplementedError(MUNDLAK_DISABLED_MESSAGE)
         elif resolved_fe_method == FEMethod.DEMEAN:
             fe_method_str = "iterative_demean"
         elif resolved_fe_method == FEMethod.AUTO_FE:
@@ -363,8 +372,8 @@ def duckreg(
             )
         else:
             raise ValueError(
-                f"With fixed effects, fe_method must be '{FEMethod.MUNDLAK}' "
-                f"or '{FEMethod.DEMEAN}', got '{resolved_fe_method}'"
+                f"With fixed effects, fe_method must be '{FEMethod.DEMEAN}', "
+                f"got '{resolved_fe_method}'"
             )
         _duckfe_extra = {}
         if fe_types is not None:

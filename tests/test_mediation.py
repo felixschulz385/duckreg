@@ -180,19 +180,19 @@ class TestNoFEDuckDB:
 
 class TestMundlakFE:
     def test_fit_runs(self, df_basic):
-        med = fit_mediation(df_basic, fe_cols=["unit"], fe_method="mundlak",
-                            mediators=["m1"])
-        assert med.mediation_results is not None
+        with pytest.raises(NotImplementedError, match="temporarily disabled"):
+            fit_mediation(df_basic, fe_cols=["unit"], fe_method="mundlak",
+                          mediators=["m1"])
 
     def test_n_obs(self, df_basic):
-        med = fit_mediation(df_basic, fe_cols=["unit"], fe_method="mundlak",
-                            mediators=["m1"])
-        assert med.n_obs == len(df_basic)
+        with pytest.raises(NotImplementedError, match="temporarily disabled"):
+            fit_mediation(df_basic, fe_cols=["unit"], fe_method="mundlak",
+                          mediators=["m1"])
 
     def test_effects_present(self, df_basic):
-        med = fit_mediation(df_basic, fe_cols=["unit"], fe_method="mundlak",
-                            mediators=["m1"])
-        assert med.mediation_results.effects is not None
+        with pytest.raises(NotImplementedError, match="temporarily disabled"):
+            fit_mediation(df_basic, fe_cols=["unit"], fe_method="mundlak",
+                          mediators=["m1"])
 
 
 # ============================================================================

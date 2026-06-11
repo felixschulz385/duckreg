@@ -35,6 +35,7 @@ from ..core.fitters.numpy_fitter import NumpyFitter
 from ..core.transformers import IterativeDemeanTransformer, MundlakTransformer
 from ..core.vcov import VcovSpec
 from ..core.results import RegressionResults, MediationEffects, MediationResults
+from ..utils.api import MUNDLAK_DISABLED_MESSAGE
 
 
 # ============================================================================
@@ -264,6 +265,8 @@ class DuckMediation(DuckEstimator):
                 f"DuckMediation: fe_method must be 'demean' or 'mundlak', "
                 f"got {self.fe_method!r}."
             )
+        if self.fe_cols and self.fe_method == "mundlak":
+            raise NotImplementedError(MUNDLAK_DISABLED_MESSAGE)
 
         # ── FE transformer settings ──────────────────────────────────────
         self.max_iterations        = max_iterations

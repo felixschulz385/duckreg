@@ -12,6 +12,12 @@ class FEMethod:
     AUTO_FE = "auto_fe"
 
 
+MUNDLAK_DISABLED_MESSAGE = (
+    "Mundlak FE absorption has been temporarily disabled. "
+    "Use 'demean' instead."
+)
+
+
 # ============================================================================
 # File Format Configuration
 # ============================================================================

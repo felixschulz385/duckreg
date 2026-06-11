@@ -37,6 +37,7 @@ import pandas as pd
 from .DuckLinearModel import DuckLinearModel
 from ..core.transformers import AutoFETransformer, IterativeDemeanTransformer, MundlakTransformer
 from ..utils.formula_parser import TransformType
+from ..utils.api import MUNDLAK_DISABLED_MESSAGE
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,8 @@ class DuckFE(DuckLinearModel):
                 "'auto_fe' is experimental and has been temporarily disabled. "
                 "Use method='iterative_demean' instead."
             )
+        if method == "mundlak":
+            raise NotImplementedError(MUNDLAK_DISABLED_MESSAGE)
         if method not in ("iterative_demean", "mundlak"):
             raise ValueError(
                 f"Unknown method {method!r}. "
@@ -117,13 +120,6 @@ class DuckFE(DuckLinearModel):
             raise ValueError("DuckFE requires at least one fixed effect.")
 
         self.method = method
-        if self.method == "mundlak":
-            logger.warning(
-                "Mundlak regression is not recommended for unbalanced panels; "
-                "consider using 'demean' instead."
-            )
-        # auto_fe may internally use Mundlak for high-cardinality FEs, but
-        # the routing is deliberate — suppress the blanket warning.
         self.max_iterations = max_iterations
         self.tolerance = tolerance
         self.check_interval = check_interval
@@ -775,6 +771,7 @@ class DuckFE(DuckLinearModel):
         result_table = self._result_table
         k_fe_nested = 0
         n_fe_fully_nested = 0
+        already_nested = set()
 
         # --- (A) FE-to-FE nesting: B nested in A (B levels map to one A level) ---
         if len(fe_cols) >= 2:
@@ -799,6 +796,7 @@ class DuckFE(DuckLinearModel):
                         n_levels_b = int(row[1]) if row[1] is not None else 0
                         break
                 if is_nested:
+                    already_nested.add(i)
                     n_fe_fully_nested += 1
                     k_fe_nested += n_levels_b
 
@@ -810,23 +808,6 @@ class DuckFE(DuckLinearModel):
         # when a cluster column is available and not already counted above.
         cluster_col = self._effective_cluster_col
         if cluster_col:
-            already_nested = set()
-            # Rebuild the set of FE dims detected as FE-to-FE nested
-            if len(fe_cols) >= 2:
-                for i, fe_b in enumerate(fe_cols):
-                    for j, fe_a in enumerate(fe_cols):
-                        if i == j:
-                            continue
-                        row = self.conn.execute(f"""
-                            SELECT MAX(cnt) FROM (
-                                SELECT {fe_b}, COUNT(DISTINCT {fe_a}) AS cnt
-                                FROM {result_table} GROUP BY {fe_b}
-                            ) t
-                        """).fetchone()
-                        if row is not None and row[0] == 1:
-                            already_nested.add(i)
-                            break
-
             for i, fe_b in enumerate(fe_cols):
                 if i in already_nested:
                     continue

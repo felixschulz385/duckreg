@@ -249,8 +249,8 @@ class TestDuckregFE:
         assert model.point_estimate is not None
 
     def test_mundlak_fe_method(self, small_df):
-        model = duckreg("y ~ x1 | fe1", data=small_df, fe_method="mundlak", se_method="none")
-        assert model.point_estimate is not None
+        with pytest.raises(NotImplementedError, match="temporarily disabled"):
+            duckreg("y ~ x1 | fe1", data=small_df, fe_method="mundlak", se_method="none")
 
 
 class TestDuckregClusterSE:

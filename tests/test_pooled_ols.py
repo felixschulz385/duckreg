@@ -42,6 +42,7 @@ from duckreg.core.fitters import (
 )
 from tests.helpers import (
     assert_coef_se_close,
+    assert_coef_near_true,
     duckreg_coef_se,
     duckreg_se_method,
     make_fe_regression_panel,
@@ -235,6 +236,60 @@ def test_pooled(balanced_df, balanced_path, fitter, has_iv, vcov):
 # 1 pooled iid sanity test
 def test_pooled_iid_sanity(balanced_df, balanced_path):
     check_pooled(balanced_df, balanced_path, fitter="numpy", has_iv=False, vcov="iid")
+
+
+def test_pooled_simple_dgp_matches_pyfixest_and_truth(parquet_path_factory):
+    rng = np.random.default_rng(123)
+    n = 1200
+    df = pd.DataFrame(
+        {
+            "x1": rng.standard_normal(n),
+            "x2": rng.standard_normal(n),
+        }
+    )
+    df["y"] = 1.0 + 1.5 * df["x1"] + 0.8 * df["x2"] + rng.standard_normal(n) * 0.4
+    path = parquet_path_factory(df, "pooled_simple_truth.parquet")
+
+    pf_fit = pf.feols("y ~ x1 + x2", data=df, vcov="HC1")
+    model = duckreg("y ~ x1 + x2", data=path, se_method="HC1", fitter="duckdb")
+    summary = model.summary_df()
+
+    np.testing.assert_allclose(
+        float(summary.loc["x1", "coefficient"]),
+        float(pf_fit.coef().loc["x1"]),
+        rtol=1e-4,
+        err_msg="pooled x1 coefficient mismatch vs pyfixest",
+    )
+    np.testing.assert_allclose(
+        float(summary.loc["x2", "coefficient"]),
+        float(pf_fit.coef().loc["x2"]),
+        rtol=1e-4,
+        err_msg="pooled x2 coefficient mismatch vs pyfixest",
+    )
+    np.testing.assert_allclose(
+        float(summary.loc["x1", "std_error"]),
+        float(pf_fit.se().loc["x1"]),
+        rtol=5e-3,
+        err_msg="pooled x1 SE mismatch vs pyfixest",
+    )
+    np.testing.assert_allclose(
+        float(summary.loc["x2", "std_error"]),
+        float(pf_fit.se().loc["x2"]),
+        rtol=5e-3,
+        err_msg="pooled x2 SE mismatch vs pyfixest",
+    )
+    assert_coef_near_true(
+        float(summary.loc["x1", "coefficient"]),
+        1.5,
+        rtol=0.03,
+        label="pooled x1 vs DGP",
+    )
+    assert_coef_near_true(
+        float(summary.loc["x2", "coefficient"]),
+        0.8,
+        rtol=0.05,
+        label="pooled x2 vs DGP",
+    )
 
 
 # ============================================================================

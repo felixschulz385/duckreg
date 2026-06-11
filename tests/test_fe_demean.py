@@ -28,6 +28,7 @@ from duckreg.core.transformers import IterativeDemeanTransformer
 from duckreg.estimators.DuckLinearModel import DuckLinearModel
 from tests.helpers import (
     assert_coef_se_close,
+    assert_coef_near_true,
     duckreg_coef_se,
     duckreg_se_method,
     make_fe_regression_panel,
@@ -310,6 +311,19 @@ class TestEndToEndSEParity:
         dr_coef = dr_fit.point_estimate
         np.testing.assert_allclose(dr_coef, pf_coef, rtol=1e-4,
             err_msg="Coefficients diverge before SE comparison is meaningful")
+        summary = dr_fit.summary_df()
+        assert_coef_near_true(
+            float(summary.loc["x1", "coefficient"]),
+            1.5,
+            rtol=0.05,
+            label="demean x1 vs DGP",
+        )
+        assert_coef_near_true(
+            float(summary.loc["x2", "coefficient"]),
+            0.8,
+            rtol=0.08,
+            label="demean x2 vs DGP",
+        )
 
     @pytest.mark.parametrize("pf_vcov,dr_vcov", [
         ("HC1",            "HC1"),

@@ -53,6 +53,7 @@ from ..core.vcov import VcovSpec
 from ..core.results import RegressionResults, FirstStageResults
 from ..utils.formula_parser import cast_if_boolean, quote_identifier
 from ..utils.name_utils import build_coef_name_lists, build_first_stage_coef_names
+from ..utils.api import MUNDLAK_DISABLED_MESSAGE
 
 logger = logging.getLogger(__name__)
 
@@ -135,11 +136,13 @@ class Duck2SLS(DuckEstimator):
         self.formula    = formula
         self.n_jobs     = n_jobs
         self.subset     = subset
-        self.method     = fe_method or method   # fe_method kept for compat
+        explicit_method = fe_method if fe_method is not None else method
+        self.method     = explicit_method   # fe_method kept for compat
         self.vcov_spec   = vcov_spec
         self.ssc_dict    = vcov_spec.ssc.to_dict() if vcov_spec is not None else None
         self.vcov_meta: Optional[Dict[str, Any]] = None
-        self.df_compressed: Optional[pd.DataFrame] = None
+        self._df_compressed: Optional[pd.DataFrame] = None
+        self._data_fetched: bool = False
 
         if self.method not in ("mundlak", "demean", "auto_fe"):
             raise ValueError(
@@ -168,6 +171,12 @@ class Duck2SLS(DuckEstimator):
             if not v.is_intercept() and v.display_name not in
             formula.get_endogenous_display_names()
         ]
+
+        if self.fe_cols and self.method == "mundlak":
+            if fe_method is None and method == "mundlak":
+                self.method = "demean"
+            else:
+                raise NotImplementedError(MUNDLAK_DISABLED_MESSAGE)
 
         # Internal state
         self._first_stage_results: Dict[str, FirstStageResults] = {}
@@ -207,6 +216,56 @@ class Duck2SLS(DuckEstimator):
     # =========================================================================
     # Properties
     # =========================================================================
+
+    @property
+    def df_compressed(self) -> Optional[pd.DataFrame]:
+        """Compressed IV data, fetched lazily for DuckDB-backed workflows."""
+        if (
+            not self._data_fetched
+            and self.n_compressed_rows is not None
+            and self.conn is not None
+        ):
+            self._ensure_compressed_data_fetched()
+        return self._df_compressed
+
+    @df_compressed.setter
+    def df_compressed(self, value: Optional[pd.DataFrame]) -> None:
+        self._df_compressed = value
+        self._data_fetched = value is not None
+
+    def _ensure_compressed_data_fetched(self) -> None:
+        """Materialise the compressed IV table only when callers need it."""
+        if self._data_fetched:
+            return
+        source_table = (
+            f"{self._DEMEANED_STAGING}_fit"
+            if self.method == "demean" and self.fitter == "duckdb"
+            else self._COMPRESSED_VIEW
+        )
+        self._df_compressed = self.conn.execute(
+            f"SELECT * FROM {source_table}"
+        ).fetchdf()
+        self._data_fetched = True
+
+    @staticmethod
+    def _dedupe_cols(cols: List[Optional[str]]) -> List[str]:
+        """Return columns in first-seen order, dropping None and duplicates."""
+        result = []
+        seen = set()
+        for col in cols:
+            if col is None or col in seen:
+                continue
+            seen.add(col)
+            result.append(col)
+        return result
+
+    def _fetch_projected_df(self, table: str, cols: List[Optional[str]]) -> pd.DataFrame:
+        """Fetch only requested columns from a DuckDB relation."""
+        projected = self._dedupe_cols(cols)
+        if not projected:
+            return pd.DataFrame()
+        select_sql = ", ".join(quote_identifier(col) for col in projected)
+        return self.conn.execute(f"SELECT {select_sql} FROM {table}").fetchdf().dropna()
 
     @property
     def _effective_cluster_col(self) -> Optional[str]:
@@ -579,6 +638,13 @@ class Duck2SLS(DuckEstimator):
         inst_sql    = self._get_inst_sql()
         cluster_col = self._cluster_staging_col
         x_sql       = exog_sql + inst_sql
+        demeaned_df = None
+        if self.fitter != "duckdb":
+            endog_sql = [v.sql_name for v in self.formula.endogenous]
+            demeaned_df = self._fetch_projected_df(
+                self._DEMEANED_STAGING,
+                x_sql + endog_sql + [cluster_col],
+            )
 
         for endog_var in self.endogenous_vars:
             endog_var_obj = next(
@@ -589,9 +655,7 @@ class Duck2SLS(DuckEstimator):
                     self._DEMEANED_STAGING, x_sql, endog_var_obj.sql_name, cluster_col
                 )
             else:
-                df = self.conn.execute(
-                    f"SELECT * FROM {self._DEMEANED_STAGING}"
-                ).fetchdf().dropna()
+                df = demeaned_df
                 n   = len(df)
                 ids = (
                     df[cluster_col].values
@@ -737,9 +801,8 @@ class Duck2SLS(DuckEstimator):
         ).fetchone()
         self.n_obs             = int(result[0]) if result[0] else 0
         self.n_compressed_rows = int(result[1]) if result[1] else 0
-        self.df_compressed = self.conn.execute(
-            f"SELECT * FROM {self._COMPRESSED_VIEW}"
-        ).fetchdf()
+        self._df_compressed = None
+        self._data_fetched = False
 
     def _setup_second_stage_demean(self):
         """Rebuild the demeaned staging view (with fitted columns) and populate
@@ -788,9 +851,15 @@ class Duck2SLS(DuckEstimator):
             # Create a lightweight helper view that adds a constant weight column
             # and squared-outcome column so DuckDBFitter can operate OOC.
             outcome_col = self._outcome_sql[0]
+            sum_outcome_col = f"sum_{outcome_col}"
+            sum_outcome_sq_col = f"sum_{outcome_col}_sq"
             self.conn.execute(f"""
             CREATE OR REPLACE VIEW {self._DEMEANED_STAGING}_fit AS
-            SELECT *, 1 AS count, {outcome_col} * {outcome_col} AS {outcome_col}_sq
+            SELECT *,
+                   1 AS count,
+                   {outcome_col} AS {sum_outcome_col},
+                   {outcome_col} * {outcome_col} AS {sum_outcome_sq_col},
+                   {outcome_col} * {outcome_col} AS {outcome_col}_sq
             FROM {self._DEMEANED_STAGING}
             """)
             logger.debug("Created demeaned fit view for DuckDB second stage.")
@@ -951,9 +1020,13 @@ class Duck2SLS(DuckEstimator):
         The DOF correction from :attr:`_df_correction` accounts for the
         absorbed FE levels in downstream vcov computations.
         """
-        df = self.conn.execute(
-            f"SELECT * FROM {self._ss_result_table}"
-        ).fetchdf().dropna()
+        x_fitted_cols  = self._exog_sql + self._fitted_endog_sql
+        x_actual_cols  = self._exog_sql + self._actual_endog_sql
+        z_cols         = self._exog_sql + self._inst_sql
+        df = self._fetch_projected_df(
+            self._ss_result_table,
+            [self._outcome_sql[0]] + x_fitted_cols + x_actual_cols + z_cols + [self._cluster_staging_col],
+        )
         n           = len(df)
         cluster_col = self._cluster_staging_col
 
@@ -961,15 +1034,12 @@ class Duck2SLS(DuckEstimator):
         self._y = df[self._outcome_sql[0]].values.reshape(-1, 1)
 
         # X_fitted: exog + fitted_endog  (no intercept)
-        x_fitted_cols  = self._exog_sql + self._fitted_endog_sql
         self._X_fitted = df[x_fitted_cols].values
 
         # X_actual: exog + actual_endog  (no intercept, for residual sandwich)
-        x_actual_cols  = self._exog_sql + self._actual_endog_sql
         self._X_actual = df[x_actual_cols].values
 
         # Z: exog + instruments  (no intercept)
-        z_cols   = self._exog_sql + self._inst_sql
         self._Z  = df[z_cols].values
 
         self._weights = np.ones(n)
@@ -1003,29 +1073,29 @@ class Duck2SLS(DuckEstimator):
 
     def _build_numpy_arrays(self):
         """Fetch design_matrix and build numpy arrays for estimation."""
-        df = self.conn.execute(
-            f"SELECT * FROM {self._ss_result_table}"
-        ).fetchdf().dropna()
-        n = len(df)
-
         extra       = self._ss_transformer.extra_regressors
         x_extra     = self._x_extra(extra)
         z_extra     = self._z_extra(extra)
         cluster_col = self._cluster_staging_col
+        x_fitted_cols = self._exog_sql + self._fitted_endog_sql + x_extra
+        x_actual_cols = self._exog_sql + self._actual_endog_sql + x_extra
+        z_cols        = self._exog_sql + self._inst_sql + z_extra
+        df = self._fetch_projected_df(
+            self._ss_result_table,
+            [self._outcome_sql[0]] + x_fitted_cols + x_actual_cols + z_cols + [cluster_col],
+        )
+        n = len(df)
 
         # Outcome
         self._y = df[self._outcome_sql[0]].values.reshape(-1, 1)
 
         # X_fitted: intercept + exog + fitted_endog + x_extra
-        x_fitted_cols    = self._exog_sql + self._fitted_endog_sql + x_extra
         self._X_fitted   = np.c_[np.ones(n), df[x_fitted_cols].values]
 
         # X_actual: same layout but with actual endogenous (for residuals)
-        x_actual_cols    = self._exog_sql + self._actual_endog_sql + x_extra
         self._X_actual   = np.c_[np.ones(n), df[x_actual_cols].values]
 
         # Z: intercept + exog + instruments + z_extra
-        z_cols   = self._exog_sql + self._inst_sql + z_extra
         self._Z  = np.c_[np.ones(n), df[z_cols].values]
 
         self._weights = np.ones(n)
@@ -1280,7 +1350,7 @@ class Duck2SLS(DuckEstimator):
         cluster_col: Optional[str],
     ) -> Tuple[np.ndarray, np.ndarray, dict, int]:
         """Fit OLS via NumpyFitter on *table* using column lists."""
-        df  = self.conn.execute(f"SELECT * FROM {table}").fetchdf().dropna()
+        df  = self._fetch_projected_df(table, x_sql + [y_sql, cluster_col])
         n   = len(df)
         y   = df[y_sql].values.reshape(-1, 1)
         X   = np.c_[np.ones(n), df[x_sql].values]

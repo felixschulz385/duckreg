@@ -13,8 +13,7 @@ Public API
 - ``SuffStats`` — dataclass returned by both compute_sufficient_stats_* functions.
   Supports tuple unpacking for backward compatibility.
 - ``compute_sufficient_stats_numpy`` — NumPy backend.
-- ``compute_sufficient_stats_sql``   — DuckDB SQL backend (DRY: delegates SQL
-  string construction to ``build_xtx_query`` / ``build_xty_query``).
+- ``compute_sufficient_stats_sql``   — DuckDB SQL backend.
 - ``execute_to_matrix``              — Execute a SQL query → numpy matrix.
 - ``compute_cross_sufficient_stats_sql`` — IV cross-product stats (X'Z, Z'Z).
 - ``profile_fe_column``              — Profile a FE column for classification.
@@ -27,11 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 import duckdb
 
-from .sql_builders import (
-    build_xtx_query,
-    build_xty_query,
-    build_cross_xtz_query,
-)
+from .sql_builders import build_cross_xtz_query
 from .linalg import DEFAULT_ALPHA
 
 logger = logging.getLogger(__name__)
@@ -189,12 +184,7 @@ def compute_sufficient_stats_sql(
 ) -> SuffStats:
     """
     SQL backend for computing sufficient statistics X'WX, X'Wy, and summary
-    statistics.
-
-    Delegates SQL string construction to ``build_xtx_query`` and
-    ``build_xty_query`` from ``sql_builders``, eliminating the previously
-    duplicated loop logic.  A third query fetches observation counts and the
-    y summary statistics.
+    statistics in a single aggregate scan.
 
     Parameters
     ----------
@@ -253,46 +243,12 @@ def compute_sufficient_stats_sql(
 
     k = len(coef_names)
 
-    # ------------------------------------------------------------------
-    # Step 1: X'WX  (delegates to build_xtx_query — no duplication)
-    # ------------------------------------------------------------------
-    xtx_query = build_xtx_query(
-        table_name=table_name,
-        x_cols=x_cols,
-        weight_col=weight_col,
-        where_clause=where_clause,
-        add_intercept=add_intercept,
-    )
-    xtx_row = conn.execute(xtx_query).fetchone()
+    from ..utils.formula_parser import quote_identifier
 
-    XtX = np.zeros((k, k))
-    idx = 0
-    for i in range(k):
-        for j in range(i, k):
-            XtX[i, j] = xtx_row[idx]
-            XtX[j, i] = xtx_row[idx]
-            idx += 1
+    quoted_table = quote_identifier(table_name)
+    quoted_weight = quote_identifier(weight_col)
+    quoted_y = quote_identifier(y_col)
 
-    # Add regularisation
-    XtX += alpha * np.eye(k)
-
-    # ------------------------------------------------------------------
-    # Step 2: X'y  (delegates to build_xty_query — no duplication)
-    # ------------------------------------------------------------------
-    xty_query = build_xty_query(
-        table_name=table_name,
-        x_cols=x_cols,
-        y_col=y_col,
-        weight_col=weight_col,
-        where_clause=where_clause,
-        add_intercept=add_intercept,
-    )
-    xty_row = conn.execute(xty_query).fetchone()
-    Xty = np.array([float(xty_row[i]) for i in range(k)], dtype=float)
-
-    # ------------------------------------------------------------------
-    # Step 3: Summary statistics (n_obs, sum_y, sum_y_sq)
-    # ------------------------------------------------------------------
     using_exact_sum_y_sq = False
     if sum_y_sq_col is not None:
         try:
@@ -311,18 +267,46 @@ def compute_sufficient_stats_sql(
         else f"SUM(POW({y_col} / {weight_col}, 2) * {weight_col})"
     )
 
-    stats_query = f"""
-    SELECT
-        SUM({weight_col}) AS n_obs,
-        SUM({y_col})      AS sum_y,
-        {sum_y_sq_expr}   AS sum_y_sq
-    FROM {table_name}
+    all_x_cols = ["1"] + x_cols if add_intercept else x_cols
+    xtx_parts = []
+    for i in range(k):
+        for j in range(i, k):
+            xtx_parts.append(
+                f"SUM(CAST(({all_x_cols[i]}) AS DOUBLE) * "
+                f"CAST(({all_x_cols[j]}) AS DOUBLE) * "
+                f"CAST({quoted_weight} AS DOUBLE)) AS xtx_{i}_{j}"
+            )
+    xty_parts = [
+        f"SUM(CAST(({col}) AS DOUBLE) * CAST({quoted_y} AS DOUBLE)) AS xty_{i}"
+        for i, col in enumerate(all_x_cols)
+    ]
+    summary_parts = [
+        f"SUM({quoted_weight}) AS n_obs",
+        f"SUM({quoted_y}) AS sum_y",
+        f"{sum_y_sq_expr} AS sum_y_sq",
+    ]
+
+    query = f"""
+    SELECT {', '.join(xtx_parts + xty_parts + summary_parts)}
+    FROM {quoted_table}
     {where_clause}
     """
-    stats_row = conn.execute(stats_query).fetchone()
-    n_obs = int(stats_row[0])
-    sum_y = float(stats_row[1])
-    sum_y_sq = float(stats_row[2])
+    row = conn.execute(query).fetchone()
+
+    XtX = np.zeros((k, k))
+    idx = 0
+    for i in range(k):
+        for j in range(i, k):
+            XtX[i, j] = row[idx]
+            XtX[j, i] = row[idx]
+            idx += 1
+    XtX += alpha * np.eye(k)
+
+    Xty = np.array([float(row[idx + i]) for i in range(k)], dtype=float)
+    idx += k
+    n_obs = int(row[idx])
+    sum_y = float(row[idx + 1])
+    sum_y_sq = float(row[idx + 2])
 
     if not using_exact_sum_y_sq:
         logger.info(

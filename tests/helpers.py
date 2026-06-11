@@ -155,6 +155,23 @@ def duckreg_coef_se(model, var: str = "ntl_harm"):
     return float(res.loc[var, "coefficient"]), float(res.loc[var, "std_error"])
 
 
+def assert_coef_near_true(
+    estimate: float,
+    truth: float,
+    *,
+    rtol: float,
+    atol: float = 1e-6,
+    label: str,
+) -> None:
+    np.testing.assert_allclose(
+        estimate,
+        truth,
+        rtol=rtol,
+        atol=atol,
+        err_msg=f"true-coef mismatch: {label}",
+    )
+
+
 def assert_coef_se_close(
     duckreg_coef: float,
     pyfixest_coef: float,

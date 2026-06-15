@@ -1315,10 +1315,11 @@ class FormulaParser:
             'UHUGEINT',
         }
         _OVERFLOW_THRESHOLD = 1_000_000_000  # multiplier used in get_sql_expression
+        source_relation_sql = f"SELECT * FROM {table_name}"
 
         # Get column types from the source table in one round-trip.
         try:
-            type_rows = conn.execute(f"DESCRIBE {table_name}").fetchall()
+            type_rows = conn.execute(f"DESCRIBE {source_relation_sql}").fetchall()
             # DESCRIBE returns (column_name, column_type, ...).  Normalise by
             # stripping any parameterisation (e.g. "DECIMAL(10,2)" → "DECIMAL").
             col_type: Dict[str, str] = {
@@ -1326,7 +1327,7 @@ class FormulaParser:
                 for row in type_rows
             }
         except Exception as exc:
-            logger.debug(f"resolve_numeric_merge: could not DESCRIBE {table_name}: {exc}")
+            logger.debug(f"resolve_numeric_merge: could not DESCRIBE {source_relation_sql}: {exc}")
             return formula  # safe fallback — keep VARCHAR
 
         new_mfes: List["MergedFixedEffect"] = []

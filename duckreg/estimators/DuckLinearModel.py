@@ -111,6 +111,7 @@ class DuckLinearModel(DuckEstimator):
         self._df_compressed: Optional[pd.DataFrame] = None
         self.agg_query: Optional[str] = None
         self.n_compressed_rows: Optional[int] = None
+        self.n_compression_base_rows: Optional[int] = None
         self._results: Optional[RegressionResults] = None
         self.vcov_meta: Optional[Dict[str, Any]] = None
         
@@ -293,6 +294,7 @@ class DuckLinearModel(DuckEstimator):
             FROM {self._COMPRESSED_VIEW}
         """).fetchone()
         self.n_obs = int(result[0]) if result[0] else 0
+        self.n_compression_base_rows = self.n_obs
         self.n_compressed_rows = int(result[1]) if result[1] else 0
 
     def _get_view_columns(self) -> List[str]:

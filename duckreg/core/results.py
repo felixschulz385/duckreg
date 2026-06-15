@@ -420,6 +420,7 @@ class ModelSummary:
     # Sample information
     n_obs: Optional[int] = None
     n_compressed: Optional[int] = None
+    n_compression_base_rows: Optional[int] = None
     n_rows_dropped_singletons: Optional[int] = None
     
     # Results
@@ -433,8 +434,9 @@ class ModelSummary:
     @property
     def compression_ratio(self) -> Optional[float]:
         """Compute compression ratio (fraction of rows saved)."""
-        if self.n_obs and self.n_compressed:
-            return 1 - self.n_compressed / self.n_obs
+        denominator = self.n_compression_base_rows or self.n_obs
+        if denominator and self.n_compressed:
+            return 1 - self.n_compressed / denominator
         return None
     
     @property
@@ -470,6 +472,7 @@ class ModelSummary:
             "sample_info": {
                 "n_obs": self.n_obs,
                 "n_compressed": self.n_compressed,
+                "n_compression_base_rows": self.n_compression_base_rows,
                 "n_rows_dropped_singletons": self.n_rows_dropped_singletons,
                 "compression_ratio": self.compression_ratio,
             },
@@ -511,6 +514,11 @@ class ModelSummary:
             "fe_method": getattr(estimator, 'fe_method', None),
             "n_obs": getattr(estimator, 'n_obs', None),
             "n_compressed": getattr(estimator, 'n_compressed_rows', None),
+            "n_compression_base_rows": getattr(
+                estimator,
+                'n_compression_base_rows',
+                getattr(estimator, 'n_obs', None),
+            ),
             "n_rows_dropped_singletons": getattr(estimator, 'n_rows_dropped_singletons', None),
         }
         

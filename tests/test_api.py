@@ -13,10 +13,15 @@ import warnings
 import numpy as np
 import pandas as pd
 import pytest
+import duckdb
 
 from duckreg import duckreg
 from duckreg.utils.formula_parser import (
     FormulaParser,
+    Formula,
+    MergedFixedEffect,
+    Variable,
+    VariableRole,
     needs_quoting,
     quote_identifier,
 )
@@ -178,6 +183,35 @@ class TestFormulaParserNullCheck:
         )
         cols = f.get_source_columns_for_null_check()
         assert cols == ["y", "ntl_harm"] or cols == ["ntl_harm", "y"]
+
+    def test_resolve_numeric_merge_accepts_relation_expression(self):
+        conn = duckdb.connect()
+        formula = Formula(
+            outcomes=(),
+            covariates=(),
+            interactions=(),
+            fixed_effects=(),
+            merged_fes=(
+                MergedFixedEffect(
+                    name="country_year",
+                    sql_name="country_year",
+                    components=(
+                        Variable("country", VariableRole.FIXED_EFFECT),
+                        Variable("year", VariableRole.FIXED_EFFECT),
+                    ),
+                ),
+            ),
+            cluster=None,
+            raw_formula="",
+        )
+
+        resolved = FormulaParser.resolve_numeric_merge(
+            formula,
+            conn,
+            "(SELECT 1 AS country, 2000 AS year)",
+        )
+
+        assert resolved.merged_fes[0].use_numeric_merge
 
 
 # ============================================================================
@@ -407,6 +441,27 @@ class TestFormatModelSummary:
         s = fitted_fe_model.summary()
         text = format_model_summary(s)
         assert "fe1" in text or "Fixed Effect" in text
+
+    def test_compression_uses_compression_base_rows(self):
+        summary = {
+            "version_info": {"duckreg_version": "test", "computed_at": "now"},
+            "model_spec": {
+                "estimator_type": "Duck2SLS",
+                "outcome_vars": ["y"],
+            },
+            "sample_info": {
+                "n_obs": 95,
+                "n_compressed": 100,
+                "n_compression_base_rows": 120,
+                "compression_ratio": 1 - 100 / 120,
+            },
+        }
+
+        text = format_model_summary(summary)
+
+        assert "Observations (final): 95" in text
+        assert "Compression Base Rows: 120" in text
+        assert "Compression: 16.7% reduction (120 \u2192 100 rows)" in text
 
 
 class TestSummaryBackwardCompat:

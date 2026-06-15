@@ -105,9 +105,20 @@ def format_model_summary(
         if n_compressed is not None:
             lines.append(f"Compressed Rows: {n_compressed:,}")
         
+        n_compression_base = sample_info.get('n_compression_base_rows') or n_obs
+        if (
+            n_compression_base is not None
+            and n_obs is not None
+            and n_compression_base != n_obs
+        ):
+            lines.append(f"Compression Base Rows: {n_compression_base:,}")
+
         compression_ratio = sample_info.get('compression_ratio')
-        if compression_ratio is not None and n_obs and n_compressed:
-            lines.append(f"Compression: {compression_ratio:.1%} reduction ({n_obs:,} → {n_compressed:,} rows)")
+        if compression_ratio is not None and n_compression_base and n_compressed:
+            lines.append(
+                f"Compression: {compression_ratio:.1%} reduction "
+                f"({n_compression_base:,} → {n_compressed:,} rows)"
+            )
     
     # Coefficient results
     coefficients = model_summary.get('coefficients')
@@ -294,5 +305,4 @@ class SummaryFormatter:
     ) -> pd.DataFrame:
         """Convert results to tidy DataFrame."""
         return to_tidy_df(result)
-
 

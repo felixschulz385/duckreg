@@ -182,6 +182,7 @@ class Duck2SLS(DuckEstimator):
         self._first_stage_results: Dict[str, FirstStageResults] = {}
         self._results: Optional[RegressionResults] = None
         self.n_compressed_rows: Optional[int] = None
+        self.n_compression_base_rows: Optional[int] = None
         self.n_rows_dropped_singletons: int = 0
 
         # Second-stage transformer and cached SQL name lists
@@ -460,6 +461,7 @@ class Duck2SLS(DuckEstimator):
         self.n_obs = self.conn.execute(
             f"SELECT COUNT(*) FROM {self._STAGING_TABLE}"
         ).fetchone()[0]
+        self.n_compression_base_rows = self.n_obs
         self.n_compressed_rows = self.n_obs
 
     def compress_data(self):
@@ -799,7 +801,8 @@ class Duck2SLS(DuckEstimator):
         result = self.conn.execute(
             f"SELECT SUM(count), COUNT(*) FROM {self._COMPRESSED_VIEW}"
         ).fetchone()
-        self.n_obs             = int(result[0]) if result[0] else 0
+        self.n_obs = int(result[0]) if result[0] else 0
+        self.n_compression_base_rows = self.n_obs
         self.n_compressed_rows = int(result[1]) if result[1] else 0
         self._df_compressed = None
         self._data_fetched = False

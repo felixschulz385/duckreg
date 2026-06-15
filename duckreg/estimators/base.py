@@ -70,6 +70,7 @@ class DuckEstimator(ABC):
         self.se: Optional[str] = None
         self.coef_names_: Optional[List[str]] = None
         self.n_obs: Optional[int] = None
+        self.n_compression_base_rows: Optional[int] = None
         self.n_rows_dropped_singletons: int = 0
         
         self._init_connection()

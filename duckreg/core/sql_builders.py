@@ -320,7 +320,7 @@ def build_strata_select_sql(
                formula.get_fe_by_name(col_name))
         
         if var:
-            if var.is_expr():
+            if var.is_expr() and var.expression_is_boolean:
                 # Parenthesised boolean / arithmetic expression: cast to SMALLINT
                 # and never apply ROUND (booleans are discrete; ROUND fails on them).
                 col_expr = f"CAST({var.get_sql_expression(unit_col, 'year')} AS SMALLINT)"

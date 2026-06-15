@@ -150,6 +150,35 @@ class TestFormulaParserNullCheck:
         assert "(y == 1)" not in f.get_source_columns_for_null_check()
         assert "((y = 1)) IS NOT NULL" in f.get_where_clause_sql()
 
+    def test_quadratic_expression_stays_numeric(self, parser):
+        f = parser.parse("y ~ x + x^2")
+        quad = f.get_covariate_by_name("x^2")
+        assert quad is not None
+        assert quad.is_expression
+        assert not quad.expression_is_boolean
+        assert quad.sql_name == "x_pow_2"
+        assert f.get_covariates_select_sql() == "x AS x, POW(x, 2) AS x_pow_2"
+
+    def test_identity_wrapped_quadratic_is_supported(self, parser):
+        f = parser.parse("y ~ x + I((x + 1)^2)")
+        quad = f.get_covariate_by_name("(x + 1)^2")
+        assert quad is not None
+        assert quad.is_expression
+        assert f.get_covariates_select_sql() == "x AS x, POW((x + 1), 2) AS x_1_pow_2"
+
+    def test_squared_transform_expression_uses_sql_transform(self, parser):
+        f = parser.parse("y ~ log(ntl_harm + 0.01) + log(ntl_harm + 0.01)^2")
+        assert f.get_covariate_display_names() == [
+            "log(ntl_harm+0.01)",
+            "log(ntl_harm + 0.01)^2",
+        ]
+        assert f.get_covariates_select_sql() == (
+            "LN((ntl_harm + 0.01)) AS log_ntl_harm_0_01, "
+            "POW(LN((ntl_harm + 0.01)), 2) AS log_ntl_harm_0_01_pow_2"
+        )
+        cols = f.get_source_columns_for_null_check()
+        assert cols == ["y", "ntl_harm"] or cols == ["ntl_harm", "y"]
+
 
 # ============================================================================
 # B. quote_identifier / needs_quoting helpers
@@ -218,6 +247,35 @@ class TestDuckregPooledOLS:
         coefs = {name: val for name, val in zip(model.coef_names_, model.point_estimate.flatten())}
         assert abs(coefs["x1"] - 2.0) < 0.3
         assert abs(coefs["x2"] - (-0.5)) < 0.3
+
+    def test_quadratic_formula_runs(self):
+        rng = np.random.default_rng(1)
+        x = rng.uniform(-2.0, 2.0, 400)
+        y = 1.0 + 2.0 * x + 3.0 * (x ** 2) + rng.standard_normal(len(x)) * 0.1
+        df = pd.DataFrame({"y": y, "x": x})
+
+        model = duckreg("y ~ x + x^2", data=df, se_method="none")
+
+        coefs = {name: val for name, val in zip(model.coef_names_, model.point_estimate.flatten())}
+        assert abs(coefs["x"] - 2.0) < 0.2
+        assert abs(coefs["x^2"] - 3.0) < 0.2
+
+    def test_squared_log_formula_runs(self):
+        rng = np.random.default_rng(2)
+        ntl_harm = rng.uniform(0.05, 3.0, 400)
+        log_term = np.log(ntl_harm + 0.01)
+        y = 1.0 + 1.5 * log_term - 0.75 * (log_term ** 2) + rng.standard_normal(len(ntl_harm)) * 0.05
+        df = pd.DataFrame({"y": y, "ntl_harm": ntl_harm})
+
+        model = duckreg(
+            "y ~ log(ntl_harm + 0.01) + log(ntl_harm + 0.01)^2",
+            data=df,
+            se_method="none",
+        )
+
+        coefs = {name: val for name, val in zip(model.coef_names_, model.point_estimate.flatten())}
+        assert abs(coefs["log(ntl_harm+0.01)"] - 1.5) < 0.2
+        assert abs(coefs["log(ntl_harm + 0.01)^2"] - (-0.75)) < 0.2
 
 
 class TestDuckregFE:

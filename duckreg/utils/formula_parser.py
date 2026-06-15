@@ -10,6 +10,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+_FORMULA_IDENTITY_FUNCTIONS = frozenset({"i"})
+
 
 class VariableRole(Enum):
     """Role of a variable in the regression formula"""
@@ -38,6 +40,10 @@ class TransformType(Enum):
             TransformType.SQRT: f"SQRT({expr})",
         }
         return sql_funcs.get(self, expr)
+
+
+_TRANSFORM_NAME_MAP = {transform.value.lower(): transform for transform in TransformType if transform != TransformType.NONE}
+_FORMULA_FUNCTION_NAMES = frozenset(_TRANSFORM_NAME_MAP) | _FORMULA_IDENTITY_FUNCTIONS
 
 
 # ============================================================================
@@ -184,6 +190,7 @@ def _make_sql_safe_name(name: str) -> str:
     # Structural / arithmetic characters
     safe = safe.replace('(', '_').replace(')', '_').replace('+', '_').replace('-', '_')
     safe = safe.replace('*', '_').replace(':', '_').replace('.', '_').replace(' ', '_')
+    safe = safe.replace('^', '_pow_')
     safe = safe.replace('/', '_').replace(',', '_').replace(';', '_')
     safe = safe.replace('=', '_eq_').replace('!', '_not_')
     safe = safe.replace('<', '_lt_').replace('>', '_gt_')
@@ -203,6 +210,158 @@ def _make_sql_safe_name(name: str) -> str:
 
 # Regex used to extract plain column names from parenthesised expressions
 _EXPR_COLUMN_RE = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\b')
+_BOOLEAN_EXPR_RE = re.compile(
+    r'(==|!=|<=|>=|(?<!:):(?!=)|(?<![<>=!])<(?![<>=])|(?<![<>=!])>(?![<>=])|\bIS\b|\bIN\b|\bLIKE\b|\bBETWEEN\b)',
+    re.IGNORECASE,
+)
+
+
+def _is_boolean_expression(expr: str) -> bool:
+    """Return whether *expr* is expected to evaluate to a boolean."""
+    return bool(_BOOLEAN_EXPR_RE.search(expr))
+
+
+def _translate_formula_expression_to_sql(expr: str) -> str:
+    """Translate formula expression syntax into DuckDB SQL."""
+    sql = _translate_supported_functions(expr)
+    sql = re.sub(r'(?<![!<>=])={2}(?!=)', '=', sql)
+    while '^' in sql:
+        sql = _replace_power_operator(sql)
+    return sql
+
+
+def _translate_supported_functions(expr: str) -> str:
+    """Translate supported formula functions inside a larger expression."""
+    parts: List[str] = []
+    i = 0
+    n = len(expr)
+
+    while i < n:
+        char = expr[i]
+        if char.isalpha() or char == '_':
+            start = i
+            i += 1
+            while i < n and (expr[i].isalnum() or expr[i] == '_'):
+                i += 1
+            func_name = expr[start:i]
+            j = i
+            while j < n and expr[j].isspace():
+                j += 1
+            if j < n and expr[j] == '(':
+                close_idx = _find_matching_paren(expr, j)
+                if close_idx != -1 and func_name.lower() in _FORMULA_FUNCTION_NAMES:
+                    inner_sql = _translate_formula_expression_to_sql(expr[j + 1:close_idx])
+                    parts.append(_formula_function_to_sql(func_name, inner_sql))
+                    i = close_idx + 1
+                    continue
+            parts.append(expr[start:i])
+            continue
+
+        parts.append(char)
+        i += 1
+
+    return ''.join(parts)
+
+
+def _formula_function_to_sql(func_name: str, inner_sql: str) -> str:
+    """Translate a supported formula function call to SQL."""
+    lower_name = func_name.lower()
+    if lower_name in _FORMULA_IDENTITY_FUNCTIONS:
+        return f"({inner_sql})"
+
+    transform = _TRANSFORM_NAME_MAP.get(lower_name)
+    if transform is None:
+        return f"{func_name}({inner_sql})"
+    return transform.to_sql(f"({inner_sql})")
+
+
+def _find_matching_paren(expr: str, open_idx: int) -> int:
+    """Return the matching closing-paren index for ``expr[open_idx]``."""
+    depth = 0
+    for idx in range(open_idx, len(expr)):
+        if expr[idx] == '(':
+            depth += 1
+        elif expr[idx] == ')':
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+
+def _replace_power_operator(expr: str) -> str:
+    """Replace the next ``^`` infix power operator with ``POW(left, right)``."""
+    idx = expr.find('^')
+    if idx == -1:
+        return expr
+
+    left_start = _find_power_operand_start(expr, idx - 1)
+    right_end = _find_power_operand_end(expr, idx + 1)
+
+    left = expr[left_start:idx].strip()
+    right = expr[idx + 1:right_end].strip()
+    if not left or not right:
+        return expr.replace('^', ' ^ ', 1)
+
+    return f"{expr[:left_start]}POW({left}, {right}){expr[right_end:]}"
+
+
+def _find_power_operand_start(expr: str, pos: int) -> int:
+    """Find the start index of the left operand for a ``^`` operator."""
+    while pos >= 0 and expr[pos].isspace():
+        pos -= 1
+    if pos < 0:
+        return 0
+
+    if expr[pos] == ')':
+        depth = 1
+        pos -= 1
+        while pos >= 0 and depth > 0:
+            if expr[pos] == ')':
+                depth += 1
+            elif expr[pos] == '(':
+                depth -= 1
+            pos -= 1
+        start = pos + 1
+        while start > 0 and (expr[start - 1].isalnum() or expr[start - 1] in '._'):
+            start -= 1
+        return start
+
+    while pos >= 0 and (expr[pos].isalnum() or expr[pos] in '._'):
+        pos -= 1
+    if pos >= 0 and expr[pos] == '-' and (pos == 0 or expr[pos - 1] in ' (*/+-,'):
+        pos -= 1
+    return pos + 1
+
+
+def _find_power_operand_end(expr: str, pos: int) -> int:
+    """Find the end index of the right operand for a ``^`` operator."""
+    n = len(expr)
+    while pos < n and expr[pos].isspace():
+        pos += 1
+    if pos >= n:
+        return n
+
+    if expr[pos] == '-':
+        pos += 1
+        while pos < n and expr[pos].isspace():
+            pos += 1
+        if pos >= n:
+            return n
+
+    if expr[pos] == '(':
+        depth = 1
+        pos += 1
+        while pos < n and depth > 0:
+            if expr[pos] == '(':
+                depth += 1
+            elif expr[pos] == ')':
+                depth -= 1
+            pos += 1
+        return pos
+
+    while pos < n and (expr[pos].isalnum() or expr[pos] in '._'):
+        pos += 1
+    return pos
 
 
 @dataclass(frozen=True)
@@ -216,6 +375,7 @@ class Variable:
     display_name: Optional[str] = None
     sql_name: Optional[str] = None  # Clean SQL-safe identifier
     is_expression: bool = False
+    expression_is_boolean: bool = False
     
     def __post_init__(self):
         # Build display name from transform info
@@ -248,7 +408,7 @@ class Variable:
     
     def is_expr(self) -> bool:
         """True when this variable is a parenthesised SQL expression, e.g. ``(col == 190)``."""
-        return self.name.startswith('(')
+        return self.is_expression or self.name.startswith('(')
 
     def get_sql_expression(self, unit_col: Optional[str] = None,
                            time_col: str = 'year') -> str:
@@ -260,7 +420,7 @@ class Variable:
         # Parenthesised boolean / arithmetic expressions — return as-is after
         # converting Python == to SQL = (DuckDB accepts == but = is safer).
         if self.is_expr():
-            return re.sub(r'(?<![!<>=])={2}(?!=)', '=', self.name)
+            return _translate_formula_expression_to_sql(self.name)
 
         # Build base expression with proper quoting
         base_expr = quote_identifier(self.name)
@@ -298,7 +458,7 @@ class Variable:
                        boolean_cols: Set[str] = None) -> str:
         """Generate SELECT clause fragment: expression AS sql_name"""
         expr = self.get_sql_expression(unit_col, time_col)
-        if self.is_expr():
+        if self.is_expr() and self.expression_is_boolean:
             # Boolean expression result: always cast to SMALLINT so it can
             # be used directly as a numeric covariate in regressions.
             expr = f"CAST({expr} AS SMALLINT)"
@@ -323,6 +483,22 @@ class Interaction:
     def get_quoted_name(self) -> str:
         """Get the SQL-safe name (no quoting needed)"""
         return self.sql_name
+
+    def get_sql_expression(self, unit_col: Optional[str] = None,
+                           time_col: str = 'year',
+                           boolean_cols: Set[str] = None) -> str:
+        """Generate SQL expression for interaction term."""
+        boolean_cols = boolean_cols or set()
+
+        def _component_expr(var: Variable) -> str:
+            expr = var.get_sql_expression(unit_col, time_col)
+            if var.is_expr() and var.expression_is_boolean:
+                return f"CAST({expr} AS SMALLINT)"
+            return cast_if_boolean(expr, var.name, boolean_cols)
+
+        expr1 = _component_expr(self.var1)
+        expr2 = _component_expr(self.var2)
+        return f"(({expr1}) * ({expr2}))"
     
     def get_select_sql(self, unit_col: Optional[str] = None,
                        time_col: str = 'year',
@@ -554,7 +730,10 @@ class Formula:
                     # "(lccs_class == 190)" → {"lccs_class"}
                     # Skip SQL reserved words to avoid spurious COLUMNS() entries.
                     for ident in _EXPR_COLUMN_RE.findall(var.name):
-                        if ident.upper() not in _SQL_RESERVED_WORDS:
+                        if (
+                            ident.upper() not in _SQL_RESERVED_WORDS
+                            and ident.lower() not in _FORMULA_FUNCTION_NAMES
+                        ):
                             cols.add(ident)
                 else:
                     cols.add(var.name)
@@ -962,7 +1141,11 @@ class FormulaParser:
         match = self._TRANSFORM_PATTERN.match(term_no_lag)
         if match:
             func_name = match.group(1).upper()
-            var_name, shift = self._parse_inner_expression(match.group(2).strip())
+            inner_expr = match.group(2).strip()
+            if func_name == "I":
+                return self._make_expression_variable(inner_expr, role, lag_val)
+
+            var_name, shift = self._parse_inner_expression(inner_expr)
             var_name = _normalize_variable_name(var_name)
             transform = TransformType[func_name] if func_name in TransformType.__members__ else TransformType.NONE
             return Variable(name=var_name, role=role, transform=transform, transform_shift=shift, lag=lag_val)
@@ -970,15 +1153,26 @@ class FormulaParser:
         # Normalize variable name (e.g., '1' -> '_intercept')
         normalized_name = _normalize_variable_name(term_no_lag)
         if self._is_sql_expression(normalized_name):
-            return Variable(
-                name=normalized_name,
-                role=role,
-                lag=lag_val,
-                display_name=normalized_name,
-                sql_name=_make_sql_safe_name(normalized_name),
-                is_expression=True,
-            )
+            return self._make_expression_variable(normalized_name, role, lag_val)
         return Variable(name=normalized_name, role=role, lag=lag_val)
+
+    def _make_expression_variable(
+        self,
+        expr: str,
+        role: VariableRole,
+        lag_val: Optional[int],
+    ) -> Variable:
+        """Build a parsed numeric or boolean expression variable."""
+        normalized_expr = expr.strip()
+        return Variable(
+            name=normalized_expr,
+            role=role,
+            lag=lag_val,
+            display_name=normalized_expr,
+            sql_name=_make_sql_safe_name(normalized_expr),
+            is_expression=True,
+            expression_is_boolean=_is_boolean_expression(normalized_expr),
+        )
 
     def _is_sql_expression(self, term: str) -> bool:
         """Return True for formula terms that are SQL expressions, not columns."""

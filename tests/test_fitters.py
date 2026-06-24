@@ -649,6 +649,19 @@ class TestDuckDBFitterFit:
                             add_intercept=False)
         assert result.coef_names == ["x1", "x2"]
 
+    def test_empty_table_raises_informative_error(self, conn):
+        _seed_table(conn, "tempty", [1.0], [0.0], [3.0], [1])
+        conn.execute("DELETE FROM tempty")
+        fitter = DuckDBFitter(conn=conn, alpha=0.0)
+
+        with pytest.raises(ValueError, match="No observations remain in 'tempty'"):
+            fitter.fit(
+                table_name="tempty",
+                x_cols=["x1"],
+                y_col="sum_y",
+                weight_col="count",
+            )
+
 
 # ---------------------------------------------------------------------------
 # ── 9. DuckDBFitter.fit_vcov ────────────────────────────────────────────────

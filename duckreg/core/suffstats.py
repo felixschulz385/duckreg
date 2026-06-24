@@ -293,20 +293,42 @@ def compute_sufficient_stats_sql(
     """
     row = conn.execute(query).fetchone()
 
+    if row is None:
+        raise ValueError(
+            f"No aggregate result was returned for table '{table_name}'."
+        )
+
     XtX = np.zeros((k, k))
     idx = 0
     for i in range(k):
         for j in range(i, k):
-            XtX[i, j] = row[idx]
-            XtX[j, i] = row[idx]
+            value = row[idx]
+            XtX[i, j] = 0.0 if value is None else value
+            XtX[j, i] = XtX[i, j]
             idx += 1
     XtX += alpha * np.eye(k)
 
-    Xty = np.array([float(row[idx + i]) for i in range(k)], dtype=float)
+    xty_values = row[idx:idx + k]
+    n_obs_raw = row[idx + k]
+    sum_y_raw = row[idx + k + 1]
+    sum_y_sq_raw = row[idx + k + 2]
+
+    if n_obs_raw is None or int(n_obs_raw) <= 0:
+        raise ValueError(
+            f"No observations remain in '{table_name}' for sufficient-statistics "
+            "computation."
+        )
+    if any(value is None for value in xty_values) or sum_y_raw is None or sum_y_sq_raw is None:
+        raise ValueError(
+            f"Incomplete sufficient statistics were produced for '{table_name}'. "
+            "This usually means the estimation sample is empty after filtering."
+        )
+
+    Xty = np.array([float(value) for value in xty_values], dtype=float)
     idx += k
-    n_obs = int(row[idx])
-    sum_y = float(row[idx + 1])
-    sum_y_sq = float(row[idx + 2])
+    n_obs = int(n_obs_raw)
+    sum_y = float(sum_y_raw)
+    sum_y_sq = float(sum_y_sq_raw)
 
     if not using_exact_sum_y_sq:
         logger.info(

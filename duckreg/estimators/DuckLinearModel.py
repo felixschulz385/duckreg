@@ -323,9 +323,32 @@ class DuckLinearModel(DuckEstimator):
 
     def estimate(self) -> np.ndarray:
         """Estimate coefficients using WLS"""
+        self._raise_if_no_observations()
         if self.fitter == "duckdb":
             return self._estimate_duckdb()
         return self._estimate_numpy()
+
+    def _raise_if_no_observations(self) -> None:
+        """Raise an informative error when the analytic sample is empty."""
+        if self.n_obs is not None and self.n_obs > 0:
+            return
+
+        reasons = ["all observations were removed before estimation"]
+        if self.n_rows_dropped_singletons:
+            reasons.append(
+                f"singleton pruning dropped all {self.n_rows_dropped_singletons} remaining row(s)"
+            )
+        elif self.fe_cols:
+            reasons.append(
+                "the combination of fixed effects, null filtering, and subset conditions left no usable rows"
+            )
+
+        detail = "; ".join(reasons)
+        raise ValueError(
+            "No observations remain for estimation after filtering/compression: "
+            f"{detail}. Adjust the sample restrictions or disable singleton pruning "
+            "if that matches the intended specification."
+        )
     
     def _estimate_numpy(self) -> np.ndarray:
         """Estimate using in-memory numpy WLS"""

@@ -236,6 +236,29 @@ def test_merged_fe(balanced_df, balanced_path, dr_fe_part, pf_fe_part):
                     dr_fe_part=dr_fe_part, pf_fe_part=pf_fe_part)
 
 
+def test_fe_demean_raises_clear_error_when_singleton_pruning_removes_all_rows():
+    df = pd.DataFrame(
+        {
+            "y": [1.0, 2.0, 3.0],
+            "x1": [0.1, 0.2, 0.3],
+            "unit": [1, 2, 3],
+            "year": [2000, 2001, 2002],
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="No observations remain for estimation after filtering/compression",
+    ):
+        duckreg(
+            "y ~ x1 | unit + year",
+            data=df,
+            fitter="duckdb",
+            fe_method="demean",
+            se_method="HC1",
+        )
+
+
 # ============================================================================
 # TestDuckFEVcovParams — get_vcov_fe_params() shape for demean models
 # ============================================================================

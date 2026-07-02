@@ -26,6 +26,7 @@ from duckreg import duckreg
 import duckdb
 from duckreg.core.transformers import IterativeDemeanTransformer
 from duckreg.estimators.DuckLinearModel import DuckLinearModel
+from duckreg.utils.formula_parser import NestedFixedEffect
 from tests.helpers import (
     assert_coef_se_close,
     assert_coef_near_true,
@@ -193,6 +194,46 @@ def _max_abs_group_mean(df, fe_cols, variables):
     return maxima
 
 
+def _make_nested_component_panel(seed: int = 123) -> pd.DataFrame:
+    """Panel with ``pixel_id %in% country`` and a ``country^year`` merged FE."""
+    rng = np.random.default_rng(seed)
+    n_countries = 4
+    pixels_per_country = 3
+    n_years = 5
+    rows = []
+
+    country_fe = rng.standard_normal(n_countries)
+    year_fe = rng.standard_normal(n_years)
+    pixel_fe = rng.standard_normal(n_countries * pixels_per_country)
+
+    for country in range(n_countries):
+        for local_pixel in range(pixels_per_country):
+            pixel_id = country * pixels_per_country + local_pixel
+            for year in range(n_years):
+                x = rng.standard_normal() + 0.2 * country - 0.1 * year
+                y = (
+                    1.25 * x
+                    + pixel_fe[pixel_id]
+                    + country_fe[country]
+                    + year_fe[year]
+                    + rng.standard_normal() * 0.1
+                )
+                rows.append(
+                    {
+                        "pixel_id": pixel_id,
+                        "country": country,
+                        "year": year,
+                        "country_year": f"{country}_{year}",
+                        "x": x,
+                        "y": y,
+                    }
+                )
+
+    df = pd.DataFrame(rows)
+    drop_mask = ((df["pixel_id"] + df["year"]) % 4 == 0)
+    return df.loc[~drop_mask].reset_index(drop=True)
+
+
 # ============================================================================
 # Coef / SE accuracy tests
 # ============================================================================
@@ -225,8 +266,8 @@ def test_fe_shallow_smoke(balanced_df, balanced_path, fe_depth):
 @pytest.mark.parametrize(
     "dr_fe_part, pf_fe_part",
     [
-        ("country*year",            "country^year"),
-        ("pixel_id + country*year", "pixel_id + country^year"),
+        ("country^year",            "country^year"),
+        ("pixel_id + country^year", "pixel_id + country^year"),
     ],
     ids=["pure_interaction", "additive_plus_interaction"],
 )
@@ -234,6 +275,40 @@ def test_merged_fe(balanced_df, balanced_path, dr_fe_part, pf_fe_part):
     """Merged FE (demean): pure interaction vs. additive TWFE."""
     check_merged_fe(balanced_df, balanced_path, fitter="numpy",
                     dr_fe_part=dr_fe_part, pf_fe_part=pf_fe_part)
+
+
+def test_nested_formula_matches_plain_absorption(balanced_df, balanced_path):
+    """Formula-level nesting should preserve estimates relative to plain FE absorption."""
+    nested = duckreg(
+        "modis_median ~ ntl_harm + exog_control | pixel_id %in% country + country^year",
+        data=balanced_path,
+        se_method="HC1",
+        fe_method="demean",
+        fitter="numpy",
+    )
+    plain = duckreg(
+        "modis_median ~ ntl_harm + exog_control | pixel_id + country^year",
+        data=balanced_path,
+        se_method="HC1",
+        fe_method="demean",
+        fitter="numpy",
+    )
+
+    nested_summary = nested.summary_df().sort_index()
+    plain_summary = plain.summary_df().sort_index()
+
+    np.testing.assert_allclose(
+        nested.point_estimate,
+        plain.point_estimate,
+        rtol=1e-6,
+        atol=1e-8,
+    )
+    np.testing.assert_allclose(
+        nested_summary["std_error"].values,
+        plain_summary["std_error"].values,
+        rtol=1e-6,
+        atol=1e-8,
+    )
 
 
 def test_fe_demean_raises_clear_error_when_singleton_pruning_removes_all_rows():
@@ -1005,6 +1080,101 @@ class TestDemeanConvergence:
         assert np.allclose(transformed["const_a"].values, 0.0)
         assert np.allclose(transformed["const_b"].values, 0.0)
         conn.close()
+
+    def test_nested_fe_validation_raises_on_inconsistent_mapping(self):
+        conn = duckdb.connect()
+        df = pd.DataFrame(
+            {
+                "pixel_id": [0, 0, 1, 1],
+                "country": [0, 1, 0, 0],
+                "year": [0, 1, 0, 1],
+                "country_year": ["0_0", "1_1", "0_0", "0_1"],
+                "x": [1.0, 2.0, 3.0, 4.0],
+                "y": [2.0, 1.0, 4.0, 3.0],
+            }
+        )
+        conn.register("bad_nested_panel", df)
+        t = IterativeDemeanTransformer(
+            conn=conn,
+            table_name="bad_nested_panel",
+            fe_cols=["pixel_id", "country_year"],
+            remove_singletons=False,
+            fe_nesting=[
+                NestedFixedEffect(
+                    child_name="pixel_id",
+                    child_sql_name="pixel_id",
+                    parent_name="country",
+                    parent_sql_name="country",
+                )
+            ],
+            carry_cols=["country", "year"],
+            merged_fe_component_map={"country_year": ["country", "year"]},
+            tolerance=1e-10,
+            check_interval=1,
+        )
+
+        with pytest.raises(ValueError, match="pixel_id is not nested in country"):
+            t.fit_transform(["x", "y"])
+        conn.close()
+
+    def test_nested_component_decomposition_matches_global_map(self):
+        df = _make_nested_component_panel()
+        conn_nested = duckdb.connect()
+        conn_map = duckdb.connect()
+        conn_nested.register("nested_panel", df)
+        conn_map.register("nested_panel", df)
+
+        nested_spec = [
+            NestedFixedEffect(
+                child_name="pixel_id",
+                child_sql_name="pixel_id",
+                parent_name="country",
+                parent_sql_name="country",
+            )
+        ]
+        common_kwargs = dict(
+            table_name="nested_panel",
+            fe_cols=["pixel_id", "country_year"],
+            remove_singletons=False,
+            carry_cols=["country", "year"],
+            merged_fe_component_map={"country_year": ["country", "year"]},
+            tolerance=1e-10,
+            check_interval=1,
+        )
+
+        t_nested = IterativeDemeanTransformer(
+            conn=conn_nested,
+            fe_nesting=nested_spec,
+            **common_kwargs,
+        )
+        t_map = IterativeDemeanTransformer(
+            conn=conn_map,
+            fe_nesting=[],
+            **common_kwargs,
+        )
+
+        t_nested.fit_transform(["x", "y"])
+        t_map.fit_transform(["x", "y"])
+
+        nested_df = _fetch_transformed_df(t_nested, ["x", "y"]).sort_values(
+            ["pixel_id", "country_year"]
+        ).reset_index(drop=True)
+        map_df = _fetch_transformed_df(t_map, ["x", "y"]).sort_values(
+            ["pixel_id", "country_year"]
+        ).reset_index(drop=True)
+
+        maxima = _max_abs_group_mean(nested_df, ["pixel_id", "country_year"], ["x", "y"])
+        assert maxima["pixel_id"] < 1e-8
+        assert maxima["country_year"] < 1e-8
+        np.testing.assert_allclose(
+            nested_df[["x", "y"]].values,
+            map_df[["x", "y"]].values,
+            atol=1e-8,
+        )
+        assert "country" in _result_columns(t_nested)
+        assert "year" in _result_columns(t_nested)
+        conn_nested.close()
+        conn_map.close()
 
     def test_float_residual_type_supports_relaxed_tolerance(self):
         conn = self._make_conn()

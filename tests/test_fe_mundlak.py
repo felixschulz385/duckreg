@@ -240,8 +240,8 @@ def test_fe_shallow_smoke(balanced_df, balanced_path, fe_depth):
 @pytest.mark.parametrize(
     "dr_fe_part, pf_fe_part",
     [
-        ("country*year",            "country^year"),
-        ("pixel_id + country*year", "pixel_id + country^year"),
+        ("country^year",            "country^year"),
+        ("pixel_id + country^year", "pixel_id + country^year"),
     ],
     ids=["pure_interaction", "additive_plus_interaction"],
 )

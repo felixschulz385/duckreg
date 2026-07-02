@@ -323,6 +323,12 @@ class DuckMediation(DuckEstimator):
             return eff
         return self._CLUSTER_ALIAS
 
+    def _get_transformer_carry_cols(self) -> List[str]:
+        """Columns needed for FE nesting validation/decomposition."""
+        if self._formula is None:
+            return []
+        return self._formula.get_fe_dependency_sql_names()
+
     # ------------------------------------------------------------------
     # Pipeline (DuckEstimator interface)
     # ------------------------------------------------------------------
@@ -334,9 +340,16 @@ class DuckMediation(DuckEstimator):
         the optional ``subset`` filter.  After running, removes singleton
         FE observations.
         """
+        if self._formula is not None:
+            from ..utils.formula_parser import FormulaParser
+
+            self._formula = FormulaParser.resolve_numeric_merge(
+                self._formula, self.conn, self.table_name
+            )
+
         # All variable inputs in their raw form (expressions preserved)
         # Note: fe_cols are handled separately via formula.get_fe_select_sql
-        # to correctly expand interaction terms (e.g. country*year → country_year).
+        # to correctly expand interaction terms (e.g. country^year → country_year).
         all_raw = (
             [self.outcome_col]
             + self._exposures_raw
@@ -371,14 +384,17 @@ class DuckMediation(DuckEstimator):
             select_parts.append(self._col_select_expr(raw, bool_cols))
 
         # Add FE columns.  When a parsed Formula is available, use its
-        # get_fe_select_sql() so that interaction terms like country*year are
-        # properly expanded to  country || '_' || CAST(year AS VARCHAR) AS country_year
+        # get_fe_select_sql() so that merged FE terms like country^year are
+        # properly expanded to country || '_' || CAST(year AS VARCHAR) AS country_year
         # rather than being referenced as a non-existent plain column.
         if self.fe_cols:
             if self._formula is not None:
                 fe_sql = self._formula.get_fe_select_sql(bool_cols)
                 if fe_sql:
                     select_parts.append(fe_sql)
+                dependency_sql = self._formula.get_fe_dependency_select_sql(bool_cols)
+                if dependency_sql:
+                    select_parts.append(dependency_sql)
             else:
                 # Fallback: plain columns only (no interaction support)
                 for fe_col in self.fe_cols:
@@ -582,6 +598,12 @@ class DuckMediation(DuckEstimator):
             fe_cols=self.fe_cols,
             cluster_col=cluster_col,
             remove_singletons=False,   # singletons already handled in prepare_data
+            fe_nesting=self._formula.get_fe_nesting() if self._formula is not None else [],
+            carry_cols=self._get_transformer_carry_cols(),
+            merged_fe_component_map=(
+                self._formula.get_merged_fe_component_map()
+                if self._formula is not None else {}
+            ),
             max_iterations=self.max_iterations,
             tolerance=self.tolerance,
         )

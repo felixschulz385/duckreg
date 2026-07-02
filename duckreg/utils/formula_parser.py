@@ -172,7 +172,6 @@ def _make_sql_safe_name(name: str) -> str:
     Removes special characters, replaces spaces/operators with underscores.
     Examples:
         'log(x+0.01)' -> 'log_x_0_01'
-        'country*year' -> 'country_year'
         'L.gdp' -> 'L_gdp'
         '(col == 190)' -> 'col_eq_190'
         '(col != 0)' -> 'col_ne_0'
@@ -541,6 +540,15 @@ class MergedFixedEffect:
 
 
 @dataclass(frozen=True)
+class NestedFixedEffect:
+    """Immutable representation of a declared FE nesting relation."""
+    child_name: str
+    child_sql_name: str
+    parent_name: str
+    parent_sql_name: str
+
+
+@dataclass(frozen=True)
 class Formula:
     """Immutable representation of a parsed regression formula"""
     outcomes: Tuple[Variable, ...]
@@ -553,6 +561,7 @@ class Formula:
     endogenous: Tuple[Variable, ...] = ()
     instruments: Tuple[Variable, ...] = ()
     mediators: Tuple[Variable, ...] = ()
+    nested_fes: Tuple[NestedFixedEffect, ...] = ()
     
     # -------------------------------------------------------------------------
     # Generic lookup helper
@@ -625,6 +634,96 @@ class Formula:
     def get_simple_fe_display_names(self) -> List[str]:
         """Get only simple FE display names (no merged FEs)"""
         return [var.display_name for var in self.fixed_effects]
+
+    def get_fe_nesting(self) -> List[NestedFixedEffect]:
+        """Return declared FE nesting metadata."""
+        return list(self.nested_fes)
+
+    def get_nesting_parent_sql_names(self) -> List[str]:
+        """Return SQL-safe parent columns referenced only by nesting metadata."""
+        names: List[str] = []
+        seen = set()
+        for nesting in self.nested_fes:
+            if nesting.parent_sql_name not in seen:
+                names.append(nesting.parent_sql_name)
+                seen.add(nesting.parent_sql_name)
+        return names
+
+    def get_nesting_source_columns(self) -> List[str]:
+        """Return raw source columns referenced by FE nesting metadata."""
+        names: List[str] = []
+        seen = set()
+        for nesting in self.nested_fes:
+            if nesting.parent_name not in seen:
+                names.append(nesting.parent_name)
+                seen.add(nesting.parent_name)
+        return names
+
+    def get_merged_fe_component_map(self) -> Dict[str, Tuple[str, ...]]:
+        """Return ``{merged_fe_sql_name: component_sql_names}``."""
+        return {
+            mfe.sql_name: tuple(comp.sql_name for comp in mfe.components)
+            for mfe in self.merged_fes
+        }
+
+    def get_fe_dependency_sql_names(self) -> List[str]:
+        """Return SQL names needed for FE nesting validation/decomposition."""
+        names = []
+        seen = set(
+            self.get_fe_sql_names()
+            + self.get_outcome_sql_names()
+            + self.get_covariate_sql_names()
+            + [var.sql_name for var in self.endogenous]
+            + [var.sql_name for var in self.instruments]
+            + [var.sql_name for var in self.mediators]
+        )
+
+        for mfe in self.merged_fes:
+            for comp in mfe.components:
+                if comp.sql_name not in seen:
+                    names.append(comp.sql_name)
+                    seen.add(comp.sql_name)
+
+        for nesting in self.nested_fes:
+            if nesting.parent_sql_name not in seen:
+                names.append(nesting.parent_sql_name)
+                seen.add(nesting.parent_sql_name)
+
+        return names
+
+    def get_fe_dependency_select_sql(self, boolean_cols: Set[str] = None) -> str:
+        """Generate SELECT fragments for raw FE dependency columns."""
+        boolean_cols = boolean_cols or set()
+        parts = []
+        seen = set(
+            self.get_fe_sql_names()
+            + self.get_outcome_sql_names()
+            + self.get_covariate_sql_names()
+            + [var.sql_name for var in self.endogenous]
+            + [var.sql_name for var in self.instruments]
+            + [var.sql_name for var in self.mediators]
+        )
+
+        for mfe in self.merged_fes:
+            for comp in mfe.components:
+                if comp.sql_name in seen:
+                    continue
+                expr = cast_if_boolean(comp.get_sql_expression(), comp.name, boolean_cols)
+                parts.append(f"{expr} AS {comp.sql_name}")
+                seen.add(comp.sql_name)
+
+        for nesting in self.nested_fes:
+            if nesting.parent_sql_name in seen:
+                continue
+            expr = cast_if_boolean(
+                quote_identifier(nesting.parent_name),
+                nesting.parent_name,
+                boolean_cols,
+            )
+            parts.append(f"{expr} AS {nesting.parent_sql_name}")
+            seen.add(nesting.parent_sql_name)
+
+        return self._join_select_parts(parts)
     
     def get_endogenous_names(self) -> List[str]:
         """Get names (raw) of endogenous variables"""
@@ -748,7 +847,10 @@ class Formula:
         # Merged FE components
         for mfe in self.merged_fes:
             cols.update(comp.name for comp in mfe.components if not comp.is_intercept())
-        
+
+        for parent_name in self.get_nesting_source_columns():
+            cols.add(parent_name)
+
         if self.cluster:
             cols.add(self.cluster.name)
         
@@ -945,7 +1047,10 @@ class FormulaParser:
             raise ValueError("Formula can have at most 4 parts separated by |")
         
         covariates, interactions, mediators = self._parse_covariates_with_interactions(parts[0]) if parts[0] else ([], [], [])
-        fixed_effects, merged_fes = self._parse_fixed_effects(parts[1]) if len(parts) > 1 and parts[1].strip() != "0" else ([], [])
+        if len(parts) > 1 and parts[1].strip() != "0":
+            fixed_effects, merged_fes, nested_fes = self._parse_fixed_effects(parts[1])
+        else:
+            fixed_effects, merged_fes, nested_fes = ([], [], [])
         
         # Parse instrumental variables (3rd pipe segment)
         endogenous, instruments = [], []
@@ -978,6 +1083,7 @@ class FormulaParser:
             endogenous=tuple(endogenous),
             instruments=tuple(instruments),
             mediators=tuple(mediators),
+            nested_fes=tuple(nested_fes),
         )
     
     def _split_terms(self, expr: str) -> List[str]:
@@ -1106,17 +1212,46 @@ class FormulaParser:
         
         return None
     
-    def _parse_fixed_effects(self, fe_string: str) -> Tuple[List[Variable], List[MergedFixedEffect]]:
+    def _parse_fixed_effects(
+        self,
+        fe_string: str,
+    ) -> Tuple[List[Variable], List[MergedFixedEffect], List[NestedFixedEffect]]:
         """Parse fixed effects including merged FEs"""
-        fixed_effects, merged_fes = [], []
+        fixed_effects, merged_fes, nested_fes = [], [], []
         
         for term in self._split_terms(fe_string):
             term = term.strip()
             if not term:
                 continue
-            
+
+            if "%in%" in term:
+                parts = [p.strip() for p in term.split("%in%")]
+                if len(parts) != 2 or not parts[0] or not parts[1]:
+                    raise ValueError(
+                        "Nested FE syntax must be exactly 'child %in% parent'. "
+                        f"Got: {term!r}"
+                    )
+                child = self._parse_single_variable(parts[0], VariableRole.FIXED_EFFECT)
+                parent = self._parse_single_variable(parts[1], VariableRole.FIXED_EFFECT)
+                fixed_effects.append(child)
+                nested_fes.append(
+                    NestedFixedEffect(
+                        child_name=child.name,
+                        child_sql_name=child.sql_name,
+                        parent_name=parent.name,
+                        parent_sql_name=parent.sql_name,
+                    )
+                )
+                continue
+
             if '*' in term:
-                parts = [p.strip() for p in term.split('*')]
+                raise ValueError(
+                    "Merged FE syntax in the FE segment now uses '^' instead of '*'. "
+                    f"Replace {term!r} with {term.replace('*', '^')!r}."
+                )
+
+            if '^' in term:
+                parts = [p.strip() for p in term.split('^')]
                 components = tuple(self._parse_single_variable(p, VariableRole.FIXED_EFFECT) for p in parts)
                 merged_name = '_'.join(c.name for c in components)
                 merged_sql_name = '_'.join(c.sql_name for c in components)
@@ -1132,7 +1267,7 @@ class FormulaParser:
             else:
                 fixed_effects.append(self._parse_single_variable(term, VariableRole.FIXED_EFFECT))
         
-        return fixed_effects, merged_fes
+        return fixed_effects, merged_fes, nested_fes
     
     def _parse_single_variable(self, term: str, role: VariableRole) -> Variable:
         """Parse a single variable term"""

@@ -109,6 +109,22 @@ class TestFormulaParserFE:
         f = parser.parse("y ~ x1 | fe1")
         assert not f.has_instruments()
 
+    def test_nested_fe_absorbs_only_child(self, parser):
+        f = parser.parse("y ~ x1 | pixel_id %in% country + country^year")
+        assert f.get_fe_names() == ["pixel_id", "country_year"]
+        nesting = f.get_fe_nesting()
+        assert len(nesting) == 1
+        assert nesting[0].child_name == "pixel_id"
+        assert nesting[0].parent_name == "country"
+
+    def test_fe_segment_star_raises_clear_error(self, parser):
+        with pytest.raises(ValueError, match="uses '\\^' instead of '\\*'"):
+            parser.parse("y ~ x1 | country*year")
+
+    def test_chained_nested_fe_is_rejected(self, parser):
+        with pytest.raises(ValueError, match="exactly 'child %in% parent'"):
+            parser.parse("y ~ x1 | pixel_id %in% adm2 %in% country")
+
 
 class TestFormulaParserIV:
     """Formula with instrumental variables (fixest-style pipe syntax)."""
@@ -183,6 +199,11 @@ class TestFormulaParserNullCheck:
         )
         cols = f.get_source_columns_for_null_check()
         assert cols == ["y", "ntl_harm"] or cols == ["ntl_harm", "y"]
+
+    def test_nested_fe_parent_is_included_in_null_check(self, parser):
+        f = parser.parse("y ~ x1 | pixel_id %in% country + country^year")
+        cols = f.get_source_columns_for_null_check()
+        assert "country" in cols
 
     def test_resolve_numeric_merge_accepts_relation_expression(self):
         conn = duckdb.connect()

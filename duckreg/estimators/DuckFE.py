@@ -195,6 +195,10 @@ class DuckFE(DuckLinearModel):
             )
         return result
 
+    def _get_transformer_carry_cols(self) -> List[str]:
+        """Columns needed for FE nesting validation/decomposition."""
+        return self.formula.get_fe_dependency_sql_names()
+
     def _drop_staging_if_exists(self) -> None:
         """Drop _STAGING_TABLE unconditionally, regardless of whether it is a
         TABLE or a VIEW.  DuckDB's ``DROP VIEW IF EXISTS`` raises an error when
@@ -225,6 +229,9 @@ class DuckFE(DuckLinearModel):
             fe_cols=fe_sql_names,
             cluster_col=cluster_col,
             remove_singletons=self.remove_singletons,
+            fe_nesting=self.formula.get_fe_nesting(),
+            carry_cols=self._get_transformer_carry_cols(),
+            merged_fe_component_map=self.formula.get_merged_fe_component_map(),
         )
         if self.method == "iterative_demean":
             return IterativeDemeanTransformer(
@@ -297,6 +304,7 @@ class DuckFE(DuckLinearModel):
 
             select_parts = [
                 self.formula.get_fe_select_sql(boolean_cols),
+                self.formula.get_fe_dependency_select_sql(boolean_cols),
                 self.formula.get_outcomes_select_sql(
                     unit_col, "year", boolean_cols
                 ),
@@ -341,16 +349,20 @@ class DuckFE(DuckLinearModel):
 
         else:  # iterative_demean or auto_fe
             # Create a staging view whenever any computed expression is needed:
-            # merged FEs (e.g. country*year) or transformed variables
+            # merged FEs (e.g. country^year) or transformed variables
             # (e.g. log(viirs_annual + 0.01)).  The view uses SELECT * so all
             # original columns remain accessible, plus extra aliases for each
             # computed expression so the transformer can reference them by
             # their sql_name.
             extra_select_exprs = []
 
-            # Merged FE expressions (e.g. country_year from country*year)
+            # Merged FE expressions (e.g. country_year from country^year)
             for mfe in self.formula.merged_fes:
                 extra_select_exprs.append(mfe.get_select_sql())
+
+            dependency_sql = self.formula.get_fe_dependency_select_sql(boolean_cols)
+            if dependency_sql:
+                extra_select_exprs.append(dependency_sql)
 
             # Transformed outcome/covariate expressions
             # (only needed when a transform is applied or when the variable is
@@ -892,7 +904,7 @@ class DuckFE(DuckLinearModel):
     def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, str]:
         if self.method in ("iterative_demean", "auto_fe"):
             # Use the SQL-safe FE name so merged FEs (e.g. country_year for
-            # country*year) resolve correctly against the demeaned_data table.
+            # country^year) resolve correctly against the demeaned_data table.
             fe_sql_names = self._resolve_fe_sql_names()
             sampling_col = self.cluster_col or (fe_sql_names[0] if fe_sql_names else self.fe_cols[0])
             cluster_df = self.conn.execute(

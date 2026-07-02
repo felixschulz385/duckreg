@@ -6,6 +6,7 @@ from typing import Dict, List, Literal, Optional
 import duckdb
 
 from .base import FETransformer
+from ...utils.formula_parser import NestedFixedEffect
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,8 @@ class IterativeDemeanTransformer(FETransformer):
         fe_cols: List[str],
         cluster_col: Optional[str] = None,
         remove_singletons: bool = True,
+        fe_nesting: Optional[List[NestedFixedEffect]] = None,
+        carry_cols: Optional[List[str]] = None,
         max_iterations: int = 1000,
         tolerance: float = 1e-8,
         check_interval: int = 5,
@@ -170,6 +173,13 @@ class IterativeDemeanTransformer(FETransformer):
         self._resid_name_map: Dict[str, str] = {}
         self._fe_code_map: List[Dict[str, str]] = []
         self._map_fe_code_order: List[Dict[str, str]] = []
+        self.fe_nesting = list(fe_nesting or [])
+        self.carry_cols = self._dedupe_cols(carry_cols or [], exclude=self.fe_cols)
+        if self.cluster_col:
+            self.carry_cols = [col for col in self.carry_cols if col != self.cluster_col]
+        self._merged_fe_component_map: Dict[str, List[str]] = dict(
+            kwargs.pop("merged_fe_component_map", {})
+        )
         self.conn.execute("SET preserve_insertion_order = false")
         if self.duckdb_memory_limit is not None:
             self.conn.execute(f"SET memory_limit = '{self.duckdb_memory_limit}'")
@@ -177,6 +187,28 @@ class IterativeDemeanTransformer(FETransformer):
         if self.duckdb_threads is not None:
             self.conn.execute(f"SET threads = {self.duckdb_threads}")
             logger.debug("Set DuckDB threads=%d", self.duckdb_threads)
+
+    @staticmethod
+    def _dedupe_cols(cols: List[str], exclude: Optional[List[str]] = None) -> List[str]:
+        """Return columns in first-seen order, excluding any listed names."""
+        seen = set(exclude or [])
+        result = []
+        for col in cols:
+            if col in seen:
+                continue
+            seen.add(col)
+            result.append(col)
+        return result
+
+    def _non_resid_columns(self, extra_cols: Optional[List[str]] = None) -> List[str]:
+        """Return non-residual output columns in stable order."""
+        cols = list(self.fe_cols)
+        if self.cluster_col:
+            cols.append(self.cluster_col)
+        cols.extend(self.carry_cols)
+        if extra_cols:
+            cols.extend(extra_cols)
+        return self._dedupe_cols(cols)
 
     @staticmethod
     def qident(name: str) -> str:
@@ -295,6 +327,8 @@ class IterativeDemeanTransformer(FETransformer):
             )
             return self._RESULT_TABLE
 
+        self._validate_fe_nesting()
+
         resid_cols = self._resid_cols(variables)
         map_resid_cols = self._filter_map_resid_cols(resid_cols)
 
@@ -325,6 +359,20 @@ class IterativeDemeanTransformer(FETransformer):
             self._fitted = True
             logger.debug(
                 "Finished iterative demeaning: result_table=%s, n_obs=%d, iterations=%d",
+                self._RESULT_TABLE,
+                self.n_obs,
+                self.n_iterations,
+            )
+            return self._RESULT_TABLE
+
+        nested_pattern = self._detect_nested_component_pattern()
+        if nested_pattern is not None:
+            self._run_nested_component_decomposition(nested_pattern, map_resid_cols)
+            self._compute_fe_levels()
+            self._fitted = True
+            logger.debug(
+                "Finished iterative demeaning via nested component decomposition: "
+                "result_table=%s, n_obs=%d, iterations=%s",
                 self._RESULT_TABLE,
                 self.n_obs,
                 self.n_iterations,
@@ -430,16 +478,16 @@ class IterativeDemeanTransformer(FETransformer):
         self.n_rows_dropped_singletons = 0
 
         select_parts = [f"ROW_NUMBER() OVER () AS {row_id_sql}"]
-        select_parts.extend(self.qident(fe_col) for fe_col in self.fe_cols)
-        if self.cluster_col:
-            select_parts.append(self.qident(self.cluster_col))
+        select_parts.extend(self.qident(col) for col in self._non_resid_columns())
         for variable in variables:
             select_parts.append(
                 f"CAST({self.qident(variable)} AS {self.residual_type}) AS "
                 f"{self.qident(self._resid_name_map[variable])}"
             )
 
-        all_model_cols = list(self.fe_cols) + list(variables)
+        all_model_cols = self._dedupe_cols(
+            list(self.fe_cols) + list(variables) + self.carry_cols
+        )
         if self.cluster_col:
             all_model_cols.append(self.cluster_col)
         null_filter = " AND ".join(
@@ -734,13 +782,22 @@ class IterativeDemeanTransformer(FETransformer):
         finally:
             self.conn.execute(f"DROP TABLE IF EXISTS {final_table_sql}")
 
+    def _build_passthrough_projection(
+        self,
+        source_alias: str,
+        extra_cols: Optional[List[str]] = None,
+    ) -> List[str]:
+        """Build the non-residual projection for result-replacement helpers."""
+        return [
+            f"{source_alias}.{self.qident(col)}"
+            for col in self._non_resid_columns(extra_cols)
+        ]
+
     def _run_oneway_exact(self, resid_cols: List[str]) -> None:
         """Demean exactly in one pass for a single FE dimension."""
         fe_sql = self.qident(self.fe_cols[0])
         active_resid_cols = set(resid_cols)
-        select_parts = [f"src.{self.qident(fe_col)}" for fe_col in self.fe_cols]
-        if self.cluster_col:
-            select_parts.append(f"src.{self.qident(self.cluster_col)}")
+        select_parts = self._build_passthrough_projection("src")
         for resid_col in self._resid_name_map.values():
             resid_sql = self.qident(resid_col)
             if resid_col in active_resid_cols:
@@ -763,9 +820,7 @@ class IterativeDemeanTransformer(FETransformer):
             f"PARTITION BY src.{self.qident(fe_col)}" for fe_col in self.fe_cols
         ]
 
-        select_parts = [f"src.{self.qident(fe_col)}" for fe_col in self.fe_cols]
-        if self.cluster_col:
-            select_parts.append(f"src.{self.qident(self.cluster_col)}")
+        select_parts = self._build_passthrough_projection("src")
         for resid_col in self._resid_name_map.values():
             resid_sql = self.qident(resid_col)
             if resid_col in active_resid_cols:
@@ -874,9 +929,7 @@ class IterativeDemeanTransformer(FETransformer):
         source_table_sql = self.qident(source_table)
         final_table_sql = self.qident("_result_final")
 
-        select_parts = [self.qident(fe_col) for fe_col in self.fe_cols]
-        if self.cluster_col:
-            select_parts.append(self.qident(self.cluster_col))
+        select_parts = [self.qident(col) for col in self._non_resid_columns()]
         select_parts.extend(
             self.qident(resid_col) for resid_col in self._resid_name_map.values()
         )
@@ -931,9 +984,9 @@ class IterativeDemeanTransformer(FETransformer):
 
         try:
             fe_select_parts = [row_id_sql]
-            fe_select_parts.extend(self.qident(fe_col) for fe_col in self.fe_cols)
-            if self.cluster_col:
-                fe_select_parts.append(self.qident(self.cluster_col))
+            fe_select_parts.extend(
+                self.qident(col) for col in self._non_resid_columns()
+            )
             self.conn.execute(
                 f"""
                 CREATE OR REPLACE TABLE {fe_store_sql} AS
@@ -1114,9 +1167,8 @@ class IterativeDemeanTransformer(FETransformer):
             logger.debug("MAP cleanup starting")
             if self._table_exists("_fe_store") and self._table_exists("_resid_store"):
                 logger.debug("Reconstructing %s from MAP scratch tables", self._RESULT_TABLE)
-                fe_exprs = ", ".join(f"f.{self.qident(fe_col)}" for fe_col in self.fe_cols)
-                cluster_expr = (
-                    f", f.{self.qident(self.cluster_col)}" if self.cluster_col else ""
+                output_exprs = ", ".join(
+                    f"f.{self.qident(col)}" for col in self._non_resid_columns()
                 )
                 active_resid_cols = set(resid_cols)
                 all_resid_cols = set(self._resid_name_map.values())
@@ -1128,7 +1180,7 @@ class IterativeDemeanTransformer(FETransformer):
                     self.conn.execute(
                         f"""
                         CREATE OR REPLACE TABLE {result_table_sql} AS
-                        SELECT {fe_exprs}{cluster_expr}, {resid_exprs}
+                        SELECT {output_exprs}, {resid_exprs}
                         FROM {fe_store_sql} f
                         JOIN {resid_store_sql} r
                           ON f.{row_id_sql} = r.{row_id_sql}
@@ -1146,7 +1198,7 @@ class IterativeDemeanTransformer(FETransformer):
                     self.conn.execute(
                         f"""
                         CREATE OR REPLACE TABLE {result_table_sql} AS
-                        SELECT {fe_exprs}{cluster_expr}, {resid_exprs}
+                        SELECT {output_exprs}, {resid_exprs}
                         FROM {fe_store_sql} f
                         JOIN {resid_store_sql} r
                           ON f.{row_id_sql} = r.{row_id_sql}
@@ -1182,4 +1234,161 @@ class IterativeDemeanTransformer(FETransformer):
             "FE levels: %d total across %d dim(s)",
             self._fe_total_levels,
             len(self.fe_cols),
+        )
+
+    def _validate_fe_nesting(self) -> None:
+        """Validate declared nesting metadata on the filtered working sample."""
+        if not self.fe_nesting:
+            return
+
+        result_table_sql = self.qident(self._RESULT_TABLE)
+        for nesting in self.fe_nesting:
+            child_sql = self.qident(nesting.child_sql_name)
+            parent_sql = self.qident(nesting.parent_sql_name)
+            row = self.conn.execute(
+                f"""
+                SELECT MAX(parent_count)
+                FROM (
+                    SELECT {child_sql}, COUNT(DISTINCT {parent_sql}) AS parent_count
+                    FROM {result_table_sql}
+                    GROUP BY {child_sql}
+                ) _nest_check
+                """
+            ).fetchone()
+            if row is not None and row[0] is not None and int(row[0]) > 1:
+                raise ValueError(
+                    f"{nesting.child_name} is not nested in {nesting.parent_name}. "
+                    f"Some {nesting.child_name} values map to multiple {nesting.parent_name} values."
+                )
+
+    def _detect_nested_component_pattern(self) -> Optional[Dict[str, str]]:
+        """Detect the single supported nested decomposition pattern."""
+        if len(self.fe_nesting) != 1 or len(self.fe_cols) != 2:
+            return None
+        if not self._merged_fe_component_map:
+            return None
+
+        nesting = self.fe_nesting[0]
+        child_sql = nesting.child_sql_name
+        parent_sql = nesting.parent_sql_name
+        merged_candidates = [fe_col for fe_col in self.fe_cols if fe_col != child_sql]
+        if len(merged_candidates) != 1:
+            return None
+
+        merged_sql = merged_candidates[0]
+        components = list(self._merged_fe_component_map.get(merged_sql, []))
+        if len(components) != 2 or parent_sql not in components:
+            return None
+
+        other_sql = components[1] if components[0] == parent_sql else components[0]
+        required_cols = {parent_sql, merged_sql, other_sql}
+        if not required_cols.issubset(set(self._non_resid_columns())):
+            return None
+
+        return {
+            "child_sql": child_sql,
+            "parent_sql": parent_sql,
+            "merged_sql": merged_sql,
+            "other_sql": other_sql,
+        }
+
+    def _run_nested_component_decomposition(
+        self,
+        pattern: Dict[str, str],
+        resid_cols: List[str],
+    ) -> None:
+        """Apply local FE absorption within each parent component."""
+        result_table_sql = self.qident(self._RESULT_TABLE)
+        accumulator_name = "_nested_accumulator"
+        accumulator_sql = self.qident(accumulator_name)
+        parent_sql = self.qident(pattern["parent_sql"])
+        projection_cols = self._non_resid_columns()
+        projection_sql = ", ".join(
+            self.qident(col) for col in projection_cols + list(self._resid_name_map.values())
+        )
+        parent_rows = self.conn.execute(
+            f"SELECT DISTINCT {parent_sql} FROM {result_table_sql} ORDER BY {parent_sql}"
+        ).fetchall()
+
+        total_iterations = 0
+        self.conn.execute(f"DROP TABLE IF EXISTS {accumulator_sql}")
+
+        for idx, (parent_value,) in enumerate(parent_rows):
+            component_table = f"_nested_component_{idx}"
+            component_result = f"_nested_component_result_{idx}"
+            component_table_sql = self.qident(component_table)
+            component_result_sql = self.qident(component_result)
+
+            self.conn.execute(
+                f"""
+                CREATE OR REPLACE TABLE {component_table_sql} AS
+                SELECT *
+                FROM {result_table_sql}
+                WHERE {parent_sql} = ?
+                """,
+                [parent_value],
+            )
+
+            local_transformer = IterativeDemeanTransformer(
+                conn=self.conn,
+                table_name=component_table,
+                fe_cols=[pattern["child_sql"], pattern["other_sql"]],
+                cluster_col=self.cluster_col,
+                remove_singletons=False,
+                carry_cols=self._dedupe_cols(
+                    self._non_resid_columns(),
+                    exclude=[pattern["child_sql"], pattern["other_sql"], self.cluster_col]
+                    if self.cluster_col
+                    else [pattern["child_sql"], pattern["other_sql"]],
+                ),
+                max_iterations=self.max_iterations,
+                tolerance=self.tolerance,
+                check_interval=self.check_interval,
+                convergence_sample=self.convergence_sample,
+                min_iterations_before_check=self.min_iterations_before_check,
+                check_interval_growth=self.check_interval_growth,
+                max_check_interval=self.max_check_interval,
+                singleton_pruning=self.singleton_pruning,
+                fe_order=self.fe_order,
+                drop_constant_variables=self.drop_constant_variables,
+                residual_type=self.residual_type,
+            )
+            local_transformer._RESULT_TABLE = component_result
+            # The component table already stores the outer residual columns,
+            # not the original variable names, so the local transformer must
+            # operate on those residual columns directly.
+            local_transformer.fit_transform(
+                list(self._resid_name_map.values()),
+                where_clause="",
+            )
+            total_iterations += int(local_transformer.n_iterations or 0)
+
+            if idx == 0:
+                self.conn.execute(
+                    f"""
+                    CREATE OR REPLACE TABLE {accumulator_sql} AS
+                    SELECT {projection_sql}
+                    FROM {component_result_sql}
+                    """
+                )
+            else:
+                self.conn.execute(
+                    f"""
+                    INSERT INTO {accumulator_sql}
+                    SELECT {projection_sql}
+                    FROM {component_result_sql}
+                    """
+                )
+
+            self.conn.execute(f"DROP TABLE IF EXISTS {component_result_sql}")
+            self.conn.execute(f"DROP TABLE IF EXISTS {component_table_sql}")
+
+        self.conn.execute(f"DROP TABLE {result_table_sql}")
+        self.conn.execute(
+            f"ALTER TABLE {accumulator_sql} RENAME TO {self.qident(self._RESULT_TABLE)}"
+        )
+        self.n_iterations = total_iterations
+        logger.debug(
+            "Applied nested component decomposition across %d parent component(s)",
+            len(parent_rows),
         )

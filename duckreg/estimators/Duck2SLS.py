@@ -344,6 +344,10 @@ class Duck2SLS(DuckEstimator):
             )
         return result
 
+    def _get_transformer_carry_cols(self) -> List[str]:
+        """Columns needed for FE nesting validation/decomposition."""
+        return self.formula.get_fe_dependency_sql_names()
+
     def _make_transformer(
         self,
         covariate_cols: List[str],
@@ -365,6 +369,9 @@ class Duck2SLS(DuckEstimator):
                 fe_cols=fe_sql,
                 cluster_col=cluster_col,
                 remove_singletons=False,   # singletons already handled in prepare_data
+                fe_nesting=self.formula.get_fe_nesting(),
+                carry_cols=self._get_transformer_carry_cols(),
+                merged_fe_component_map=self.formula.get_merged_fe_component_map(),
                 max_iterations=self.max_iterations,
                 tolerance=self.tolerance,
             )
@@ -408,6 +415,11 @@ class Duck2SLS(DuckEstimator):
         ``design_matrix`` can be joined back to the staging table after first-stage
         fitted values have been computed.
         """
+        from ..utils.formula_parser import FormulaParser
+
+        self.formula = FormulaParser.resolve_numeric_merge(
+            self.formula, self.conn, self.table_name
+        )
         boolean_cols = self._get_boolean_columns()
         unit_col     = self.fe_cols[0] if self.fe_cols else None
         eff_cluster  = self._effective_cluster_col
@@ -418,6 +430,9 @@ class Duck2SLS(DuckEstimator):
         fe_sql = self.formula.get_fe_select_sql(boolean_cols)
         if fe_sql:
             select_parts.append(fe_sql)
+        dependency_sql = self.formula.get_fe_dependency_select_sql(boolean_cols)
+        if dependency_sql:
+            select_parts.append(dependency_sql)
 
         outcomes_sql = self.formula.get_outcomes_select_sql(unit_col, "year", boolean_cols)
         if outcomes_sql:
@@ -598,6 +613,9 @@ class Duck2SLS(DuckEstimator):
             fe_cols=self._resolve_fe_sql_names() if self.fe_cols else [],
             cluster_col=cluster_col,
             remove_singletons=False,   # singletons already handled in prepare_data
+            fe_nesting=self.formula.get_fe_nesting(),
+            carry_cols=self._get_transformer_carry_cols(),
+            merged_fe_component_map=self.formula.get_merged_fe_component_map(),
             max_iterations=self.max_iterations,
             tolerance=self.tolerance,
         )

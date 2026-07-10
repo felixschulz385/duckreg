@@ -1,11 +1,11 @@
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from .base import DuckReg
+from .base import DuckEstimator
 from ..core.fitters.duckdb_fitter import ridge_closed_form, ridge_closed_form_batch
 
 
-class DuckRidge(DuckReg):
+class DuckRidge(DuckEstimator):
     def __init__(
         self,
         db_name: str,

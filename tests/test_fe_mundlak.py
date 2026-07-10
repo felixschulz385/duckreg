@@ -198,8 +198,8 @@ def test_unbalanced_accuracy_vs_demean(unbalanced_df, unbalanced_path,
     dr_mundlak = duckreg(formula, data=unbalanced_path, fe_method="mundlak",
                          se_method="HC1", fitter="numpy")
 
-    coef_demean  = float(dr_demean.summary_df().loc["ntl_harm", "coefficient"])
-    coef_mundlak = float(dr_mundlak.summary_df().loc["ntl_harm", "coefficient"])
+    coef_demean = float(dr_demean.coef().loc["ntl_harm"])
+    coef_mundlak = float(dr_mundlak.coef().loc["ntl_harm"])
 
     rtol = 0.30  # Mundlak is an approximation; allow 30% on unbalanced
     assert abs(coef_mundlak - coef_demean) / (abs(coef_demean) + 1e-8) < rtol, (
@@ -307,8 +307,8 @@ class TestEndToEndSEParityMundlak:
         dr_fit = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
                          se_method="HC1", fe_method="mundlak", fitter="duckdb")
         # Mundlak adds group-mean columns; extract only the original regressors
-        summary = dr_fit.summary_df()
-        dr_coef = summary.loc[['x1', 'x2'], 'coefficient'].values
+        summary = dr_fit.tidy().set_index("variable")
+        dr_coef = summary.loc[['x1', 'x2'], 'estimate'].values
         np.testing.assert_allclose(dr_coef, pf_coef, rtol=5e-2,
             err_msg="Mundlak coefficients deviate > 5% from pyfixest within-estimator")
 
@@ -326,7 +326,7 @@ class TestEndToEndSEParityMundlak:
         dr_fit = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
                          se_method=dr_vcov, fe_method="mundlak", fitter="duckdb")
         # Mundlak adds group-mean columns; extract only the original regressors
-        summary = dr_fit.summary_df()
+        summary = dr_fit.tidy().set_index("variable")
         dr_se = summary.loc[['x1', 'x2'], 'std_error'].values
 
         np.testing.assert_allclose(
@@ -367,11 +367,11 @@ class TestSSCAutoSelectionMundlak:
                     se_method={"CRV1": "unit"}, fe_method="mundlak", fitter="duckdb")
         assert m.vcov_spec.ssc.Gdf == 'min'
 
-    def test_ssc_dict_attr_reflects_auto_ssc(self, panel_data):
-        """model.ssc_dict is derived from the auto-selected SSC."""
+    def test_ssc_config_attr_reflects_auto_ssc(self, panel_data):
+        """model.ssc_config is derived from the auto-selected SSC."""
         m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
                     se_method="HC1", fe_method="mundlak", fitter="duckdb")
-        assert m.ssc_dict == m.vcov_spec.ssc.to_dict()
+        assert m.ssc_config == m.vcov_spec.ssc.to_dict()
 
 
 # ============================================================================

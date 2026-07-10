@@ -151,8 +151,7 @@ def pyfixest_coef_se(fit, var: str, has_iv: bool):
 
 
 def duckreg_coef_se(model, var: str = "ntl_harm"):
-    res = model.summary_df()
-    return float(res.loc[var, "coefficient"]), float(res.loc[var, "std_error"])
+    return float(model.coef().loc[var]), float(model.se().loc[var])
 
 
 def assert_coef_near_true(

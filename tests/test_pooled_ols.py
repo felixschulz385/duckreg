@@ -252,16 +252,16 @@ def test_pooled_simple_dgp_matches_pyfixest_and_truth(parquet_path_factory):
 
     pf_fit = pf.feols("y ~ x1 + x2", data=df, vcov="HC1")
     model = duckreg("y ~ x1 + x2", data=path, se_method="HC1", fitter="duckdb")
-    summary = model.summary_df()
+    summary = model.tidy().set_index("variable")
 
     np.testing.assert_allclose(
-        float(summary.loc["x1", "coefficient"]),
+        float(summary.loc["x1", "estimate"]),
         float(pf_fit.coef().loc["x1"]),
         rtol=1e-4,
         err_msg="pooled x1 coefficient mismatch vs pyfixest",
     )
     np.testing.assert_allclose(
-        float(summary.loc["x2", "coefficient"]),
+        float(summary.loc["x2", "estimate"]),
         float(pf_fit.coef().loc["x2"]),
         rtol=1e-4,
         err_msg="pooled x2 coefficient mismatch vs pyfixest",
@@ -279,13 +279,13 @@ def test_pooled_simple_dgp_matches_pyfixest_and_truth(parquet_path_factory):
         err_msg="pooled x2 SE mismatch vs pyfixest",
     )
     assert_coef_near_true(
-        float(summary.loc["x1", "coefficient"]),
+        float(summary.loc["x1", "estimate"]),
         1.5,
         rtol=0.03,
         label="pooled x1 vs DGP",
     )
     assert_coef_near_true(
-        float(summary.loc["x2", "coefficient"]),
+        float(summary.loc["x2", "estimate"]),
         0.8,
         rtol=0.05,
         label="pooled x2 vs DGP",
@@ -298,15 +298,15 @@ def test_pooled_simple_dgp_matches_pyfixest_and_truth(parquet_path_factory):
 
 class TestVcovDispatch:
 
-    def _run(self, data, vcov_type, cluster_ids=None, ssc_dict=None):
+    def _run(self, data, vcov_type, cluster_ids=None, ssc_config=None):
         X, y, w = data['X'], data['y'], data['w']
         theta, XtXinv, resid, rss = ols(X, y)
-        ssc_dict = ssc_dict or {'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'}
+        ssc_config = ssc_config or {'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'}
         vcov, meta, agg = compute_vcov_dispatch(
             X=X, y=y.reshape(-1, 1), weights=w,
             coefficients=theta, residuals=resid,
-            XtXinv=XtXinv, vcov_type=vcov_type,
-            cluster_ids=cluster_ids, ssc_dict=ssc_dict)
+            XtX_inv=XtXinv, vcov_type=vcov_type,
+            cluster_ids=cluster_ids, ssc_config=ssc_config)
         return vcov, meta, agg
 
     def test_dispatch_iid(self, simple):
@@ -352,9 +352,9 @@ class TestVcovDispatch:
 
 class TestNumpyFitterVcov:
 
-    def _fit_vcov(self, data, vcov_type, cluster_ids=None, ssc_dict=None):
+    def _fit_vcov(self, data, vcov_type, cluster_ids=None, ssc_config=None):
         X, y, w = data['X'], data['y'], data['w']
-        ssc_dict = ssc_dict or {'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'}
+        ssc_config = ssc_config or {'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'}
         fitter = NumpyFitter()
         result = fitter.fit(X, y, w)
         vcov, meta, agg = fitter.fit_vcov(
@@ -362,7 +362,7 @@ class TestNumpyFitterVcov:
             coefficients=result.coefficients,
             cluster_ids=cluster_ids,
             vcov_type=vcov_type,
-            ssc_dict=ssc_dict,
+            ssc_config=ssc_config,
             existing_result=result,
         )
         return vcov, meta, result
@@ -386,12 +386,12 @@ class TestNumpyFitterVcov:
     def test_iid_with_fe_ssc(self, with_fe):
         X, y, w = with_fe['X'], with_fe['y'], with_fe['w']
         kfe, nfe = with_fe['kfe'], with_fe['nfe']
-        ssc_dict = {'kadj': True, 'kfixef': 'nonnested', 'Gadj': True, 'Gdf': 'conventional'}
+        ssc_config = {'kadj': True, 'kfixef': 'nonnested', 'Gadj': True, 'Gdf': 'conventional'}
         fitter = NumpyFitter()
         result = fitter.fit(X, y, w)
         vcov, meta, _ = fitter.fit_vcov(
             X=X, y=y, weights=w, coefficients=result.coefficients,
-            vcov_type='iid', ssc_dict=ssc_dict, kfe=kfe, nfe=nfe,
+            vcov_type='iid', ssc_config=ssc_config, k_fe=kfe, n_fe=nfe,
             existing_result=result,
         )
         assert vcov.shape == (with_fe['k'], with_fe['k'])
@@ -430,14 +430,14 @@ class TestDuckDBFitterVcov:
     def test_iid_duckdb(self, duckdb_conn):
         fitter = DuckDBFitter(conn=duckdb_conn)
         result = fitter.fit(
-            table_name='reg_table', xcols=['x1', 'x2'],
-            ycol='sumy', weightcol='count', add_intercept=True)
+            table_name='reg_table', x_cols=['x1', 'x2'],
+            y_col='sumy', weight_col='count', add_intercept=True)
         vcov, meta, _ = fitter.fit_vcov(
-            table_name='reg_table', xcols=['x1', 'x2'],
-            ycol='sumy', weightcol='count', add_intercept=True,
+            table_name='reg_table', x_cols=['x1', 'x2'],
+            y_col='sumy', weight_col='count', add_intercept=True,
             coefficients=result.coefficients,
             vcov_type='iid',
-            ssc_dict={'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'},
+            ssc_config={'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'},
             existing_result=result,
         )
         assert vcov.shape == (3, 3)
@@ -447,14 +447,14 @@ class TestDuckDBFitterVcov:
     def test_hc1_duckdb(self, duckdb_conn):
         fitter = DuckDBFitter(conn=duckdb_conn)
         result = fitter.fit(
-            table_name='reg_table', xcols=['x1', 'x2'],
-            ycol='sumy', weightcol='count', add_intercept=True)
+            table_name='reg_table', x_cols=['x1', 'x2'],
+            y_col='sumy', weight_col='count', add_intercept=True)
         vcov, meta, _ = fitter.fit_vcov(
-            table_name='reg_table', xcols=['x1', 'x2'],
-            ycol='sumy', weightcol='count', add_intercept=True,
+            table_name='reg_table', x_cols=['x1', 'x2'],
+            y_col='sumy', weight_col='count', add_intercept=True,
             coefficients=result.coefficients,
             vcov_type='HC1',
-            ssc_dict={'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'},
+            ssc_config={'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'},
             existing_result=result,
         )
         assert meta['vcov_type'] == 'hetero'
@@ -463,16 +463,16 @@ class TestDuckDBFitterVcov:
     def test_cluster_duckdb(self, duckdb_conn):
         fitter = DuckDBFitter(conn=duckdb_conn)
         result = fitter.fit(
-            table_name='reg_table', xcols=['x1', 'x2'],
-            ycol='sumy', weightcol='count', add_intercept=True,
+            table_name='reg_table', x_cols=['x1', 'x2'],
+            y_col='sumy', weight_col='count', add_intercept=True,
             cluster_col='cluster')
         vcov, meta, _ = fitter.fit_vcov(
-            table_name='reg_table', xcols=['x1', 'x2'],
-            ycol='sumy', weightcol='count', add_intercept=True,
+            table_name='reg_table', x_cols=['x1', 'x2'],
+            y_col='sumy', weight_col='count', add_intercept=True,
             coefficients=result.coefficients,
             cluster_col='cluster',
             vcov_type='CRV1',
-            ssc_dict={'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'},
+            ssc_config={'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'},
             existing_result=result,
         )
         assert meta['vcov_type'] == 'cluster'
@@ -484,14 +484,14 @@ class TestDuckDBFitterVcov:
         X = np.column_stack([np.ones(n), rng.standard_normal((n, 2))])
         y = X @ np.array([1.0, 1.5, 0.8]) + rng.standard_normal(n) * 0.5
         w = np.ones(n)
-        ssc_dict = {'kadj': True, 'kfixef': 'none', 'Gadj': False, 'Gdf': 'conventional'}
+        ssc_config = {'kadj': True, 'kfixef': 'none', 'Gadj': False, 'Gdf': 'conventional'}
 
         np_fitter = NumpyFitter()
         np_result = np_fitter.fit(X, y, w)
         np_vcov, _, _ = np_fitter.fit_vcov(
             X=X, y=y, weights=w,
             coefficients=np_result.coefficients,
-            vcov_type='iid', ssc_dict=ssc_dict, existing_result=np_result)
+            vcov_type='iid', ssc_config=ssc_config, existing_result=np_result)
 
         df = pd.DataFrame({'x1': X[:, 1], 'x2': X[:, 2],
                            'sumy': y, 'count': w, 'sumysq': y**2})
@@ -502,7 +502,7 @@ class TestDuckDBFitterVcov:
         db_vcov, _, _ = db_fitter.fit_vcov(
             't', ['x1', 'x2'], 'sumy', 'count', add_intercept=True,
             coefficients=db_result.coefficients,
-            vcov_type='iid', ssc_dict=ssc_dict, existing_result=db_result)
+            vcov_type='iid', ssc_config=ssc_config, existing_result=db_result)
         conn2.close()
 
         np.testing.assert_allclose(
@@ -602,13 +602,13 @@ class TestVcovVsPyfixest:
         df = pd.DataFrame(X[:, 1:], columns=['x1', 'x2', 'x3'])
         df['y'] = y
         theta, XtXinv, resid, _ = ols(X, y)
-        ssc_dict = {'kadj': True, 'kfixef': 'full',
-                    'Gadj': True, 'Gdf': 'conventional'}
+        ssc_config = {'kadj': True, 'kfixef': 'full',
+                      'Gadj': True, 'Gdf': 'conventional'}
         vcov, _, _ = compute_vcov_dispatch(
             X=X, y=y.reshape(-1, 1), weights=simple['w'],
             coefficients=theta, residuals=resid,
-            XtXinv=XtXinv, vcov_type='HC2',
-            cluster_ids=None, ssc_dict=ssc_dict,
+            XtX_inv=XtXinv, vcov_type='HC2',
+            cluster_ids=None, ssc_config=ssc_config,
         )
         our_se = np.sqrt(np.diag(vcov))[1:]
         ref_se = self._pyfixest_se(df, 'y ~ x1 + x2 + x3', vcov='HC2').values[1:]

@@ -49,10 +49,10 @@ CONDITION_NUMBER_THRESHOLD = 1e12
 def _resolve_vcov_spec(
     vcov_spec: Optional[VcovSpec],
     vcov_type: Optional[str],
-    ssc_dict: Optional[Dict[str, Any]],
+    ssc_config: Optional[Dict[str, Any]],
     has_clusters: bool,
 ) -> VcovSpec:
-    """Build a VcovSpec from vcov_type/ssc_dict when none is supplied directly.
+    """Build a VcovSpec from vcov_type/ssc_config when none is supplied directly.
 
     Single source of truth — previously duplicated in compute_vcov_dispatch,
     NumpyFitter.fit_vcov, and DuckDBFitter.fit_vcov.
@@ -61,7 +61,7 @@ def _resolve_vcov_spec(
         return vcov_spec
     _vtype = vcov_type or 'HC1'
     if has_clusters and _vtype not in ('CRV1', 'CRV3'):
-        _base = VcovSpec.build('CRV1', ssc_dict)
+        _base = VcovSpec.build('CRV1', ssc_config)
         return VcovSpec(
             vcov_type='CRV',
             vcov_detail='CRV1',
@@ -69,7 +69,7 @@ def _resolve_vcov_spec(
             cluster_vars=None,
             ssc=_base.ssc,
         )
-    return VcovSpec.build(_vtype, ssc_dict)
+    return VcovSpec.build(_vtype, ssc_config)
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +205,8 @@ def compute_vcov_dispatch(
     Z: Optional[np.ndarray] = None,
     is_iv: bool = False,
     alpha: float = DEFAULT_ALPHA,
-    # Convenience aliases
-    XtXinv: np.ndarray = None,
     vcov_type: Optional[str] = None,
-    ssc_dict: Optional[Dict[str, Any]] = None,
-    kfe: Optional[int] = None,
-    nfe: Optional[int] = None,
+    ssc_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
     """Unified variance-covariance computation dispatcher.
 
@@ -233,15 +229,7 @@ def compute_vcov_dispatch(
     -------
     Tuple of (vcov, vcov_meta, aggregates)
     """
-    # Handle aliases
-    if XtXinv is not None and XtX_inv is None:
-        XtX_inv = XtXinv
-    if kfe is not None:
-        k_fe = kfe
-    if nfe is not None:
-        n_fe = nfe
-
-    vcov_spec = _resolve_vcov_spec(vcov_spec, vcov_type, ssc_dict, cluster_ids is not None)
+    vcov_spec = _resolve_vcov_spec(vcov_spec, vcov_type, ssc_config, cluster_ids is not None)
 
     # Guard against Decimal-typed arrays from DuckDB fetchall() results
     X = np.asarray(X, dtype=np.float64)
@@ -278,8 +266,8 @@ def compute_vcov_dispatch(
             Z=Z, is_iv=is_iv,
         )
         context = VcovContext(
-            N=n_obs, k=n_features, kfe=k_fe, nfe=n_fe,
-            kfenested=k_fe_nested, nfefullynested=n_fe_fully_nested,
+            N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
+            k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested,
         )
         vcov, vcov_meta = compute_cluster_vcov(
             bread=XtX_inv, cluster_scores=agg['cluster_scores'],
@@ -295,8 +283,8 @@ def compute_vcov_dispatch(
             compute_rss=True, Z=Z, is_iv=is_iv,
         )
         context = VcovContext(
-            N=n_obs, k=n_features, kfe=k_fe, nfe=n_fe,
-            kfenested=k_fe_nested, nfefullynested=n_fe_fully_nested,
+            N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
+            k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested,
         )
         vcov, vcov_meta = compute_iid_vcov(
             bread=XtX_inv, rss=agg['rss'], context=context,
@@ -339,7 +327,7 @@ def compute_vcov_dispatch(
             leverages=None,  # already incorporated into meat above
             vcov_type_detail=vcov_spec.vcov_detail,
             ssc_config=vcov_spec.ssc,
-            N=n_obs, k=n_features, kfe=k_fe, nfe=n_fe,
+            N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
             k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested,
             is_iv=is_iv, tXZ=tXZ, tZZinv=tZZinv, tZX=tZX,
         )
@@ -362,7 +350,7 @@ class BaseFitter(ABC):
     - X, y, weights : core data (always frequency weights)
     - coefficients, residuals : optional pre-computed values
     - vcov_type : SE type ("iid", "HC1", "HC2", "HC3")
-    - ssc_dict : small sample correction configuration
+    - ssc_config : small sample correction configuration
     - k_fe, n_fe : fixed effects parameters
     - cluster_ids (numpy) / cluster_col (duckdb) : clustering
     - Z (numpy) / z_cols (duckdb) : instruments for IV
@@ -372,33 +360,6 @@ class BaseFitter(ABC):
     def __init__(self, alpha: float = DEFAULT_ALPHA, se_type: str = "stata"):
         self.alpha = alpha
         self.se_type = se_type
-
-    # ------------------------------------------------------------------
-    # Alias normalisation
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _normalize_fit_kwargs(**kwargs) -> Dict[str, Any]:
-        """Normalise legacy keyword aliases to canonical names.
-
-        Maps: xcols→x_cols, ycol→y_col, weightcol→weight_col,
-              kfe→k_fe, nfe→n_fe, XtXinv→XtX_inv.
-        """
-        mapping = {
-            'xcols': 'x_cols',
-            'ycol': 'y_col',
-            'weightcol': 'weight_col',
-            'kfe': 'k_fe',
-            'nfe': 'n_fe',
-            'XtXinv': 'XtX_inv',
-        }
-        for old, new in mapping.items():
-            if old in kwargs:
-                if new not in kwargs:
-                    kwargs[new] = kwargs.pop(old)
-                else:
-                    kwargs.pop(old)
-        return kwargs
 
     # ------------------------------------------------------------------
     # Abstract hooks

@@ -6,7 +6,7 @@ Structure
 1.  Fixtures            — data generators (simple, weighted, clustered, het, FE, two-way)
 2.  TestSSCConfig       — dataclass defaults, from_dict, to_dict, round-trip
 2b. TestSSCConfigForFormula — SSCConfig.for_formula() auto-determination
-2c. TestVcovSpecBuild   — VcovSpec.build() auto-SSC, explicit ssc_dict override
+2c. TestVcovSpecBuild   — VcovSpec.build() auto-SSC, explicit ssc_config override
 3.  TestVcovContext     — dataclass fields and defaults
 4.  TestVcovParsing     — parse_vcov_specification + parse_cluster_vars, all types + error paths
 5.  TestComputeSSC      — compute_ssc for every (k_fixef × vcov_type × G_df) combination vs pyfixest
@@ -261,7 +261,7 @@ class TestSSCConfigForFormula:
 # ============================================================================
 
 class TestVcovSpecBuild:
-    """Unit tests for VcovSpec.build() auto-SSC and explicit ssc_dict override."""
+    """Unit tests for VcovSpec.build() auto-SSC and explicit ssc_config override."""
 
     def test_auto_ssc_non_clustered(self):
         spec = VcovSpec.build('HC1', has_fixef=True)
@@ -274,10 +274,10 @@ class TestVcovSpecBuild:
         assert spec.ssc.Gdf == 'min'
         assert spec.is_clustered is True
 
-    def test_explicit_ssc_dict_overrides_auto(self):
-        """Passing ssc_dict bypasses for_formula() — used in component tests."""
-        spec = VcovSpec.build('HC1', ssc_dict={'kadj': False, 'kfixef': 'full',
-                                               'Gadj': False, 'Gdf': 'min'})
+    def test_explicit_ssc_config_overrides_auto(self):
+        """Passing ssc_config bypasses for_formula() — used in component tests."""
+        spec = VcovSpec.build('HC1', ssc_config={'kadj': False, 'kfixef': 'full',
+                                                 'Gadj': False, 'Gdf': 'min'})
         assert spec.ssc.kadj is False
         assert spec.ssc.kfixef == 'full'
         assert spec.ssc.Gadj is False
@@ -300,20 +300,20 @@ class TestVcovSpecBuild:
 class TestVcovContext:
 
     def test_basic_fields(self):
-        ctx = VcovContext(N=500, k=4, kfe=50, nfe=2, kfenested=20, nfefullynested=1)
+        ctx = VcovContext(N=500, k=4, k_fe=50, n_fe=2, k_fe_nested=20, n_fe_fully_nested=1)
         assert ctx.N == 500
         assert ctx.k == 4
-        assert ctx.kfe == 50
-        assert ctx.nfe == 2
-        assert ctx.kfenested == 20
-        assert ctx.nfefullynested == 1
+        assert ctx.k_fe == 50
+        assert ctx.n_fe == 2
+        assert ctx.k_fe_nested == 20
+        assert ctx.n_fe_fully_nested == 1
 
     def test_defaults(self):
         ctx = VcovContext(N=200, k=3)
-        assert ctx.kfe == 0
-        assert ctx.nfe == 0
-        assert ctx.kfenested == 0
-        assert ctx.nfefullynested == 0
+        assert ctx.k_fe == 0
+        assert ctx.n_fe == 0
+        assert ctx.k_fe_nested == 0
+        assert ctx.n_fe_fully_nested == 0
 
 
 # ============================================================================
@@ -417,8 +417,14 @@ class TestComputeSSC:
         kfenested, nfefullynested = 0, 0   # no nesting (crossed FE)
         d = {'kadj': True, 'kfixef': kfixef, 'Gadj': True, 'Gdf': 'conventional'}
         cfg = SSCConfig.from_dict(d)
-        ctx = VcovContext(N=N, k=k, kfe=kfe, nfe=nfe,
-                         kfenested=kfenested, nfefullynested=nfefullynested)
+        ctx = VcovContext(
+            N=N,
+            k=k,
+            k_fe=kfe,
+            n_fe=nfe,
+            k_fe_nested=kfenested,
+            n_fe_fully_nested=nfefullynested,
+        )
         ssc, dfk, dft = compute_ssc(cfg, ctx, G=G, vcov_type="CRV")
         ref_ssc, ref_dfk, ref_dft = _pyfixest_ssc(
             d, N, k, kfe, kfenested, nfe, nfefullynested, G, 1, "CRV")
@@ -431,8 +437,14 @@ class TestComputeSSC:
         kfenested, nfefullynested = 20, 1   # time (20 levels) nested in unit
         d = {'kadj': True, 'kfixef': 'nonnested', 'Gadj': True, 'Gdf': 'conventional'}
         cfg = SSCConfig.from_dict(d)
-        ctx = VcovContext(N=N, k=k, kfe=kfe, nfe=nfe,
-                         kfenested=kfenested, nfefullynested=nfefullynested)
+        ctx = VcovContext(
+            N=N,
+            k=k,
+            k_fe=kfe,
+            n_fe=nfe,
+            k_fe_nested=kfenested,
+            n_fe_fully_nested=nfefullynested,
+        )
         ssc, dfk, dft = compute_ssc(cfg, ctx, G=25, vcov_type="CRV")
         ref_ssc, ref_dfk, ref_dft = _pyfixest_ssc(
             d, N, k, kfe, kfenested, nfe, nfefullynested, 25, 1, "CRV")
@@ -556,7 +568,7 @@ class TestIIDVcov:
         X, y, n, k = with_fe['X'], with_fe['y'], with_fe['n'], with_fe['k']
         kfe, nfe = with_fe['kfe'], with_fe['nfe']
         theta, XtXinv, resid, rss = ols(X, y)
-        ctx = VcovContext(N=n, k=k, kfe=kfe, nfe=nfe)
+        ctx = VcovContext(N=n, k=k, k_fe=kfe, n_fe=nfe)
         cfg = SSCConfig.from_dict({'kadj': True, 'kfixef': 'full'})
         vcov, meta = compute_iid_vcov(XtXinv, rss, ctx, cfg)
 
@@ -589,7 +601,7 @@ class TestIIDVcov:
     def test_kfixef_affects_ssc(self, simple, kfixef):
         X, y, n, k = simple['X'], simple['y'], simple['n'], simple['k']
         theta, XtXinv, _, rss = ols(X, y)
-        ctx = VcovContext(N=n, k=k, kfe=40, nfe=2)
+        ctx = VcovContext(N=n, k=k, k_fe=40, n_fe=2)
         cfg = SSCConfig.from_dict({'kadj': True, 'kfixef': kfixef})
         vcov, meta = compute_iid_vcov(XtXinv, rss, ctx, cfg)
         assert vcov.shape == (k, k)
@@ -665,7 +677,7 @@ class TestHeteroVcov:
         cfg = SSCConfig.from_dict({'kadj': True, 'kfixef': 'nonnested'})
         vcov, meta = compute_hetero_vcov(
             bread=XtXinv, scores=sc, vcov_type_detail='HC1',
-            ssc_config=cfg, N=n, k=k, kfe=kfe, nfe=nfe)
+            ssc_config=cfg, N=n, k=k, k_fe=kfe, n_fe=nfe)
         assert vcov.shape == (k, k)
 
     def test_hetero_ssc_uses_k_fe_nested(self, with_fe):
@@ -679,11 +691,11 @@ class TestHeteroVcov:
 
         _, meta_no_nest = compute_hetero_vcov(
             bread=XtXinv, scores=sc, vcov_type_detail='HC1',
-            ssc_config=cfg, N=n, k=k, kfe=kfe, nfe=nfe,
+            ssc_config=cfg, N=n, k=k, k_fe=kfe, n_fe=nfe,
             k_fe_nested=0)
         _, meta_nested = compute_hetero_vcov(
             bread=XtXinv, scores=sc, vcov_type_detail='HC1',
-            ssc_config=cfg, N=n, k=k, kfe=kfe, nfe=nfe,
+            ssc_config=cfg, N=n, k=k, k_fe=kfe, n_fe=nfe,
             k_fe_nested=kfenested)
 
         # k_fe_nested reduces dfk → larger (N-dfk) → smaller N/(N-dfk) → smaller SSC
@@ -791,7 +803,7 @@ class TestClusterVcov:
         theta, XtXinv, resid, _ = ols(X, y)
         sc = X * resid.reshape(-1, 1)
         cs, G_out = compute_cluster_scores(sc, cids)
-        ctx = VcovContext(N=n, k=k, kfe=kfe, nfe=nfe)
+        ctx = VcovContext(N=n, k=k, k_fe=kfe, n_fe=nfe)
         cfg = SSCConfig.from_dict({'kadj': True, 'kfixef': 'nonnested', 'Gadj': True, 'Gdf': 'conventional'})
         vcov, meta = compute_cluster_vcov(XtXinv, cs, ctx, G_out, cfg)
         assert vcov.shape == (k, k)
@@ -811,7 +823,7 @@ class TestTwoWayCluster:  # name kept for readability
         cfg_dict = {'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'}
         vcov, meta = compute_twoway_cluster_vcov(
             bread=XtXinv, scores=sc, cluster_df=cdf,
-            ssc_dict=cfg_dict, N=n, k=k)
+            ssc_config=SSCConfig.from_dict(cfg_dict), N=n, k=k)
         assert vcov.shape == (k, k)
         np.testing.assert_allclose(vcov, vcov.T, atol=1e-12)
         assert meta['vcov_type'] == 'cluster'
@@ -826,7 +838,8 @@ class TestTwoWayCluster:  # name kept for readability
         cfg_dict = {'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'}
 
         vcov_2w, _ = compute_twoway_cluster_vcov(
-            bread=XtXinv, scores=sc, cluster_df=cdf, ssc_dict=cfg_dict, N=n, k=k)
+            bread=XtXinv, scores=sc, cluster_df=cdf,
+            ssc_config=SSCConfig.from_dict(cfg_dict), N=n, k=k)
 
         # one-way on state only
         cs_s, G_s = compute_cluster_scores(sc, cdf[:, 0])
@@ -845,7 +858,9 @@ class TestTwoWayCluster:  # name kept for readability
         sc = X * resid.reshape(-1, 1)
         vcov, meta = compute_twoway_cluster_vcov(
             bread=XtXinv, scores=sc, cluster_df=two_way['cluster_df'],
-            ssc_dict={'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'},
+            ssc_config=SSCConfig.from_dict(
+                {'kadj': True, 'kfixef': 'full', 'Gadj': True, 'Gdf': 'conventional'}
+            ),
             N=n, k=k)
         assert isinstance(meta['n_clusters'], list)
         assert len(meta['n_clusters']) == 3    # state, industry, pair

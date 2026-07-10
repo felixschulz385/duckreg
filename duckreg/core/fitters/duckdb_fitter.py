@@ -46,8 +46,8 @@ class DuckDBFitter(BaseFitter):
     def _fetch_suffstats(self, **kwargs) -> SuffStats:
         """Compute SuffStats via DuckDB SQL."""
         table_name = kwargs['table_name']
-        x_cols = kwargs.get('x_cols') or kwargs.get('xcols')
-        y_col = kwargs.get('y_col') or kwargs.get('ycol')
+        x_cols = kwargs['x_cols']
+        y_col = kwargs['y_col']
         weight_col = kwargs.get('weight_col', 'count')
         add_intercept = kwargs.get('add_intercept', True)
         sum_y_sq_col = f"{y_col}_sq"
@@ -71,26 +71,15 @@ class DuckDBFitter(BaseFitter):
     def fit(
         self,
         table_name: str,
-        x_cols: List[str] = None,
-        y_col: str = None,
+        x_cols: List[str],
+        y_col: str,
         weight_col: str = "count",
         add_intercept: bool = True,
         cluster_col: Optional[str] = None,
         coefficients: Optional[np.ndarray] = None,
         residual_x_cols: Optional[List[str]] = None,
-        # Aliases
-        xcols: List[str] = None,
-        ycol: str = None,
-        weightcol: str = None,
     ) -> FitterResult:
         """Fit WLS model using DuckDB sufficient statistics."""
-        if xcols is not None and x_cols is None:
-            x_cols = xcols
-        if ycol is not None and y_col is None:
-            y_col = ycol
-        if weightcol is not None:
-            weight_col = weightcol
-
         sum_y_sq_col = f"{y_col}_sq"
         XtX, Xty, n_obs, sum_y, sum_y_sq, coef_names = compute_sufficient_stats_sql(
             conn=self.conn, table_name=table_name, x_cols=x_cols,
@@ -129,8 +118,8 @@ class DuckDBFitter(BaseFitter):
     def fit_vcov(
         self,
         table_name: str,
-        x_cols: List[str] = None,
-        y_col: str = None,
+        x_cols: List[str],
+        y_col: str,
         weight_col: str = "count",
         add_intercept: bool = True,
         coefficients: Optional[np.ndarray] = None,
@@ -144,21 +133,11 @@ class DuckDBFitter(BaseFitter):
         existing_result: Optional[FitterResult] = None,
         z_cols: Optional[List[str]] = None,
         is_iv: bool = False,
-        # Aliases
-        xcols: List[str] = None,
-        ycol: str = None,
-        weightcol: str = None,
         vcov_type: Optional[str] = None,
-        ssc_dict: Optional[Dict[str, Any]] = None,
+        ssc_config: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
         """Compute variance-covariance matrix using DuckDB SQL."""
-        if xcols is not None and x_cols is None:
-            x_cols = xcols
-        if ycol is not None and y_col is None:
-            y_col = ycol
-        if weightcol is not None:
-            weight_col = weightcol
-        vcov_spec = _resolve_vcov_spec(vcov_spec, vcov_type, ssc_dict, bool(cluster_col))
+        vcov_spec = _resolve_vcov_spec(vcov_spec, vcov_type, ssc_config, bool(cluster_col))
 
         result = existing_result or self._last_result
 
@@ -210,8 +189,8 @@ class DuckDBFitter(BaseFitter):
                 z_cols=z_cols, is_iv=is_iv,
             )
             context = VcovContext(
-                N=n_obs, k=n_features, kfe=k_fe, nfe=n_fe,
-                kfenested=k_fe_nested, nfefullynested=n_fe_fully_nested,
+                N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
+                k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested,
             )
             vcov, vcov_meta = compute_cluster_vcov(
                 bread=XtX_inv, cluster_scores=agg['cluster_scores'],
@@ -232,8 +211,8 @@ class DuckDBFitter(BaseFitter):
                        residual_x_cols=residual_x_cols, compute_rss=True,
                    )['rss'])
             context = VcovContext(
-                N=n_obs, k=n_features, kfe=k_fe, nfe=n_fe,
-                kfenested=k_fe_nested, nfefullynested=n_fe_fully_nested,
+                N=n_obs, k=n_features, k_fe=k_fe, n_fe=n_fe,
+                k_fe_nested=k_fe_nested, n_fe_fully_nested=n_fe_fully_nested,
             )
             vcov, vcov_meta = compute_iid_vcov(
                 bread=XtX_inv, rss=rss, context=context,

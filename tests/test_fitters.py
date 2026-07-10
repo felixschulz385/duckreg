@@ -1,20 +1,4 @@
-"""
-tests/test_fitters.py
-
-Comprehensive test suite for:
-    - base.py   : FitterResult, _resolve_vcov_spec, _validate_and_prepare_data,
-                  _compute_weighted_matrices, BaseFitter._normalize_fit_kwargs,
-                  compute_vcov_dispatch
-    - numpy_fitter.py : NumpyFitter.fit, NumpyFitter.fit_vcov
-    - duckdb_fitter.py : DuckDBFitter.fit, DuckDBFitter.fit_vcov,
-                         get_fitter, wls_duckdb
-
-All SQL tests use an in-process DuckDB connection — no external fixtures needed.
-
-Usage
------
-    pytest tests/test_fitters.py -v
-"""
+"""Comprehensive tests for the fitter and VCOV dispatch layers."""
 
 from __future__ import annotations
 
@@ -292,54 +276,7 @@ class TestComputeWeightedMatrices:
 
 
 # ---------------------------------------------------------------------------
-# ── 5. BaseFitter._normalize_fit_kwargs ─────────────────────────────────────
-# ---------------------------------------------------------------------------
-
-
-class TestNormalizeFitKwargs:
-
-    def test_xcols_renamed(self):
-        kw = BaseFitter._normalize_fit_kwargs(xcols=["a", "b"])
-        assert "x_cols" in kw
-        assert "xcols" not in kw
-
-    def test_ycol_renamed(self):
-        kw = BaseFitter._normalize_fit_kwargs(ycol="y")
-        assert "y_col" in kw
-        assert "ycol" not in kw
-
-    def test_weightcol_renamed(self):
-        kw = BaseFitter._normalize_fit_kwargs(weightcol="n")
-        assert "weight_col" in kw
-        assert "weightcol" not in kw
-
-    def test_kfe_renamed(self):
-        kw = BaseFitter._normalize_fit_kwargs(kfe=3)
-        assert "k_fe" in kw
-        assert "kfe" not in kw
-
-    def test_nfe_renamed(self):
-        kw = BaseFitter._normalize_fit_kwargs(nfe=2)
-        assert "n_fe" in kw
-
-    def test_XtXinv_renamed(self):
-        mat = np.eye(2)
-        kw = BaseFitter._normalize_fit_kwargs(XtXinv=mat)
-        assert "XtX_inv" in kw
-
-    def test_canonical_name_not_overwritten(self):
-        """If both alias and canonical are present, canonical wins."""
-        kw = BaseFitter._normalize_fit_kwargs(xcols=["old"], x_cols=["new"])
-        assert kw["x_cols"] == ["new"]
-
-    def test_unrelated_kwargs_preserved(self):
-        kw = BaseFitter._normalize_fit_kwargs(alpha=0.1, some_flag=True)
-        assert kw["alpha"] == 0.1
-        assert kw["some_flag"] is True
-
-
-# ---------------------------------------------------------------------------
-# ── 6. NumpyFitter.fit ──────────────────────────────────────────────────────
+# ── 5. NumpyFitter.fit ──────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
 
@@ -502,13 +439,12 @@ class TestNumpyFitterFitVcov:
         )
         assert agg.get("n_clusters") == 10
 
-    def test_alias_kfe_nfe(self, fitter_and_data):
+    def test_k_fe_n_fe(self, fitter_and_data):
         fitter, X, y, w, result = fitter_and_data
-        # Should not raise
         fitter.fit_vcov(X=X, y=y, weights=w,
                         coefficients=result.coefficients,
                         vcov_type="HC1",
-                        kfe=5, nfe=2,
+                        k_fe=5, n_fe=2,
                         existing_result=result)
 
     def test_missing_coefficients_raises(self, fitter_and_data):
@@ -614,16 +550,16 @@ class TestDuckDBFitterFit:
                             coefficients=theta_given)
         assert np.allclose(result.coefficients, theta_given)
 
-    def test_alias_xcols(self, fitter, simple_table):
+    def test_fit_requires_canonical_column_names(self, fitter, simple_table):
         result = fitter.fit(table_name=simple_table,
-                            xcols=["x1"], ycol="sum_y")
+                            x_cols=["x1"], y_col="sum_y")
         assert isinstance(result, FitterResult)
 
-    def test_alias_weightcol(self, conn, simple_table):
+    def test_fit_accepts_weight_col(self, conn, simple_table):
         fitter = DuckDBFitter(conn=conn, alpha=0.0)
         result = fitter.fit(table_name=simple_table,
                             x_cols=["x1"], y_col="sum_y",
-                            weightcol="count")
+                            weight_col="count")
         assert isinstance(result, FitterResult)
 
     def test_last_result_cached(self, fitter, simple_table):
@@ -787,12 +723,12 @@ class TestDuckDBFitterFitVcov:
 
         assert np.allclose(np_vcov, db_vcov, atol=1e-8, rtol=1e-5)
 
-    def test_alias_xcols_ycol(self, fitter, large_table):
+    def test_fit_vcov_requires_canonical_column_names(self, fitter, large_table):
         result = fitter.fit(table_name=large_table,
                             x_cols=["x1", "x2"], y_col="sum_y")
         vcov, _, _ = fitter.fit_vcov(
             table_name=large_table,
-            xcols=["x1", "x2"], ycol="sum_y",
+            x_cols=["x1", "x2"], y_col="sum_y",
             vcov_type="HC1",
             coefficients=result.coefficients,
             existing_result=result,

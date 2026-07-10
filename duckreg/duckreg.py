@@ -5,11 +5,10 @@ with support for fixed effects, instrumental variables, and various standard err
 It handles formula parsing, data source resolution, and estimator selection.
 """
 import logging
-import warnings
 from typing import Any, Dict, Optional, Union
 
-from .core.vcov import parse_vcov_specification, parse_cluster_vars, VcovTypeNotSupportedError, VcovSpec
-from .estimators.base import DuckEstimator, SEMethod
+from .core.vcov import VcovSpec
+from .estimators.base import SEMethod
 from .utils.api import (
     FEMethod,
     MUNDLAK_DISABLED_MESSAGE,
@@ -18,9 +17,6 @@ from .utils.api import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Backward compatibility - re-export from base
-DuckReg = DuckEstimator
 
 # DuckDB settings that can be passed as top-level kwargs
 _DUCKDB_RESOURCE_KWARGS = frozenset({"threads", "memory_limit", "max_temp_directory_size"})
@@ -35,7 +31,6 @@ def duckreg(
     data: Any,
     # ── SE settings ──────────────────────────────────────────────────────────
     se_method: Union[str, Dict] = SEMethod.HC1,
-    bootstrap: Optional[Dict] = None,
     # ── Fixed-effects settings ───────────────────────────────────────────────
     fe_method: str = FEMethod.AUTO,
     remove_singletons: bool = True,
@@ -47,7 +42,6 @@ def duckreg(
     # ── Engine settings ──────────────────────────────────────────────────────
     fitter: str = "numpy",
     compression: Optional[int] = None,
-    round_strata: int = None,
     seed: int = 42,
     max_iterations: int = 1000,
     tolerance: float = 1e-8,
@@ -65,7 +59,7 @@ def duckreg(
     max_fixed_fe_levels: Optional[int] = None,
     # ── DuckDB resource kwargs: threads, memory_limit, max_temp_directory_size
     **kwargs,
-) -> "DuckEstimator":
+) -> object:
     """High-level API for DuckReg regression with lfe/fixest-style formula.
 
     Orchestrates the entire regression workflow:
@@ -88,16 +82,10 @@ def duckreg(
             files, an in-memory pandas/Polars/PyArrow DataFrame, or a DuckDB
             relation object.
         se_method: Standard error method.  Either a string (``'iid'``, ``'HC1'``,
-            ``'BS'``, ``'none'``) or a dict specifying cluster-robust SEs::
+            ``'none'``) or a dict specifying cluster-robust SEs::
 
                 se_method = {"CRV1": "state"}          # single cluster
                 se_method = {"CRV1": "state + firm"}   # two-way clustering
-
-        bootstrap: Bootstrap settings, only used when ``se_method='BS'``.
-            Accepted keys:
-
-            * ``"n"`` – number of bootstrap replications (default 100)
-            * ``"seed"`` – random seed for bootstrap draws (defaults to *seed*)
 
         fe_method: Method for handling fixed effects (``'demean'`` or
             ``'mundlak'``).  ``'demean'`` (iterative alternating projections) is
@@ -116,7 +104,6 @@ def duckreg(
             ``None`` means exact compression, non-negative integers round
             continuous strata columns before grouping, and ``-1`` disables
             compression entirely.
-        round_strata: Deprecated alias for ``compression``.
         seed: Global random seed for reproducibility.
         max_iterations: For FE demeaning, maximum MAP iterations.
         tolerance: For FE demeaning, exact maximum absolute remaining
@@ -145,8 +132,7 @@ def duckreg(
             tolerance.
         **kwargs: DuckDB resource settings passed directly as keyword arguments:
 
-            * ``threads`` (int) – number of DuckDB threads; also controls
-              bootstrap parallelism (replaces ``n_jobs``).
+            * ``threads`` (int) – number of DuckDB threads.
             * ``memory_limit`` (str) – e.g. ``"8GB"``.
             * ``max_temp_directory_size`` (str) – e.g. ``"20GB"``.
 
@@ -167,13 +153,14 @@ def duckreg(
 
             duckreg("y ~ x1 | unit + year | (endog ~ z1 + z2)", data=df)
 
-        Bootstrap SEs with 200 replications and 4 threads::
-
-            duckreg("y ~ x1 | unit", data=df,
-                    se_method="BS", bootstrap={"n": 200, "seed": 0},
-                    threads=4)
     """
     logger.debug("=== duckreg START ===")
+
+    if isinstance(se_method, str) and se_method == "BS":
+        raise ValueError(
+            "Bootstrap standard errors are no longer supported. "
+            "Use 'iid', 'HC1', 'HC2', 'HC3', or cluster-robust se_method values instead."
+        )
 
     # ------------------------------------------------------------------
     # 1. Extract and validate DuckDB / resource kwargs
@@ -182,33 +169,17 @@ def duckreg(
     memory_limit = kwargs.pop("memory_limit", None)
     max_temp_dir_size = kwargs.pop("max_temp_directory_size", None)
 
-    # Backward-compat shims – warn but still work
-    if "n_jobs" in kwargs:
-        warnings.warn(
-            "'n_jobs' is deprecated; use the 'threads' keyword argument instead.",
-            DeprecationWarning, stacklevel=2,
+    removed_kwargs = []
+    for name in ("bootstrap", "round_strata", "n_jobs", "duckdb_kwargs", "n_bootstraps"):
+        if name in kwargs:
+            removed_kwargs.append(name)
+            kwargs.pop(name)
+
+    if removed_kwargs:
+        raise TypeError(
+            "duckreg() got unsupported legacy keyword argument(s): "
+            + ", ".join(sorted(removed_kwargs))
         )
-        threads = int(kwargs.pop("n_jobs"))
-    if "duckdb_kwargs" in kwargs:
-        warnings.warn(
-            "'duckdb_kwargs' is deprecated; pass DuckDB settings as top-level "
-            "keyword arguments (e.g. threads=4, memory_limit='8GB').",
-            DeprecationWarning, stacklevel=2,
-        )
-        for k, v in kwargs.pop("duckdb_kwargs").items():
-            kwargs.setdefault(k, v)
-        # Re-extract resource kwargs that the shim may have put back into kwargs
-        threads = int(kwargs.pop("threads", threads))
-        memory_limit = kwargs.pop("memory_limit", memory_limit)
-        max_temp_dir_size = kwargs.pop("max_temp_directory_size", max_temp_dir_size)
-    if "n_bootstraps" in kwargs:
-        warnings.warn(
-            "'n_bootstraps' is deprecated; use bootstrap={'n': N} instead.",
-            DeprecationWarning, stacklevel=2,
-        )
-        _nb = kwargs.pop("n_bootstraps")
-        if bootstrap is None:
-            bootstrap = {"n": _nb}
 
     if kwargs:
         raise TypeError(
@@ -225,47 +196,16 @@ def duckreg(
         duckdb_kwargs["max_temp_directory_size"] = max_temp_dir_size
 
     # ------------------------------------------------------------------
-    # 2. Bootstrap settings
+    # 2. Compression settings
     # ------------------------------------------------------------------
-    if round_strata is not None:
-        warnings.warn(
-            "'round_strata' is deprecated; use 'compression' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
     if compression is not None and not isinstance(compression, int):
         raise TypeError(
             f"compression must be an integer or None, got {type(compression)!r}"
-        )
-    if round_strata is not None and (not isinstance(round_strata, int)):
-        raise TypeError(
-            f"round_strata must be an integer or None, got {type(round_strata)!r}"
         )
     if compression is not None and compression < -1:
         raise ValueError(
             f"compression must be >= -1 or None, got {compression!r}"
         )
-    if round_strata is not None and round_strata < -1:
-        raise ValueError(
-            f"round_strata must be >= -1 or None, got {round_strata!r}"
-        )
-    if compression is not None and round_strata is not None and compression != round_strata:
-        raise ValueError(
-            "compression and round_strata specify different compression settings. "
-            "Use only one, or make them equal."
-        )
-    compression = compression if compression is not None else round_strata
-
-    is_bs = isinstance(se_method, str) and se_method == SEMethod.BS
-    if is_bs:
-        _bs = bootstrap or {}
-        n_bootstraps = int(_bs.get("n", 100))
-        seed = int(_bs.get("seed", seed))  # bootstrap seed overrides global seed
-        # Bootstrap benefits from multiple threads – propagate to DuckDB
-        if threads > 1:
-            duckdb_kwargs.setdefault("threads", threads)
-    else:
-        n_bootstraps = 0
 
     # ------------------------------------------------------------------
     # 3. Parse formula
@@ -307,14 +247,8 @@ def duckreg(
     # ------------------------------------------------------------------
     # 6. Build VcovSpec (once at the API boundary)
     # ------------------------------------------------------------------
-    # Bootstrap/none are runtime-only flags; the analytical spec falls back to HC1.
-    _spec_se = (
-        se_method
-        if not (isinstance(se_method, str) and se_method in (SEMethod.BS, SEMethod.NONE, "none"))
-        else SEMethod.HC1
-    )
     vcov_spec = VcovSpec.build(
-        se_method=_spec_se,
+        se_method=se_method if se_method not in (SEMethod.NONE, "none") else SEMethod.HC1,
         has_fixef=bool(fe_cols),
         is_iv=has_iv,
     )
@@ -327,12 +261,9 @@ def duckreg(
         table_name=table_name,
         formula=parsed_formula,
         subset=subset,
-        n_bootstraps=n_bootstraps,
         compression=compression,
-        round_strata=round_strata,
         seed=seed,
         duckdb_kwargs=duckdb_kwargs or None,
-        n_jobs=threads,   # threads controls bootstrap parallelism (n_jobs in estimators)
         fitter=fitter,
         remove_singletons=remove_singletons,
         vcov_spec=vcov_spec,
@@ -389,7 +320,7 @@ def duckreg(
     if has_iv:
         estimator = Duck2SLS(
             **_common,
-            fe_method=resolved_fe_method,
+            method=resolved_fe_method or "mundlak",
             max_iterations=max_iterations,
             tolerance=tolerance,
         )
@@ -437,7 +368,3 @@ def duckreg(
 
     logger.debug("=== duckreg END ===")
     return estimator
-
-
-# Backward compatibility alias
-compressed_ols = duckreg

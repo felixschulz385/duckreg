@@ -116,21 +116,21 @@ class VcovContext:
         Number of observations
     k : int
         Number of parameters
-    kfe : int
+    k_fe : int
         Number of fixed effect levels
-    nfe : int
+    n_fe : int
         Number of fixed effect variables
-    kfenested : int
+    k_fe_nested : int
         Number of nested fixed effect levels
-    nfefullynested : int
+    n_fe_fully_nested : int
         Number of fully nested FE dimensions
     """
     N: int
     k: int
-    kfe: int = 0
-    nfe: int = 0
-    kfenested: int = 0
-    nfefullynested: int = 0
+    k_fe: int = 0
+    n_fe: int = 0
+    k_fe_nested: int = 0
+    n_fe_fully_nested: int = 0
 
 
 @dataclass(frozen=True)
@@ -151,7 +151,7 @@ class VcovSpec:
     def build(
         cls,
         se_method: str,
-        ssc_dict: Optional[Dict[str, Any]] = None,
+        ssc_config: Optional[Dict[str, Any]] = None,
         has_fixef: bool = False,
         is_iv: bool = False,
     ) -> "VcovSpec":
@@ -160,15 +160,15 @@ class VcovSpec:
         This is the single place where validation and defaulting happens.
         Raises VcovTypeNotSupportedError or ValueError on invalid input.
 
-        When ``ssc_dict`` is *None* (the default), SSC settings are
+        When ``ssc_config`` is *None* (the default), SSC settings are
         auto-determined from formula properties via ``SSCConfig.for_formula()``.
-        Pass an explicit ``ssc_dict`` only for component-level testing or
+        Pass an explicit ``ssc_config`` only for component-level testing or
         legacy callers; the high-level ``duckreg()`` API no longer exposes it.
         """
         vcov_type, vcov_detail, is_clustered, cluster_vars = \
             parse_vcov_specification(se_method, has_fixef=has_fixef, is_iv=is_iv)
-        if ssc_dict is not None:
-            ssc = SSCConfig.from_dict(ssc_dict)
+        if ssc_config is not None:
+            ssc = SSCConfig.from_dict(ssc_config)
         else:
             ssc = SSCConfig.for_formula(
                 has_fixef=has_fixef,
@@ -462,20 +462,20 @@ def compute_ssc(
     """
     # Adjust fixed effects count: subtract one for each FE except the first
     # See: https://github.com/lrberge/fixest/issues/554
-    k_fe_adj = context.kfe - (context.nfe - 1) if context.nfe > 1 else context.kfe
+    k_fe_adj = context.k_fe - (context.n_fe - 1) if context.n_fe > 1 else context.k_fe
     
     # Compute dfk based on kfixef rule
     if ssc_config.kfixef == "none":
         dfk = context.k
     elif ssc_config.kfixef == "nonnested":
-        if context.nfe == 0:
+        if context.n_fe == 0:
             dfk = context.k
-        elif context.kfenested == 0:
+        elif context.k_fe_nested == 0:
             dfk = context.k + k_fe_adj
         else:
-            dfk = context.k + k_fe_adj - context.kfenested + context.nfefullynested
+            dfk = context.k + k_fe_adj - context.k_fe_nested + context.n_fe_fully_nested
     elif ssc_config.kfixef == "full":
-        dfk = context.k + k_fe_adj if context.nfe > 0 else context.k
+        dfk = context.k + k_fe_adj if context.n_fe > 0 else context.k
     else:
         raise ValueError(f"kfixef must be 'none', 'nonnested', or 'full', got: {ssc_config.kfixef}")
     
@@ -736,15 +736,12 @@ def compute_hetero_vcov(
     leverages: Optional[np.ndarray] = None,
     vcov_type_detail: str = "HC1",
     ssc_config: SSCConfig = None,
-    ssc_dict: Optional[Dict[str, Any]] = None,  # backward-compat alias; ssc_config takes precedence
     N: Optional[int] = None,
     k: Optional[int] = None,
     k_fe: int = 0,
     n_fe: int = 0,
     k_fe_nested: int = 0,
     n_fe_fully_nested: int = 0,
-    kfe: Optional[int] = None,  # alias for k_fe
-    nfe: Optional[int] = None,  # alias for n_fe
     is_iv: bool = False,
     tXZ: Optional[np.ndarray] = None,
     tZZinv: Optional[np.ndarray] = None,
@@ -802,15 +799,8 @@ def compute_hetero_vcov(
     if k is None:
         k = bread.shape[0]
 
-    # Handle kfe/nfe aliases
-    if kfe is not None:
-        k_fe = kfe
-    if nfe is not None:
-        n_fe = nfe
-
     if ssc_config is None:
-        # Support backward-compatible ssc_dict alias
-        ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict is not None else SSCConfig.default()
+        ssc_config = SSCConfig.default()
 
     # Compute meat if not provided
     if meat is None:
@@ -869,8 +859,14 @@ def compute_hetero_vcov(
             raise ValueError("N must be provided when using pre-computed meat")
     
     # Compute SSC - for hetero, G = N (fixest convention)
-    context = VcovContext(N=N, k=k, kfe=k_fe, nfe=n_fe,
-                          kfenested=k_fe_nested, nfefullynested=n_fe_fully_nested)
+    context = VcovContext(
+        N=N,
+        k=k,
+        k_fe=k_fe,
+        n_fe=n_fe,
+        k_fe_nested=k_fe_nested,
+        n_fe_fully_nested=n_fe_fully_nested,
+    )
     ssc, dfk, dft = compute_ssc(
         ssc_config=ssc_config,
         context=context,
@@ -1034,17 +1030,12 @@ def compute_twoway_cluster_vcov(
     scores: np.ndarray,
     cluster_df: np.ndarray,
     ssc_config: SSCConfig = None,
-    ssc_dict: Optional[Dict[str, Any]] = None,  # alias for ssc_config
     N: int = 0,
     k: Optional[int] = None,
     k_fe: int = 0,
     n_fe: int = 0,
     k_fe_nested: int = 0,
     n_fe_fully_nested: int = 0,
-    kfe: Optional[int] = None,
-    nfe: Optional[int] = None,
-    kfenested: Optional[int] = None,
-    nfefullynested: Optional[int] = None
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Compute two-way cluster-robust variance.
@@ -1078,18 +1069,8 @@ def compute_twoway_cluster_vcov(
     if k is None:
         k = bread.shape[0]
 
-    # Handle aliases
-    if kfe is not None:
-        k_fe = kfe
-    if nfe is not None:
-        n_fe = nfe
-    if kfenested is not None:
-        k_fe_nested = kfenested
-    if nfefullynested is not None:
-        n_fe_fully_nested = nfefullynested
-
     if ssc_config is None:
-        ssc_config = SSCConfig.from_dict(ssc_dict) if ssc_dict is not None else SSCConfig.default()
+        ssc_config = SSCConfig.default()
 
     vcov_sign_list = [1, 1, -1]
     dft_full = np.zeros(cluster_df.shape[1])
@@ -1105,8 +1086,12 @@ def compute_twoway_cluster_vcov(
         G_list.append(G)
         
         context = VcovContext(
-            N=N, k=k, kfe=k_fe, nfe=n_fe,
-            kfenested=k_fe_nested, nfefullynested=n_fe_fully_nested
+            N=N,
+            k=k,
+            k_fe=k_fe,
+            n_fe=n_fe,
+            k_fe_nested=k_fe_nested,
+            n_fe_fully_nested=n_fe_fully_nested,
         )
         ssc, dfk, dft = compute_ssc(
             ssc_config=ssc_config,

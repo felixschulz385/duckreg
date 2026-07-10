@@ -1,14 +1,4 @@
-"""
-Tests for the main API, formula parsing, and summary generation.
-
-Covers:
-- FormulaParser: OLS, FE, IV, cluster formulas; name getters; has_instruments()
-- quote_identifier / needs_quoting helpers
-- duckreg() entry point: pooled OLS, FE, bad kwargs, deprecated kwargs
-- Summary helpers: format_model_summary, format_summary, SummaryFormatter
-"""
-
-import warnings
+"""Tests for the main API, formula parsing, and summary generation."""
 
 import numpy as np
 import pandas as pd
@@ -26,11 +16,8 @@ from duckreg.utils.formula_parser import (
     quote_identifier,
 )
 from duckreg.utils.summary import (
-    SummaryFormatter,
     format_model_summary,
     format_summary,
-    print_summary,
-    to_tidy_df,
 )
 
 
@@ -148,6 +135,10 @@ class TestFormulaParserIV:
         exog = f.get_exogenous_covariate_names()
         assert "endog" not in exog
         assert "x1" in exog
+
+    def test_legacy_iv_syntax_raises_clear_error(self, parser):
+        with pytest.raises(ValueError, match="fixest-style syntax"):
+            parser.parse("y ~ x1 | fe1 | endog(z1 + z2)")
 
 
 class TestFormulaParserNullCheck:
@@ -382,27 +373,27 @@ class TestDuckregBadInputs:
         with pytest.raises(TypeError, match="unexpected keyword argument"):
             duckreg("y ~ x1", data=small_df, nonexistent_arg=True)
 
-    def test_n_jobs_deprecation_warning(self, small_df):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            duckreg("y ~ x1", data=small_df, se_method="none", n_jobs=1)
-        categories = [str(w.category) for w in caught]
-        assert any("DeprecationWarning" in c for c in categories)
+    @pytest.mark.parametrize(
+        "kwarg, value",
+        [
+            ("n_jobs", 1),
+            ("n_bootstraps", 10),
+            ("duckdb_kwargs", {"threads": 1}),
+            ("bootstrap", {"n": 50}),
+            ("round_strata", 5),
+        ],
+    )
+    def test_removed_legacy_kwargs_raise(self, small_df, kwarg, value):
+        with pytest.raises(TypeError, match="unsupported legacy keyword argument"):
+            duckreg("y ~ x1", data=small_df, se_method="none", **{kwarg: value})
 
-    def test_n_bootstraps_deprecation_warning(self, small_df):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            duckreg("y ~ x1", data=small_df, se_method="none", n_bootstraps=10)
-        categories = [str(w.category) for w in caught]
-        assert any("DeprecationWarning" in c for c in categories)
+    def test_bootstrap_se_method_raises(self, small_df):
+        with pytest.raises(ValueError, match="Bootstrap standard errors are no longer supported"):
+            duckreg("y ~ x1", data=small_df, se_method="BS")
 
-    def test_duckdb_kwargs_deprecation_warning(self, small_df):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            duckreg("y ~ x1", data=small_df, se_method="none",
-                    duckdb_kwargs={"threads": 1})
-        categories = [str(w.category) for w in caught]
-        assert any("DeprecationWarning" in c for c in categories)
+    def test_fourth_pipe_cluster_segment_raises(self, small_df):
+        with pytest.raises(ValueError, match="4th pipe segment"):
+            duckreg("y ~ x1 | fe1 | | fe2", data=small_df, se_method={"CRV1": "fe2"})
 
     def test_unsupported_data_type_raises(self):
         with pytest.raises(TypeError):
@@ -427,39 +418,39 @@ class TestFormatModelSummary:
     """format_model_summary() from utils.summary."""
 
     def test_returns_string(self, fitted_model):
-        s = fitted_model.summary()
+        s = fitted_model.as_dict()
         text = format_model_summary(s)
         assert isinstance(text, str)
 
     def test_contains_coefficient_section(self, fitted_model):
-        s = fitted_model.summary()
+        s = fitted_model.as_dict()
         text = format_model_summary(s)
         assert "COEFFICIENT" in text.upper()
 
     def test_contains_variable_names(self, fitted_model):
-        s = fitted_model.summary()
+        s = fitted_model.as_dict()
         text = format_model_summary(s)
         assert "x1" in text
         assert "x2" in text
 
     def test_contains_sample_info(self, fitted_model):
-        s = fitted_model.summary()
+        s = fitted_model.as_dict()
         text = format_model_summary(s)
         assert "SAMPLE" in text.upper() or "Observations" in text
 
     def test_custom_description(self, fitted_model):
-        s = fitted_model.summary()
+        s = fitted_model.as_dict()
         text = format_model_summary(s, spec_config={"description": "My Analysis"})
         assert "My Analysis" in text
 
     def test_precision_parameter(self, fitted_model):
-        s = fitted_model.summary()
+        s = fitted_model.as_dict()
         text_p6 = format_model_summary(s, precision=6)
         # Six decimal places means more digits than default 4
         assert text_p6 is not None
 
     def test_fe_model_shows_fixed_effects(self, fitted_fe_model):
-        s = fitted_fe_model.summary()
+        s = fitted_fe_model.as_dict()
         text = format_model_summary(s)
         assert "fe1" in text or "Fixed Effect" in text
 
@@ -485,37 +476,43 @@ class TestFormatModelSummary:
         assert "Compression: 16.7% reduction (120 \u2192 100 rows)" in text
 
 
-class TestSummaryBackwardCompat:
-    """Backward-compatibility wrappers and SummaryFormatter."""
+class TestResultApiAlignment:
+    def test_summary_returns_human_readable_string(self, fitted_model):
+        text = fitted_model.summary()
+        assert isinstance(text, str)
+        assert "COEFFICIENT RESULTS" in text
+
+    def test_as_dict_preserves_structured_export(self, fitted_model):
+        data = fitted_model.as_dict()
+        assert "model_spec" in data
+        assert "coefficients" in data
 
     def test_format_summary_with_dict(self, fitted_model):
-        s = fitted_model.summary()
-        text = format_summary(s)
+        text = format_summary(fitted_model.as_dict())
         assert isinstance(text, str)
 
-    def test_print_summary_does_not_raise(self, fitted_model, capsys):
-        s = fitted_model.summary()
-        print_summary(s)
-        captured = capsys.readouterr()
-        assert len(captured.out) > 0
-
-    def test_to_tidy_df_with_result_object(self, fitted_model):
-        # to_tidy_df on a dict returns empty DataFrame (spec'd behaviour)
-        result = to_tidy_df(fitted_model.summary())
-        assert isinstance(result, pd.DataFrame)
-
-    def test_summary_formatter_format(self, fitted_model):
-        s = fitted_model.summary()
-        text = SummaryFormatter.format(s)
-        assert isinstance(text, str)
-
-    def test_summary_formatter_print(self, fitted_model, capsys):
-        s = fitted_model.summary()
-        SummaryFormatter.print(s)
-        captured = capsys.readouterr()
-        assert len(captured.out) > 0
-
-    def test_summary_formatter_to_tidy_df(self, fitted_model):
-        s = fitted_model.summary()
-        df = SummaryFormatter.to_tidy_df(s)
+    def test_tidy_returns_dataframe(self, fitted_model):
+        df = fitted_model.tidy()
         assert isinstance(df, pd.DataFrame)
+        assert "estimate" in df.columns
+
+    def test_removed_aliases_are_not_present(self, fitted_model):
+        assert not hasattr(fitted_model, "summary_df")
+        assert not hasattr(fitted_model, "to_tidy_df")
+        assert not hasattr(fitted_model, "print_summary")
+
+    def test_coef_se_tstat_pvalue_confint(self, fitted_model):
+        assert isinstance(fitted_model.coef(), pd.Series)
+        assert isinstance(fitted_model.se(), pd.Series)
+        assert isinstance(fitted_model.tstat(), pd.Series)
+        assert isinstance(fitted_model.pvalue(), pd.Series)
+        assert isinstance(fitted_model.confint(), pd.DataFrame)
+
+    def test_accessors_raise_before_fit(self, fitted_model):
+        model = fitted_model
+        model._results = None
+        model.point_estimate = None
+        with pytest.raises(ValueError, match="Call fit\\(\\) first"):
+            model.summary()
+        with pytest.raises(ValueError, match="Call fit\\(\\) first"):
+            model.tidy()

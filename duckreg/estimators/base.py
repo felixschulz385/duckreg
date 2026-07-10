@@ -14,8 +14,32 @@ class SEMethod:
     IID = "iid"
     HC1 = "HC1"
     CRV1 = "CRV1"
-    BS = "BS"
     NONE = "none"
+
+
+class _StandardErrorAccessor:
+    """Callable accessor that preserves ``model.se()`` and string compatibility."""
+
+    def __init__(self, estimator: "DuckEstimator"):
+        self._estimator = estimator
+
+    def _value(self) -> Optional[str]:
+        return getattr(self._estimator, "_se_type", None)
+
+    def __call__(self):
+        results = getattr(self._estimator, "results", None)
+        if results is None:
+            raise ValueError("No results available. Call fit() first.")
+        return results.se()
+
+    def __str__(self) -> str:
+        return self._value() or ""
+
+    def __repr__(self) -> str:
+        return repr(self._value())
+
+    def __eq__(self, other: object) -> bool:
+        return self._value() == other
 
 
 class DuckEstimator(ABC):
@@ -67,7 +91,8 @@ class DuckEstimator(ABC):
         self.rng: Optional[np.random.Generator] = None
         self.point_estimate: Optional[np.ndarray] = None
         self.vcov: Optional[np.ndarray] = None
-        self.se: Optional[str] = None
+        self._se_type: Optional[str] = None
+        self.se = _StandardErrorAccessor(self)
         self.coef_names_: Optional[List[str]] = None
         self.n_obs: Optional[int] = None
         self.n_compression_base_rows: Optional[int] = None
@@ -145,7 +170,7 @@ class DuckEstimator(ABC):
         # For string se_method (not dict), ensure vcov_spec is built so all
         # subclasses (DuckLinearModel, Duck2SLS) can read self.vcov_spec in
         # their fit_vcov implementations.
-        if vcov_spec is None and effective not in (SEMethod.NONE, SEMethod.BS, None):
+        if vcov_spec is None and effective not in (SEMethod.NONE, None):
             from ..core.vcov import VcovSpec
             has_fixef = bool(getattr(self, 'fe_cols', None))
             is_iv     = bool(getattr(self, 'endogenous_vars', None))
@@ -156,11 +181,7 @@ class DuckEstimator(ABC):
             except Exception:
                 pass
 
-        if self.n_bootstraps > 0 and (effective == SEMethod.BS or se_method == SEMethod.BS):
-            logger.debug("Computing bootstrap standard errors")
-            self.vcov = self.bootstrap()
-            self.se = "bootstrap"
-        elif effective == SEMethod.NONE:
+        if effective == SEMethod.NONE:
             logger.debug("Skipping standard error computation")
         elif effective in (SEMethod.IID, SEMethod.HC1, SEMethod.CRV1,
                            'HC2', 'HC3', 'CRV3', 'hetero', 'iid'):
@@ -204,15 +225,6 @@ class DuckEstimator(ABC):
     @abstractmethod
     def fit_vcov(self, se_method: str = SEMethod.HC1):
         """Compute variance-covariance matrix."""
-        pass
-
-    @abstractmethod
-    def bootstrap(self) -> np.ndarray:
-        """Compute variance-covariance matrix via bootstrap.
-        
-        Returns:
-            Variance-covariance matrix
-        """
         pass
 
     # -------------------------------------------------------------------------
@@ -314,9 +326,5 @@ class DuckEstimator(ABC):
             "point_estimate": self.point_estimate,
             "coef_names": self.coef_names_,
             "n_obs": self.n_obs,
-            "se_type": self.se,
+            "se_type": self._se_type,
         }
-
-
-# Backward compatibility alias
-DuckReg = DuckEstimator

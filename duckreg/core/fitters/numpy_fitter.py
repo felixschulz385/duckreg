@@ -124,18 +124,11 @@ class NumpyFitter(BaseFitter):
         Z: Optional[np.ndarray] = None,
         is_iv: bool = False,
         residual_X: Optional[np.ndarray] = None,
-        # Convenience aliases
         vcov_type: Optional[str] = None,
-        ssc_dict: Optional[Dict[str, Any]] = None,
-        kfe: Optional[int] = None,
-        nfe: Optional[int] = None,
+        ssc_config: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
         """Compute variance-covariance matrix."""
-        if kfe is not None:
-            k_fe = kfe
-        if nfe is not None:
-            n_fe = nfe
-        vcov_spec = _resolve_vcov_spec(vcov_spec, vcov_type, ssc_dict, cluster_ids is not None)
+        vcov_spec = _resolve_vcov_spec(vcov_spec, vcov_type, ssc_config, cluster_ids is not None)
 
         result = existing_result or self._last_result
         X, y, weights, n_rows, n_obs = _validate_and_prepare_data(X, y, weights)

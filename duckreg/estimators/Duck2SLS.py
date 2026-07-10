@@ -96,16 +96,11 @@ class Duck2SLS(DuckEstimator):
         table_name: str,
         formula,
         seed: int = 42,
-        n_bootstraps: int = 0,
         compression: int = None,
-        round_strata: int = None,
         duckdb_kwargs: dict = None,
         subset: str = None,
-        n_jobs: int = 1,
         fitter: str = "numpy",
         method: str = "mundlak",
-        # backward-compat alias
-        fe_method: str = None,
         vcov_spec: Optional[VcovSpec] = None,
         # Transformer tuning (forwarded to MundlakTransformer)
         fe_types: Optional[Dict[str, str]] = None,
@@ -124,9 +119,7 @@ class Duck2SLS(DuckEstimator):
             db_name=db_name,
             table_name=table_name,
             seed=seed,
-            n_bootstraps=n_bootstraps,
             compression=compression,
-            round_strata=round_strata,
             duckdb_kwargs=duckdb_kwargs,
             fitter=fitter,
             remove_singletons=remove_singletons,
@@ -134,12 +127,10 @@ class Duck2SLS(DuckEstimator):
         )
 
         self.formula    = formula
-        self.n_jobs     = n_jobs
         self.subset     = subset
-        explicit_method = fe_method if fe_method is not None else method
-        self.method     = explicit_method   # fe_method kept for compat
+        self.method      = method
         self.vcov_spec   = vcov_spec
-        self.ssc_dict    = vcov_spec.ssc.to_dict() if vcov_spec is not None else None
+        self.ssc_config  = vcov_spec.ssc.to_dict() if vcov_spec is not None else None
         self.vcov_meta: Optional[Dict[str, Any]] = None
         self._df_compressed: Optional[pd.DataFrame] = None
         self._data_fetched: bool = False
@@ -173,10 +164,7 @@ class Duck2SLS(DuckEstimator):
         ]
 
         if self.fe_cols and self.method == "mundlak":
-            if fe_method is None and method == "mundlak":
-                self.method = "demean"
-            else:
-                raise NotImplementedError(MUNDLAK_DISABLED_MESSAGE)
+            self.method = "demean"
 
         # Internal state
         self._first_stage_results: Dict[str, FirstStageResults] = {}
@@ -312,7 +300,7 @@ class Duck2SLS(DuckEstimator):
             vcov=getattr(self, "vcov", None),
             n_obs=getattr(self, "n_obs", None),
             n_compressed=self.n_compressed_rows,
-            se_type=getattr(self, "se", None),
+            se_type=getattr(self, "_se_type", None),
         )
         return self._results
 
@@ -926,7 +914,7 @@ class Duck2SLS(DuckEstimator):
             and self._fitter_result.vcov is not None
         ):
             self.vcov        = self._fitter_result.vcov
-            self.se          = self._fitter_result.se_type
+            self._se_type    = self._fitter_result.se_type
             self._n_clusters = self._fitter_result.n_clusters
             self._results    = None
             return
@@ -962,8 +950,8 @@ class Duck2SLS(DuckEstimator):
         self.vcov        = vcov
         self.vcov_spec   = vcov_spec
         self.vcov_meta   = vcov_meta
-        self.ssc_dict    = vcov_spec.ssc.to_dict()
-        self.se          = vcov_meta["vcov_type_detail"]
+        self.ssc_config  = vcov_spec.ssc.to_dict()
+        self._se_type    = vcov_meta["vcov_type_detail"]
         self._n_clusters = vcov_meta.get("n_clusters")
         self._results    = None
 
@@ -1273,8 +1261,8 @@ class Duck2SLS(DuckEstimator):
         self.vcov        = vcov
         self.vcov_spec   = vcov_spec
         self.vcov_meta   = vcov_meta
-        self.ssc_dict    = vcov_spec.ssc.to_dict()
-        self.se          = vcov_meta["vcov_type_detail"]
+        self.ssc_config  = vcov_spec.ssc.to_dict()
+        self._se_type    = vcov_meta["vcov_type_detail"]
         self._n_clusters = vcov_meta.get("n_clusters")
         self._results    = None
 
@@ -1284,7 +1272,7 @@ class Duck2SLS(DuckEstimator):
             and self._fitter_result.vcov is not None
         ):
             self.vcov        = self._fitter_result.vcov
-            self.se          = self._fitter_result.se_type
+            self._se_type    = self._fitter_result.se_type
             self._n_clusters = self._fitter_result.n_clusters
             self._results    = None
             return
@@ -1317,15 +1305,10 @@ class Duck2SLS(DuckEstimator):
         self.vcov        = vcov
         self.vcov_spec   = vcov_spec
         self.vcov_meta   = vcov_meta
-        self.ssc_dict    = vcov_spec.ssc.to_dict()
-        self.se          = vcov_meta["vcov_type_detail"]
+        self.ssc_config  = vcov_spec.ssc.to_dict()
+        self._se_type    = vcov_meta["vcov_type_detail"]
         self._n_clusters = vcov_meta.get("n_clusters")
         self._results    = None
-
-    def bootstrap(self) -> np.ndarray:
-        logger.warning("Bootstrap for 2SLS is not yet implemented; using analytical SEs.")
-        self.fit_vcov()  # reads self.vcov_spec internally
-        return self.vcov
 
     # =========================================================================
     # OLS helpers used inside the first-stage loop
@@ -1530,27 +1513,46 @@ class Duck2SLS(DuckEstimator):
     # Summary / output
     # =========================================================================
 
-    def summary(self) -> Dict[str, Any]:
+    def as_dict(self) -> Dict[str, Any]:
         from ..core.results import ModelSummary
         return ModelSummary.from_estimator(self).to_dict()
 
-    def summary_df(self) -> pd.DataFrame:
+    def summary(self, precision: int = 4, include_diagnostics: bool = True) -> str:
         if self.results is None:
-            return pd.DataFrame()
-        return self.results.to_dataframe()
-
-    def print_summary(self, precision: int = 4, include_diagnostics: bool = True):
-        """Print formatted 2SLS results to console using unified formatter."""
-        from ..utils.summary import print_summary as fmt_print
-        fmt_print(
-            self.summary(),
+            raise ValueError("No results available. Call fit() first.")
+        from ..utils.summary import format_model_summary
+        return format_model_summary(
+            self.as_dict(),
             precision=precision,
             include_diagnostics=include_diagnostics,
         )
 
-    def to_tidy_df(self) -> pd.DataFrame:
-        """Get results as a tidy DataFrame using unified formatter."""
-        from ..utils.summary import to_tidy_df as fmt_tidy
-        if self.results:
-            return fmt_tidy(self.results)
-        return pd.DataFrame()
+    def tidy(self) -> pd.DataFrame:
+        """Get results as a tidy DataFrame."""
+        if self.results is None:
+            raise ValueError("No results available. Call fit() first.")
+        return self.results.tidy()
+
+    def coef(self) -> pd.Series:
+        """Return coefficient estimates."""
+        if self.results is None:
+            raise ValueError("No results available. Call fit() first.")
+        return self.results.coef()
+
+    def tstat(self) -> pd.Series:
+        """Return t-statistics."""
+        if self.results is None:
+            raise ValueError("No results available. Call fit() first.")
+        return self.results.tstat()
+
+    def pvalue(self) -> pd.Series:
+        """Return p-values."""
+        if self.results is None:
+            raise ValueError("No results available. Call fit() first.")
+        return self.results.pvalue()
+
+    def confint(self) -> pd.DataFrame:
+        """Return confidence intervals."""
+        if self.results is None:
+            raise ValueError("No results available. Call fit() first.")
+        return self.results.confint()

@@ -294,8 +294,8 @@ def test_nested_formula_matches_plain_absorption(balanced_df, balanced_path):
         fitter="numpy",
     )
 
-    nested_summary = nested.summary_df().sort_index()
-    plain_summary = plain.summary_df().sort_index()
+    nested_summary = nested.tidy().set_index("variable").sort_index()
+    plain_summary = plain.tidy().set_index("variable").sort_index()
 
     np.testing.assert_allclose(
         nested.point_estimate,
@@ -409,15 +409,15 @@ class TestEndToEndSEParity:
         dr_coef = dr_fit.point_estimate
         np.testing.assert_allclose(dr_coef, pf_coef, rtol=1e-4,
             err_msg="Coefficients diverge before SE comparison is meaningful")
-        summary = dr_fit.summary_df()
+        summary = dr_fit.tidy().set_index("variable")
         assert_coef_near_true(
-            float(summary.loc["x1", "coefficient"]),
+            float(summary.loc["x1", "estimate"]),
             1.5,
             rtol=0.05,
             label="demean x1 vs DGP",
         )
         assert_coef_near_true(
-            float(summary.loc["x2", "coefficient"]),
+            float(summary.loc["x2", "estimate"]),
             0.8,
             rtol=0.08,
             label="demean x2 vs DGP",
@@ -478,11 +478,11 @@ class TestSSCAutoSelection:
                     se_method={"CRV1": "unit"}, fe_method="demean", fitter="duckdb")
         assert m.vcov_spec.ssc.Gdf == 'min'
 
-    def test_ssc_dict_attr_reflects_auto_ssc(self, panel_data):
-        """model.ssc_dict is derived from the auto-selected SSC (for introspection)."""
+    def test_ssc_config_attr_reflects_auto_ssc(self, panel_data):
+        """model.ssc_config is derived from the auto-selected SSC (for introspection)."""
         m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
                     se_method="HC1", fe_method="demean", fitter="duckdb")
-        assert m.ssc_dict == m.vcov_spec.ssc.to_dict()
+        assert m.ssc_config == m.vcov_spec.ssc.to_dict()
 
     def test_ssc_kfixef_affects_se_numerically(self, panel_data):
         """kfixef='full' must give larger SE than kfixef='none' when kfe > 0."""
@@ -498,7 +498,7 @@ class TestSSCAutoSelection:
         XtXinv = safe_inv(XtX, use_pinv=True)
         rss = float(((y - X @ theta) ** 2).sum())
 
-        ctx = VcovContext(N=n, k=k, kfe=kfe, nfe=nfe)
+        ctx = VcovContext(N=n, k=k, k_fe=kfe, n_fe=nfe)
         cfg_none = SSCConfig.from_dict(
             {'kadj': True, 'kfixef': 'none', 'Gadj': False, 'Gdf': 'conventional'})
         cfg_full = SSCConfig.from_dict(

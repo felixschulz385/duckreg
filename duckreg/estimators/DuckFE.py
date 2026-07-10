@@ -979,13 +979,13 @@ class DuckFE(DuckLinearModel):
     # Summary
     # -------------------------------------------------------------------------
 
-    def summary(self) -> Dict[str, Any]:
-        result = super().summary()
-        result["estimator_type"] = "DuckFE"
-        result["fe_method"] = self.method
+    def as_dict(self) -> Dict[str, Any]:
+        result = super().as_dict()
+        result["model_spec"]["estimator_type"] = "DuckFE"
+        result["model_spec"]["fe_method"] = self.method
 
         if self.method == "iterative_demean" and self._transformer is not None:
-            result.update(
+            result.setdefault("estimation_info", {}).update(
                 {
                     "n_iterations": getattr(
                         self._transformer, "n_iterations", None
@@ -1010,14 +1010,14 @@ class DuckFE(DuckLinearModel):
                 }
             )
         if self.method == "auto_fe" and self._transformer is not None:
-            result["routing"] = getattr(self._transformer, "routing_", {})
-            result["cardinalities"] = getattr(self._transformer, "cardinalities_", {})
+            result.setdefault("estimation_info", {})["routing"] = getattr(
+                self._transformer, "routing_", {}
+            )
+            result["estimation_info"]["cardinalities"] = getattr(
+                self._transformer, "cardinalities_", {}
+            )
             active = getattr(self._transformer, "_active_transformer", None)
             if active is not None and not self._transformer.has_intercept:
                 n_iter = getattr(active, "n_iterations", None)
-                result["n_iterations"] = n_iter
-                max_iter = getattr(active, "max_iterations", None)
-                result["converged"] = (
-                    n_iter < max_iter if n_iter is not None and max_iter is not None else None
-                )
+                result["estimation_info"]["n_iterations"] = n_iter
         return result

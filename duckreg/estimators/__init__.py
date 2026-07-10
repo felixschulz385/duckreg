@@ -12,25 +12,13 @@ Architecture follows OOP best practices:
 """
 
 # Base classes and constants
-from .base import DuckEstimator, DuckReg, SEMethod
+from .base import DuckEstimator, SEMethod
 
 # Result containers
 from ..core.results import RegressionResults, FirstStageResults, ModelSummary
 
-# Bootstrap utilities
-from ..core.vcov import (
-    BootstrapExecutor,
-    _bootstrap_iteration_iid,
-    _bootstrap_iteration_cluster,
-)
-
 # Unified summary formatting
-from ..utils.summary import (
-    SummaryFormatter,
-    format_summary,
-    print_summary,
-    to_tidy_df,
-)
+from ..utils.summary import format_summary
 
 # Base class
 from .DuckLinearModel import DuckLinearModel
@@ -46,19 +34,13 @@ from .DuckMediation import DuckMediation
 __all__ = [
     # Base classes
     'DuckEstimator',
-    'DuckReg',
     'SEMethod',
     # Results
     'RegressionResults',
     'FirstStageResults',
     'ModelSummary',
-    # Bootstrap utilities
-    'BootstrapExecutor',
     # Summary utilities
-    'SummaryFormatter',
     'format_summary',
-    'print_summary',
-    'to_tidy_df',
     # Base
     'DuckLinearModel',
     # Estimators

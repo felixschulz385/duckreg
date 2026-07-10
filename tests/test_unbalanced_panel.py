@@ -14,12 +14,12 @@ pytest.skip(
     allow_module_level=True,
 )
 
-from duckreg import compressed_ols
+from duckreg import duckreg
 from tests.helpers import make_fe_classification_panel
 
 
 def _fit_model(parquet_path: str, formula: str, **kwargs):
-    return compressed_ols(
+    return duckreg(
         formula=formula,
         data=parquet_path,
         fe_method="mundlak",
@@ -78,7 +78,7 @@ def large_cardinality_data():
 class TestFEClassificationAndFeatureGeneration:
     @pytest.mark.parametrize("fitter", ["numpy", "duckdb"])
     def test_balanced_panel_classification(self, balanced_panel_path, fitter):
-        model = compressed_ols(
+        model = duckreg(
             formula="y ~ x1 + x2 | firm_id + year",
             data=balanced_panel_path,
             fe_method="mundlak",
@@ -106,7 +106,7 @@ class TestFEClassificationAndFeatureGeneration:
 
     @pytest.mark.parametrize("fitter", ["numpy", "duckdb"])
     def test_unbalanced_panel_adds_dummy_means(self, unbalanced_panel_path, fitter):
-        model = compressed_ols(
+        model = duckreg(
             formula="y ~ x1 + x2 | firm_id + year",
             data=unbalanced_panel_path,
             fe_method="mundlak",

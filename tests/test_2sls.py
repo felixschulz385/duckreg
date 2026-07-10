@@ -15,7 +15,6 @@ are deliberately NOT re-tested here because they are covered by other suites:
 import logging
 import os
 import tempfile
-import warnings
 
 import numpy as np
 import pandas as pd
@@ -121,11 +120,6 @@ class TestConstruction:
         assert m.fitter == "numpy"
         assert m.endogenous_vars == ["endog"]
         assert m.instrument_vars == ["z"]
-
-    def test_fe_method_compat_alias(self, iv_parquet):
-        """fe_method= should map to method= for backward compatibility."""
-        m = _build(iv_parquet, "y ~ x | | (endog ~ z)", fe_method="mundlak")
-        assert m.method == "mundlak"
 
     def test_method_demean_accepted(self, iv_parquet):
         """method='demean' is now a supported FE absorption strategy."""
@@ -592,14 +586,6 @@ class TestVCov:
         with pytest.raises(RuntimeError):
             m._fit_vcov_numpy()
 
-    def test_bootstrap_warns_and_returns_vcov(self, fitted_numpy, caplog):
-        import logging
-        with caplog.at_level(logging.WARNING, logger="duckreg.estimators.Duck2SLS"):
-            vcov = fitted_numpy.bootstrap()
-        assert any("not yet implemented" in r.message.lower() for r in caplog.records)
-        assert vcov is not None
-        assert vcov.shape[0] == vcov.shape[1]
-
     def test_se_positive(self, fitted_numpy):
         se = np.sqrt(np.diag(fitted_numpy.vcov))
         assert np.all(se > 0)
@@ -622,45 +608,60 @@ class TestVCov:
 # ===========================================================================
 
 class TestOutputMethods:
-    def test_summary_df_returns_dataframe(self, fitted_numpy):
-        df = fitted_numpy.summary_df()
+    def test_summary_returns_string(self, fitted_numpy):
+        text = fitted_numpy.summary()
+        assert isinstance(text, str)
+        assert "FIRST STAGE DIAGNOSTICS" in text
+
+    def test_as_dict_returns_structured_output(self, fitted_numpy):
+        result = fitted_numpy.as_dict()
+        assert "coefficients" in result
+        assert "iv_diagnostics" in result
+
+    def test_summary_can_hide_iv_diagnostics(self, fitted_numpy):
+        text = fitted_numpy.summary(include_diagnostics=False)
+        assert "FIRST STAGE DIAGNOSTICS" not in text
+
+    def test_tidy_returns_dataframe(self, fitted_numpy):
+        df = fitted_numpy.tidy()
         assert isinstance(df, pd.DataFrame)
         assert len(df) > 0
 
-    def test_summary_df_has_endog_in_index(self, fitted_numpy):
-        df = fitted_numpy.summary_df()
-        assert "endog" in df.index
+    def test_tidy_has_endog_variable(self, fitted_numpy):
+        df = fitted_numpy.tidy()
+        assert "endog" in set(df["variable"])
 
-    def test_summary_df_has_coefficient_column(self, fitted_numpy):
-        df = fitted_numpy.summary_df()
-        assert "coefficient" in df.columns
+    def test_tidy_has_estimate_column(self, fitted_numpy):
+        df = fitted_numpy.tidy()
+        assert "estimate" in df.columns
 
-    def test_to_tidy_df_returns_dataframe(self, fitted_numpy):
-        df = fitted_numpy.to_tidy_df()
-        assert isinstance(df, pd.DataFrame)
-        assert len(df) > 0
-
-    def test_to_tidy_df_has_variable_column(self, fitted_numpy):
-        df = fitted_numpy.to_tidy_df()
+    def test_tidy_has_variable_column(self, fitted_numpy):
+        df = fitted_numpy.tidy()
         assert "variable" in df.columns
 
-    def test_summary_df_empty_before_fit(self, iv_parquet):
-        m = _build(iv_parquet, "y ~ x | | (endog ~ z)")
-        df = m.summary_df()
-        assert isinstance(df, pd.DataFrame)
-        assert len(df) == 0
+    def test_tidy_coef_se_accessors(self, fitted_numpy):
+        assert isinstance(fitted_numpy.tidy(), pd.DataFrame)
+        assert isinstance(fitted_numpy.coef(), pd.Series)
+        assert isinstance(fitted_numpy.se(), pd.Series)
+        assert isinstance(fitted_numpy.tstat(), pd.Series)
+        assert isinstance(fitted_numpy.pvalue(), pd.Series)
+        assert isinstance(fitted_numpy.confint(), pd.DataFrame)
 
-    def test_to_tidy_df_empty_before_fit(self, iv_parquet):
+    def test_tidy_raises_before_fit(self, iv_parquet):
         m = _build(iv_parquet, "y ~ x | | (endog ~ z)")
-        df = m.to_tidy_df()
-        assert isinstance(df, pd.DataFrame)
-        assert len(df) == 0
+        with pytest.raises(ValueError, match="Call fit\\(\\) first"):
+            m.tidy()
 
-    def test_summary_df_matches_coef_names(self, fitted_numpy):
-        df   = fitted_numpy.summary_df()
+    def test_tidy_matches_coef_names(self, fitted_numpy):
+        df = fitted_numpy.tidy().set_index("variable")
         names = set(fitted_numpy.coef_names_) - {"Intercept"}
         for n in names:
-            assert n in df.index, f"Expected {n!r} in summary_df index"
+            assert n in df.index, f"Expected {n!r} in tidy output"
+
+    def test_summary_raises_before_fit(self, iv_parquet):
+        m = _build(iv_parquet, "y ~ x | | (endog ~ z)")
+        with pytest.raises(ValueError, match="Call fit\\(\\) first"):
+            m.summary()
 
 
 # ===========================================================================
@@ -971,10 +972,10 @@ class TestSSCAutoSelection2SLS:
         m = self._fit(iv_parquet, {"CRV1": "firm_id"})
         assert m.vcov_spec.ssc.Gdf == 'min'
 
-    def test_ssc_dict_attr_reflects_auto_ssc(self, iv_parquet):
-        """ssc_dict must be consistent with vcov_spec.ssc for introspection."""
+    def test_ssc_config_attr_reflects_auto_ssc(self, iv_parquet):
+        """ssc_config must be consistent with vcov_spec.ssc for introspection."""
         m = self._fit(iv_parquet, "HC1")
-        assert m.ssc_dict == m.vcov_spec.ssc.to_dict()
+        assert m.ssc_config == m.vcov_spec.ssc.to_dict()
 
     def test_ssc_kfixef_affects_se_numerically(self):
         """kfixef='full' must give strictly larger SE than kfixef='none' when kfe > 0.
@@ -994,7 +995,7 @@ class TestSSCAutoSelection2SLS:
         XtXinv = safe_inv(XtX, use_pinv=True)
         rss    = float(((y - X @ theta) ** 2).sum())
 
-        ctx      = VcovContext(N=n, k=k, kfe=kfe, nfe=nfe)
+        ctx      = VcovContext(N=n, k=k, k_fe=kfe, n_fe=nfe)
         cfg_none = SSCConfig.from_dict(
             {'kadj': True, 'kfixef': 'none', 'Gadj': False, 'Gdf': 'conventional'})
         cfg_full = SSCConfig.from_dict(

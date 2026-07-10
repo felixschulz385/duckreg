@@ -7,7 +7,7 @@ either demeaning or Mundlak device for fixed effects.
 Architecture:
 - DuckLinearModel extends DuckEstimator
 - Results containers are imported from core/results.py (Single Responsibility)
-- Bootstrap and vcov helpers are imported from core/vcov.py (DRY)
+- VCOV helpers are imported from core/vcov.py (DRY)
 - SQL builders are imported from core/sql_builders.py (DRY)
 """
 
@@ -24,11 +24,7 @@ from ..utils.formula_parser import cast_if_boolean, needs_quoting, quote_identif
 
 # Import from refactored modules - Single Responsibility Principle
 from ..core.results import RegressionResults, FirstStageResults
-from ..core.vcov import (
-    VcovSpec,
-    BootstrapExecutor,
-    _bootstrap_iteration_iid, _bootstrap_iteration_cluster
-)
+from ..core.vcov import VcovSpec
 from ..utils.name_utils import build_coef_name_lists
 
 logger = logging.getLogger(__name__)
@@ -45,7 +41,7 @@ class DuckLinearModel(DuckEstimator):
     - Formula-based model specification
     - Data compression for efficient estimation
     - Coefficient estimation (numpy or duckdb)
-    - Vcov computation (analytical or bootstrap)
+    - Analytical VCOV computation
     
     Subclasses should override:
     - prepare_data(): Create design matrix tables
@@ -62,12 +58,9 @@ class DuckLinearModel(DuckEstimator):
         table_name: str,
         seed: int,
         formula=None,
-        n_bootstraps: int = 0,
         compression: int = None,
-        round_strata: int = None,
         duckdb_kwargs: dict = None,
         subset: str = None,
-        n_jobs: int = 1,
         fitter: str = "numpy",
         remove_singletons: bool = True,
         vcov_spec: Optional[VcovSpec] = None,
@@ -88,9 +81,7 @@ class DuckLinearModel(DuckEstimator):
             db_name=db_name,
             table_name=table_name,
             seed=seed,
-            n_bootstraps=n_bootstraps,
             compression=compression,
-            round_strata=round_strata,
             duckdb_kwargs=duckdb_kwargs,
             fitter=fitter,
             remove_singletons=remove_singletons,
@@ -98,10 +89,9 @@ class DuckLinearModel(DuckEstimator):
         )
         
         self.formula = formula
-        self.n_jobs = n_jobs
         self.subset = subset
         self.vcov_spec = vcov_spec
-        self.ssc_dict = vcov_spec.ssc.to_dict() if vcov_spec is not None else None
+        self.ssc_config = vcov_spec.ssc.to_dict() if vcov_spec is not None else None
 
         # State
         self.strata_cols: List[str] = []
@@ -147,7 +137,7 @@ class DuckLinearModel(DuckEstimator):
             vcov=getattr(self, 'vcov', None),
             n_obs=getattr(self, 'n_obs', None),
             n_compressed=self.n_compressed_rows,
-            se_type=getattr(self, 'se', None),
+            se_type=getattr(self, '_se_type', None),
         )
         return self._results
 
@@ -493,7 +483,7 @@ class DuckLinearModel(DuckEstimator):
         # Annotate meta with the SSC kfixef actually used, for inspection.
         vcov_meta['ssc_kfixef'] = vcov_spec.ssc.kfixef if vcov_spec is not None else None
         self.vcov_meta = vcov_meta
-        self.se = vcov_meta.get('vcov_type_detail', vcov_spec.vcov_detail)
+        self._se_type = vcov_meta.get('vcov_type_detail', vcov_spec.vcov_detail)
         self._results = None
 
     def _fit_vcov_duckdb(self):
@@ -516,7 +506,7 @@ class DuckLinearModel(DuckEstimator):
         if k_fe == 0 and self._fitter_result is not None and self._fitter_result.vcov is not None:
             if self._fitter_result.se_type == vcov_spec.vcov_detail or vcov_spec.vcov_detail in self._fitter_result.se_type:
                 self.vcov = self._fitter_result.vcov
-                self.se = self._fitter_result.se_type
+                self._se_type = self._fitter_result.se_type
                 self._results = None
                 return
         
@@ -548,107 +538,58 @@ class DuckLinearModel(DuckEstimator):
         # Annotate meta with the SSC kfixef actually used, for inspection.
         vcov_meta['ssc_kfixef'] = vcov_spec.ssc.kfixef if vcov_spec is not None else None
         self.vcov_meta = vcov_meta
-        self.se = vcov_meta.get('vcov_type_detail', vcov_spec.vcov_detail)
+        self._se_type = vcov_meta.get('vcov_type_detail', vcov_spec.vcov_detail)
         self._results = None
-
-    # -------------------------------------------------------------------------
-    # Bootstrap
-    # -------------------------------------------------------------------------
-
-    def bootstrap(self) -> np.ndarray:
-        """Run bootstrap to estimate variance-covariance matrix.
-        
-        Note: Bootstrap requires loading data into memory and is not compatible
-        with the DuckDB fitter's out-of-core processing. Use analytical SEs instead.
-        """
-        if self.fitter == "duckdb":
-            logger.warning(
-                "Bootstrap requested with fitter='duckdb'. Bootstrap requires "
-                "loading data into memory which defeats the purpose of out-of-core "
-                "processing. Using analytical standard errors from DuckDB fitter instead."
-            )
-            self.fit_vcov()
-            return self.vcov
-        
-        self._ensure_data_fetched()
-        executor = BootstrapExecutor(self.n_bootstraps, self.n_jobs, self.rng)
-        
-        if self.cluster_col:
-            boot_coefs, boot_sizes = self._run_cluster_bootstrap(executor)
-        else:
-            boot_coefs, boot_sizes = self._run_iid_bootstrap(executor)
-        
-        vcov = np.cov(boot_coefs.T, aweights=boot_sizes)
-        self._results = None
-        return np.expand_dims(vcov, axis=0) if vcov.ndim == 0 else vcov
-
-    def _run_iid_bootstrap(self, executor: BootstrapExecutor) -> Tuple[np.ndarray, np.ndarray]:
-        y, X, n = self.collect_data(data=self.df_compressed)
-        n_rows = len(self.df_compressed)
-        
-        return executor.execute(
-            _bootstrap_iteration_iid, (X, y, n, n_rows),
-            args_builder=lambda b, seed: (X, y, n, n_rows, seed)
-        )
-
-    def _run_cluster_bootstrap(self, executor: BootstrapExecutor) -> Tuple[np.ndarray, np.ndarray]:
-        df_clusters, cluster_col_name = self._get_cluster_data_for_bootstrap()
-        df_clusters = df_clusters.dropna(subset=[cluster_col_name])
-        
-        unique_groups = df_clusters[cluster_col_name].unique()
-        group_to_idx = {x: i for i, x in enumerate(unique_groups)}
-        group_idx = df_clusters[cluster_col_name].map(group_to_idx).to_numpy(dtype=int)
-        
-        y, X, n = self.collect_data(data=df_clusters)
-        n_unique_groups = len(unique_groups)
-        
-        return executor.execute(
-            _bootstrap_iteration_cluster, (X, y, n, group_idx, n_unique_groups),
-            args_builder=lambda b, seed: (X, y, n, group_idx, n_unique_groups, seed)
-        )
-
-    def _get_cluster_data_for_bootstrap(self) -> Tuple[pd.DataFrame, str]:
-        """Get data and cluster column for bootstrap. Subclasses may override."""
-        self._ensure_data_fetched()
-        return self.df_compressed, self.cluster_col
 
     # -------------------------------------------------------------------------
     # Summary
     # -------------------------------------------------------------------------
 
-    def summary(self) -> Dict[str, Any]:
-        """Provide comprehensive and exhaustive results summary.
-        
-        Returns a dictionary containing all information needed to:
-        - Reconstruct the analysis
-        - Track provenance (version, timestamp)
-        - Identify results from buggy versions
-        
-        Uses the standardized ModelSummary structure for consistency.
-        
-        Returns:
-            Dictionary with model specification, results, and metadata
-        """
+    def _require_results(self) -> RegressionResults:
+        """Return fitted results or raise a consistent fit-first error."""
+        if self.results is None:
+            raise ValueError("No results available. Call fit() first.")
+        return self.results
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Return exhaustive machine-readable model output."""
         from ..core.results import ModelSummary
         return ModelSummary.from_estimator(self).to_dict()
+
+    def summary(
+        self,
+        precision: int = 4,
+        include_diagnostics: bool = True,
+    ) -> str:
+        """Return a human-readable summary string."""
+        self._require_results()
+        from ..utils.summary import format_model_summary
+        return format_model_summary(
+            self.as_dict(),
+            precision=precision,
+            include_diagnostics=include_diagnostics,
+        )
     
-    def summary_df(self) -> pd.DataFrame:
-        """Get results as a DataFrame"""
-        if self.results is None:
-            return pd.DataFrame()
-        return self.results.to_dataframe()
-    
-    def print_summary(self, precision: int = 4):
-        """Print formatted results to console using unified formatter."""
-        if self.results:
-            from ..utils.summary import print_summary as fmt_print
-            fmt_print(self.results, precision=precision)
-        else:
-            print("No results available. Call fit() first.")
-    
-    def to_tidy_df(self) -> pd.DataFrame:
-        """Get results as a tidy DataFrame using unified formatter."""
-        if self.results:
-            from ..utils.summary import to_tidy_df as fmt_tidy
-            return fmt_tidy(self.results)
-        return pd.DataFrame()
+    def tidy(self) -> pd.DataFrame:
+        """Get results as a tidy DataFrame."""
+        return self._require_results().tidy()
+
+    def coef(self) -> pd.Series:
+        """Return coefficient estimates."""
+        return self._require_results().coef()
+
+    def se(self) -> pd.Series:
+        """Return standard errors."""
+        return self._require_results().se()
+
+    def tstat(self) -> pd.Series:
+        """Return t-statistics."""
+        return self._require_results().tstat()
+
+    def pvalue(self) -> pd.Series:
+        """Return p-values."""
+        return self._require_results().pvalue()
+
+    def confint(self) -> pd.DataFrame:
+        """Return confidence intervals."""
+        return self._require_results().confint()

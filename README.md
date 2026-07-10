@@ -12,7 +12,7 @@ At a high level, `duckreg`:
 - builds regression design matrices inside DuckDB,
 - compresses repeated strata into sufficient statistics,
 - fits weighted least squares on the compressed representation,
-- computes analytical or bootstrap standard errors, depending on the specification.
+- computes analytical standard errors.
 
 This design is useful when the original dataset is larger than comfortable in-memory workflows, or when repeated covariate patterns allow substantial compression before estimation.
 
@@ -25,7 +25,7 @@ The repository currently exposes:
 - 2SLS / instrumental-variables regression,
 - mediation models,
 - DuckDB-backed and NumPy-backed fitting paths,
-- analytical and bootstrap inference utilities,
+- analytical inference utilities,
 - notebooks, tests, generated API docs, and benchmark scripts.
 
 Some code paths are present but intentionally disabled in the current branch:
@@ -79,7 +79,7 @@ model = duckreg(
 )
 
 summary = model.summary()
-tidy = model.to_tidy_df()
+tidy = model.tidy()
 ```
 
 `data` can be:
@@ -115,12 +115,6 @@ IV / 2SLS:
 duckreg("y ~ x1 | unit + year | (endog ~ z1 + z2)", data=df)
 ```
 
-Clustered standard errors using a fourth pipe segment:
-
-```python
-duckreg("y ~ x1 + x2 | unit + year | | firm_id", data=df, se_method={"CRV1": "firm_id"})
-```
-
 Mediation using `via(...)` in the covariate slot:
 
 ```python
@@ -132,7 +126,6 @@ Supported formula features in the parser include:
 - multiple covariates separated by `+`,
 - fixed effects in the second pipe segment,
 - IV specifications in the third pipe segment with `(endog ~ instruments)`,
-- clustering,
 - simple transforms such as `log(...)`, `log1p(...)`, `exp(...)`, and `sqrt(...)`,
 - powers such as `x^2`,
 - interaction handling,
@@ -145,20 +138,7 @@ The main standard error options are:
 - `"iid"` for homoskedastic standard errors,
 - `"HC1"` for heteroskedasticity-robust standard errors,
 - `{"CRV1": "cluster_var"}` for cluster-robust standard errors,
-- `"BS"` for bootstrap-based inference,
 - `"none"` to skip variance estimation.
-
-For bootstrap inference, pass settings through `bootstrap`, for example:
-
-```python
-model = duckreg(
-    "y ~ x1 | unit",
-    data=df,
-    se_method="BS",
-    bootstrap={"n": 200, "seed": 0},
-    threads=4,
-)
-```
 
 ## Main options
 
@@ -167,7 +147,6 @@ The `duckreg()` API includes the following commonly used parameters:
 - `formula`: model specification string.
 - `data`: file path, directory, or supported in-memory table object.
 - `se_method`: inference specification.
-- `bootstrap`: bootstrap settings when `se_method="BS"`.
 - `fe_method`: currently `None`, `"auto"`, or `"demean"` in practical use. `mundlak` is currently disabled.
 - `remove_singletons`: drop singleton FE groups before estimation.
 - `subset`: SQL `WHERE` filter applied before estimation.
@@ -176,7 +155,7 @@ The `duckreg()` API includes the following commonly used parameters:
 - `fitter`: `"numpy"` or `"duckdb"`.
 - `compression`: controls row compression before fitting.
 - `seed`: random seed.
-- `threads`: DuckDB thread count and bootstrap parallelism control.
+- `threads`: DuckDB thread count.
 - `memory_limit`: DuckDB memory limit such as `"8GB"`.
 - `max_temp_directory_size`: DuckDB temporary storage limit.
 
@@ -216,9 +195,10 @@ The project also uses DuckDB throughout the preprocessing pipeline even when the
 
 Depending on the model type, useful methods and attributes include:
 
-- `summary()`: structured model summary as a dictionary,
-- `summary_df()`: summary table as a pandas DataFrame,
-- `to_tidy_df()`: tidy coefficient output,
+- `summary()`: human-readable model summary,
+- `as_dict()`: structured model summary for serialization,
+- `tidy()`: tidy coefficient output,
+- `coef()`, `se()`, `tstat()`, `pvalue()`, `confint()`: direct coefficient accessors,
 - `results`: underlying result container,
 - `first_stage`: first-stage IV results for 2SLS models.
 
@@ -334,7 +314,7 @@ See [`benchmarks/README.md`](/Users/felixschulz/Library/CloudStorage/OneDrive-Pe
 - Mundlak fixed-effects absorption is present in code history but disabled in this branch.
 - `auto_fe` is also disabled.
 - Some advanced features, especially compression tuning and out-of-core operation, are best validated against the specific data-generating setting rather than treated as drop-in defaults.
-- Cluster and bootstrap inference can be materially more expensive than plain HC1 inference.
+- Cluster-robust inference can be materially more expensive than plain HC1 inference.
 
 ## References
 

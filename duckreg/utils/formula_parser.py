@@ -1027,13 +1027,7 @@ class FormulaParser:
 
             "y ~ x1 + x2 | fe1 + fe2 | (endog ~ inst1 + inst2)"
 
-        The 4th pipe segment for cluster is *deprecated*; pass the cluster
-        variable via ``se_method={'CRV1': 'cluster_var'}`` instead.
-        The old IV syntax ``endog(inst1 + inst2)`` is also *deprecated*; use
-        the fixest-style ``(endog ~ inst1 + inst2)`` form in the 3rd segment.
         """
-        import warnings
-
         logger.debug(f"Parsing formula: {formula}")
         
         if "~" not in formula:
@@ -1057,20 +1051,12 @@ class FormulaParser:
         if len(parts) > 2 and parts[2].strip() not in ("", "0"):
             endogenous, instruments = self._parse_instruments(parts[2])
         
-        # 4th pipe segment (cluster) is deprecated → move to se_method dict
         cluster = None
         if len(parts) > 3 and parts[3].strip() not in ("", "0"):
-            warnings.warn(
-                "Specifying the cluster variable in the formula (4th pipe segment) "
-                "is deprecated and will be removed in a future version. "
-                "Use se_method={'CRV1': 'cluster_var'} instead.",
-                DeprecationWarning,
-                stacklevel=4,
+            raise ValueError(
+                "Cluster variables are no longer supported in the 4th pipe segment. "
+                "Use se_method={'CRV1': 'cluster_var'} instead."
             )
-            cluster_vars = self._parse_variable_list(parts[3], VariableRole.CLUSTER)
-            if len(cluster_vars) > 1:
-                raise ValueError("Only one cluster variable is allowed in the formula")
-            cluster = cluster_vars[0] if cluster_vars else None
         
         return Formula(
             outcomes=tuple(outcomes),
@@ -1340,12 +1326,7 @@ class FormulaParser:
 
             (endog ~ inst1 + inst2)
             (endog1 + endog2 ~ inst1 + inst2 + inst3)
-
-        The legacy format ``endog(inst1 + inst2)`` is still accepted but
-        emits a :class:`DeprecationWarning`.
         """
-        import warnings
-
         iv_string = iv_string.strip()
 
         # ── New fixest-style: (endog ~ instruments) ──────────────────────────
@@ -1369,44 +1350,10 @@ class FormulaParser:
                     )
                 return endogenous, instruments
 
-        # ── Legacy format: endog(inst1 + inst2) ──────────────────────────────
-        warnings.warn(
-            "The IV syntax 'endog(inst1 + inst2)' is deprecated.  "
-            "Use the fixest-style '(endog ~ inst1 + inst2)' in the 3rd pipe "
-            "segment instead, e.g.  'y ~ x | fe | (endog ~ z1 + z2)'.",
-            DeprecationWarning,
-            stacklevel=5,
+        raise ValueError(
+            "IV specification must use fixest-style syntax '(endog ~ inst1 + inst2)' "
+            f"in the 3rd pipe segment. Got: {iv_string!r}"
         )
-
-        paren_start = self._find_instrument_paren_start(iv_string)
-        
-        if paren_start == -1 or ')' not in iv_string[paren_start:]:
-            raise ValueError(
-                "IV specification must be in format: (endog ~ inst1 + inst2) "
-                f"[fixest-style] or endog(inst1 + inst2) [legacy].  Got: {iv_string!r}"
-            )
-        
-        paren_end = iv_string.rindex(')')
-        
-        endog_part = iv_string[:paren_start].strip()
-        inst_part  = iv_string[paren_start + 1:paren_end].strip()
-        
-        if not endog_part or not inst_part:
-            raise ValueError(
-                "IV specification requires both endogenous variables and instruments. "
-                f"Got endogenous: '{endog_part}', instruments: '{inst_part}'"
-            )
-        
-        endogenous  = self._parse_variable_list(endog_part, VariableRole.ENDOGENOUS)
-        instruments = self._parse_variable_list(inst_part,  VariableRole.INSTRUMENT)
-        
-        if len(instruments) < len(endogenous):
-            raise ValueError(
-                f"Number of instruments ({len(instruments)}) must be at least "
-                f"equal to number of endogenous variables ({len(endogenous)})"
-            )
-        
-        return endogenous, instruments
     
     @staticmethod
     def resolve_numeric_merge(formula: "Formula", conn, table_name: str) -> "Formula":

@@ -3,7 +3,7 @@
 """
 
 from ._version import __version__, get_version, get_version_info
-from .duckreg import duckreg, compressed_ols, DuckReg, SEMethod
+from .duckreg import duckreg, SEMethod
 from .utils.api import FEMethod
 from .core.fitters.base import FitterResult
 from .core.fitters.numpy_fitter import NumpyFitter
@@ -26,8 +26,6 @@ __all__ = [
     "get_version_info",
     # High-level API
     "duckreg",
-    "compressed_ols",  # Backward compatibility alias
-    "DuckReg",
     "SEMethod",
     "FEMethod",
     # Estimators

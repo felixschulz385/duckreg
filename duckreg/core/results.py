@@ -90,6 +90,44 @@ class RegressionResults:
             data['ci_lower'] = self.coefficients.flatten() - 1.96 * self.std_errors
             data['ci_upper'] = self.coefficients.flatten() + 1.96 * self.std_errors
         return pd.DataFrame(data)
+
+    def tidy(self) -> pd.DataFrame:
+        """Return coefficient results as a tidy DataFrame."""
+        return self.to_tidy_df()
+
+    def coef(self) -> pd.Series:
+        """Return coefficient estimates indexed by variable name."""
+        return pd.Series(self.coefficients.flatten(), index=self.coef_names, name="estimate")
+
+    def se(self) -> pd.Series:
+        """Return standard errors indexed by variable name."""
+        if self.std_errors is None:
+            return pd.Series(dtype=float, name="std_error")
+        return pd.Series(self.std_errors, index=self.coef_names, name="std_error")
+
+    def tstat(self) -> pd.Series:
+        """Return t-statistics indexed by variable name."""
+        if self.t_stats is None:
+            return pd.Series(dtype=float, name="t_stat")
+        return pd.Series(self.t_stats, index=self.coef_names, name="t_stat")
+
+    def pvalue(self) -> pd.Series:
+        """Return p-values indexed by variable name."""
+        if self.p_values is None:
+            return pd.Series(dtype=float, name="p_value")
+        return pd.Series(self.p_values, index=self.coef_names, name="p_value")
+
+    def confint(self) -> pd.DataFrame:
+        """Return 95% confidence intervals indexed by variable name."""
+        if self.std_errors is None:
+            return pd.DataFrame(columns=["ci_lower", "ci_upper"], index=self.coef_names)
+        values = np.column_stack(
+            [
+                self.coefficients.flatten() - 1.96 * self.std_errors,
+                self.coefficients.flatten() + 1.96 * self.std_errors,
+            ]
+        )
+        return pd.DataFrame(values, index=self.coef_names, columns=["ci_lower", "ci_upper"])
     
     def to_string(self, precision: int = 4) -> str:
         """Generate a printable text summary of results.

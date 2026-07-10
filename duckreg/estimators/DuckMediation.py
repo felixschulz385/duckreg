@@ -486,7 +486,7 @@ class DuckMediation(DuckEstimator):
                 se_type=vcov_meta.get("vcov_type_detail", se_method),
             )
 
-        self.se    = vcov_spec.vcov_detail
+        self._se_type = vcov_spec.vcov_detail
         self.vcov  = eq_results.get("__outcome__", RegressionResults(
             np.array([]), [], None, None
         )).vcov
@@ -504,7 +504,7 @@ class DuckMediation(DuckEstimator):
             outcome_result=outcome_result,
             effects=effects,
             n_obs=self.n_obs,
-            se_type=self.se,
+            se_type=self._se_type,
         )
         # Reset cached single-equation result to prevent stale access
         self._results = None

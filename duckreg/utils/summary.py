@@ -1,23 +1,12 @@
-"""
-Summary formatting for regression and 2SLS results.
+"""Summary formatting for regression and 2SLS results."""
 
-This module provides comprehensive formatting for model output, including:
-- Model specification (estimator, variables, FE, clustering)
-- Sample information with compression ratios
-- Coefficient results with significance indicators
-- First stage diagnostics for IV models
-"""
-
-import pandas as pd
 from typing import Union, Optional, Dict, Any
-
-from ..core.results import RegressionResults, FirstStageResults
-
 
 def format_model_summary(
     model_summary: Dict[str, Any],
     spec_config: Optional[Dict[str, Any]] = None,
-    precision: int = 4
+    precision: int = 4,
+    include_diagnostics: bool = True,
 ) -> str:
     """Format comprehensive model summary for printing and storage.
     
@@ -28,9 +17,10 @@ def format_model_summary(
     - First stage diagnostics for IV models
     
     Args:
-        model_summary: Model summary dictionary from estimator.summary()
+        model_summary: Model summary dictionary from estimator.as_dict()
         spec_config: Optional specification config with description
         precision: Number of decimal places for display
+        include_diagnostics: Whether to include IV diagnostics / first-stage output
         
     Returns:
         Formatted string suitable for console output and file storage
@@ -190,7 +180,7 @@ def format_model_summary(
     first_stage = model_summary.get('first_stage')
     iv_diagnostics = model_summary.get('iv_diagnostics')
     
-    if first_stage and iv_diagnostics:
+    if include_diagnostics and first_stage and iv_diagnostics:
         lines.append("\n" + "=" * 80)
         lines.append("FIRST STAGE DIAGNOSTICS (IV/2SLS)")
         lines.append("=" * 80)
@@ -249,60 +239,17 @@ def format_model_summary(
 
 # Backward compatibility: convenience functions and SummaryFormatter class
 def format_summary(
-    result: Union[RegressionResults, FirstStageResults, Dict[str, Any]],
+    result: Union[Dict[str, Any], str],
     precision: int = 4,
     include_diagnostics: bool = True
 ) -> str:
     """Format results for console output."""
     if isinstance(result, dict):
-        return format_model_summary(result, precision=precision)
-    else:
-        return str(result)
-
-
-def print_summary(
-    result: Union[RegressionResults, FirstStageResults, Dict[str, Any]],
-    precision: int = 4,
-    include_diagnostics: bool = True
-):
-    """Print formatted results to console."""
-    print(format_summary(result, precision, include_diagnostics))
-
-
-def to_tidy_df(
-    result: Union[RegressionResults, FirstStageResults, Dict[str, Any]]
-) -> pd.DataFrame:
-    """Convert results to tidy DataFrame."""
-    if isinstance(result, (RegressionResults, FirstStageResults)):
-        return result.to_tidy_df()
-    return pd.DataFrame()
-
-
-class SummaryFormatter:
-    """Backward-compatible summary formatter (use format_model_summary() instead)."""
-    
-    @staticmethod
-    def format(
-        result: Union[RegressionResults, FirstStageResults, Dict[str, Any]],
-        precision: int = 4,
-        include_diagnostics: bool = True
-    ) -> str:
-        """Format results from dict or result objects."""
-        return format_summary(result, precision, include_diagnostics)
-    
-    @staticmethod
-    def print(
-        result: Union[RegressionResults, FirstStageResults, Dict[str, Any]],
-        precision: int = 4,
-        include_diagnostics: bool = True
-    ):
-        """Print formatted results to console."""
-        print_summary(result, precision, include_diagnostics)
-    
-    @staticmethod
-    def to_tidy_df(
-        result: Union[RegressionResults, FirstStageResults, Dict[str, Any]]
-    ) -> pd.DataFrame:
-        """Convert results to tidy DataFrame."""
-        return to_tidy_df(result)
-
+        return format_model_summary(
+            result,
+            precision=precision,
+            include_diagnostics=include_diagnostics,
+        )
+    if isinstance(result, str):
+        return result
+    return str(result)

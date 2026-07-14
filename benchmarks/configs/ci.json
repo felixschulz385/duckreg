@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "description": "Tiny two-package CI integration profile.",
+  "packages": ["duckreg", "pyfixest"],
+  "seed": 20260714,
+  "warmups": 0,
+  "repetitions": 1,
+  "tracks": [
+    {
+      "kind": "matrix",
+      "name": "ci",
+      "N": [2000],
+      "K": [2],
+      "models": ["pooled", "fe", "iv"],
+      "vcovs": ["HC1"],
+      "data_regimes": ["continuous"],
+      "threads": [1],
+      "fe_divisors": [50, 200]
+    }
+  ]
+}

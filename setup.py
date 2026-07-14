@@ -35,7 +35,7 @@ def read_long_description():
 setup(
     name="duckreg",
     version=get_version(),
-    packages=find_packages(),
+    packages=find_packages(exclude=("benchmarks", "benchmarks.*")),
     install_requires=read_requirements(),
     author="Apoorva Lal",
     author_email="lal.apoorva@gmail.com",

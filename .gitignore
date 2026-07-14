@@ -10,6 +10,7 @@ dist/*
 *.log
 **/log
 benchmarks/results
+benchmarks/runs/
 *.bbl
 *.bcf
 *.fls

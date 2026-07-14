@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "description": "DuckReg-only component diagnostics.",
+  "packages": ["duckreg"],
+  "seed": 20260714,
+  "warmups": 0,
+  "repetitions": 1,
+  "tracks": [
+    {
+      "kind": "diagnostics",
+      "name": "diagnostics",
+      "base": {
+        "N": 80000,
+        "K": 5,
+        "nFE1": 4000,
+        "nFE2": 100,
+        "data_regime": "continuous",
+        "threads": 1
+      },
+      "benchmarks": ["cluster_scores", "map_numpy", "map_duckdb", "automatic_compression"]
+    }
+  ]
+}

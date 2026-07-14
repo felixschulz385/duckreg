@@ -1,0 +1,15 @@
+name: duckreg-bench
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy=2.2
+  - pandas=3.0
+  - duckdb=1.5
+  - numba=0.65
+  - matplotlib
+  - pyarrow
+  - pip
+  - pip:
+      - pyfixest==0.50.1
+      - -e .

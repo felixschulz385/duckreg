@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "description": "Opt-in 100M-row and file-backed scalability suite.",
+  "packages": ["duckreg", "pyfixest"],
+  "seed": 20260714,
+  "warmups": 0,
+  "repetitions": 1,
+  "tracks": [
+    {
+      "kind": "comparison",
+      "name": "stress_comparison",
+      "N": [100000000],
+      "K": [5],
+      "models": ["pooled", "fe", "iv"],
+      "vcovs": ["HC1", "CRV1"],
+      "data_regimes": ["continuous"],
+      "threads": [4],
+      "fe_divisors": [100, 500]
+    },
+    {
+      "kind": "comparison",
+      "name": "stress_width",
+      "N": [100000000],
+      "K": [20],
+      "models": ["pooled", "fe", "iv"],
+      "vcovs": ["HC1"],
+      "data_regimes": ["continuous"],
+      "threads": [4],
+      "fe_divisors": [100, 500]
+    },
+    {
+      "kind": "out_of_core",
+      "name": "out_of_core",
+      "N": [10000000, 100000000],
+      "K": [5],
+      "models": ["fe", "iv"],
+      "vcovs": ["CRV1"],
+      "data_regimes": ["continuous"],
+      "threads": [4],
+      "fe_divisors": [100, 500]
+    }
+  ]
+}

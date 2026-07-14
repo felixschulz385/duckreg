@@ -1,65 +1,106 @@
-# DuckReg Benchmarks
+# DuckReg benchmark suite
 
+This suite produces reproducible DuckReg-versus-pyfixest comparisons. It uses
+deterministic workloads, isolated package processes, numerical parity checks,
+and immutable run manifests. Benchmark outputs are written below `runs/` and
+are ignored by Git.
 
-## Key components
-
-- `performance_benchmark.ipynb` – notebook that checks for
-  `benchmark_results_large.csv` (in `results/`), triggers
-  `scripts/orchestrate.py` if necessary, and visualises the results.
-
-- `scripts/orchestrate.py` – builds the full grid of parameter combinations,
-  submits one `run_single_benchmark.sh` job per combo (throttled to a
-  configurable maximum), tracks submissions in `manifest.csv`, and upon
-  completion calls `collect_results.py` to merge JSON outputs.
-
-- `scripts/run_single_benchmark.sh` – SLURM wrapper invoked by the orchestrator.
-  It activates the conda environment and runs `run_single.py` with the
-  arguments supplied by `orchestrate.py`.
-
-- `scripts/run_single.py` – generates synthetic data, runs either `duckreg` or
-  `pyfixest` for a single configuration, times the execution, and writes a
-  JSON record to the chosen results directory.
-
-- `scripts/collect_results.py` – aggregates the individual JSON files from the
-  results directory into one CSV, flags missing runs / OOM kills by
-  scanning `log/`, and is used by both the orchestrator and the notebook.
-
-- `scripts/slurm_benchmark.sh` – optional top‑level SLURM script that simply
-  launches `orchestrate.py` in one job.  Pass an output directory name
-  (default `results`) if you want to override the location of the JSON
-  outputs.
-
-- `benchmark_results_large.csv` – the merged results file produced by the
-  orchestrator; this is what the notebook reads.  It is generated, not
-  edited manually.
-
-- `log/` – directory containing SLURM stdout/err logs for each per‑combo
-  job.  Useful for diagnosing OOM kills.
-
-- `results/` (or other directory you specify) – holds the per‑run JSON
-  result files; these can be deleted once `benchmark_results_large.csv`
-  exists.
-
-## Typical usage
+Create the dedicated Python 3.11 benchmark environment with:
 
 ```bash
-# submit orchestrated grid via SLURM
-sbatch scripts/slurm_benchmark.sh
-# or run the orchestrator directly on a login node
-python scripts/orchestrate.py --results-dir results
-
-# once finished, open the notebook to explore or rerun
-jupyter notebook performance_benchmark.ipynb
+conda env create -f benchmarks/environment.yml
+conda activate duckreg-bench
 ```
 
-## Cleaning up
+## Profiles
 
-After collecting results you can safely remove:
+| Profile | Purpose | Measurements |
+| --- | --- | --- |
+| `smoke` | Fast local pooled, FE, and IV coverage for HC1 and CRV1 | One cold fit |
+| `standard` | 28 controlled scaling, width, compression, FE-cardinality, and threading scenarios | One cold fit and five steady fits |
+| `stress` | Opt-in 100M-row and DuckReg file-backed cases | One cold fit |
+| `diagnostics` | DuckReg MAP, cluster-score, and compression components | One cold measurement |
 
-- `results/*.json` (intermediate files)
-- `manifest.csv` if you want to restart from scratch
-- `log/slurm-*.err` if you don’t need them
+The standard profile changes one performance dimension at a time. Its scaling
+track covers 100K, 1M, and 10M rows. Additional scenarios isolate 20-covariate
+width, compressible inputs, low/high FE cardinality, and four-thread execution.
 
-The remaining Python scripts and the notebook are kept for future
-benchmark runs.
+## Commands
 
+Run the local smoke profile:
+
+```bash
+python benchmarks/bench.py run --profile smoke
+```
+
+Submit resource-bucketed SLURM arrays:
+
+```bash
+python benchmarks/bench.py submit \
+  --profile standard \
+  --partition scicore \
+  --max-concurrent 4
+```
+
+`submit` prints the run ID. Reusing it resumes a run and submits only scenarios
+whose package result is absent or unsuccessful:
+
+```bash
+python benchmarks/bench.py submit --profile standard --run-id RUN_ID
+```
+
+Collect or regenerate a report independently:
+
+```bash
+python benchmarks/bench.py collect --run-id RUN_ID --report
+python benchmarks/bench.py report --run-id RUN_ID
+```
+
+Use `--dry-run` with `submit` to inspect the generated `sbatch` commands.
+
+## Measurement contract
+
+- Package imports, formula construction, and deterministic data generation are
+  outside the fit timer. Data-generation time is reported separately.
+- Both packages receive the same pandas input in comparison tracks. File-backed
+  scenarios are DuckReg-only and are reported separately.
+- Package workers run in isolated processes with the same thread environment.
+  On SLURM, they run as independent `srun` steps on the same allocation.
+- The standard profile reports steady-state median and interquartile range.
+  Cold-start time remains available in the raw results.
+- Peak process RSS and SLURM accounting data are recorded when available.
+- Pooled/FE coefficients and standard errors use relative tolerances of `1e-6`
+  and `1e-3`; IV uses `1e-3` and `1e-2`. Observation counts must match exactly.
+  Invalid comparisons retain their timings but are excluded from speedups.
+
+The IV generator is genuinely endogenous: treatment contains part of the
+outcome disturbance and is identified by an independent strong instrument.
+Balanced and sparse FE structures and continuous and compressible covariates
+are represented by the profiles.
+
+## Run layout
+
+Each `runs/<run_id>/` directory contains:
+
+- `run.json`: Git, Python, package, OS, and hardware provenance.
+- `tasks.jsonl`: immutable expanded scenarios and resource assignments.
+- `raw/<scenario>/<package>.json`: atomic package-level measurements.
+- `results.csv` and `summary.csv`: normalized raw and aggregated results.
+- `report.html` and `report_assets/`: deterministic tables and plots.
+- `logs/`: SLURM stdout/stderr.
+
+Statuses distinguish missing or malformed output, Python exceptions, numerical
+mismatches, convergence failures, timeouts, and OOM failures. Reports calculate
+speedups only for complete numerically valid package pairs and use geometric
+means for track-level summaries.
+
+## SLURM behavior
+
+Scenarios are grouped by CPU, memory, and time requirements. Defaults are 32 GB
+and one hour through 1M rows, 64 GB and four hours at 10M rows, and 192 GB and
+six hours at 100M rows. The collection job uses an `afterany` dependency, so no
+coordinator job polls the queue. Run-specific node-local scratch prevents
+DuckDB spill-file collisions.
+
+The JSON files in `configs/` are the versioned workload definitions. Change or
+add a profile rather than editing the runner for a new experiment.

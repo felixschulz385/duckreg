@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "description": "Controlled one-factor-at-a-time comparison suite (28 scenarios).",
+  "packages": ["duckreg", "pyfixest"],
+  "seed": 20260714,
+  "warmups": 1,
+  "repetitions": 5,
+  "tracks": [
+    {
+      "kind": "matrix",
+      "name": "scaling",
+      "N": [100000, 1000000, 10000000],
+      "K": [5],
+      "models": ["pooled"],
+      "vcovs": ["HC1"],
+      "data_regimes": ["continuous"],
+      "threads": [1],
+      "fe_divisors": [100, 500]
+    },
+    {
+      "kind": "matrix",
+      "name": "scaling",
+      "N": [100000, 1000000, 10000000],
+      "K": [5],
+      "models": ["fe", "iv"],
+      "vcovs": ["HC1", "CRV1"],
+      "data_regimes": ["continuous"],
+      "threads": [1],
+      "fe_divisors": [100, 500]
+    },
+    {
+      "kind": "matrix",
+      "name": "compression",
+      "N": [1000000],
+      "K": [5],
+      "models": ["pooled", "fe", "iv"],
+      "vcovs": ["HC1"],
+      "data_regimes": ["continuous", "compressible"],
+      "threads": [1],
+      "fe_divisors": [10000, 20000]
+    },
+    {
+      "kind": "matrix",
+      "name": "width",
+      "N": [1000000],
+      "K": [20],
+      "models": ["pooled", "fe", "iv"],
+      "vcovs": ["HC1"],
+      "data_regimes": ["continuous"],
+      "threads": [1],
+      "fe_divisors": [100, 500]
+    },
+    {
+      "kind": "fe_cardinality",
+      "name": "fe_cardinality",
+      "base": {
+        "N": 1000000,
+        "K": 5,
+        "model": "fe",
+        "vcov": "CRV1",
+        "threads": 1,
+        "data_regime": "continuous",
+        "fe_structure": "sparse"
+      },
+      "levels": [[100, 100], [200000, 50000]]
+    },
+    {
+      "kind": "matrix",
+      "name": "threading",
+      "N": [10000000],
+      "K": [5],
+      "models": ["fe", "iv"],
+      "vcovs": ["CRV1"],
+      "data_regimes": ["continuous"],
+      "threads": [4],
+      "fe_divisors": [100, 500]
+    }
+  ]
+}

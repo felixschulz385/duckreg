@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "description": "Fast local end-to-end correctness and reporting check.",
+  "packages": ["duckreg", "pyfixest"],
+  "seed": 20260714,
+  "warmups": 0,
+  "repetitions": 1,
+  "tracks": [
+    {
+      "kind": "matrix",
+      "name": "smoke",
+      "N": [20000],
+      "K": [3],
+      "models": ["pooled", "fe", "iv"],
+      "vcovs": ["HC1", "CRV1"],
+      "data_regimes": ["continuous"],
+      "threads": [1],
+      "fe_divisors": [100, 500]
+    }
+  ]
+}

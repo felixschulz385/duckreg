@@ -104,7 +104,7 @@ class IterativeDemeanTransformer(FETransformer):
         carry_cols: Optional[List[str]] = None,
         max_iterations: int = 1000,
         tolerance: float = 1e-8,
-        check_interval: int = 5,
+        check_interval: int = 2,
         convergence_sample: float = 1.0,
         min_iterations_before_check: int = 5,
         check_interval_growth: bool = True,
@@ -610,12 +610,11 @@ class IterativeDemeanTransformer(FETransformer):
                     "Skipping singleton pruning; using null-filtered sample directly"
                 )
 
+            # The singleton-pruned work table already has the final schema.
+            # Rename it into place to avoid a full-table copy.
+            self.conn.execute(f"DROP TABLE IF EXISTS {result_table_sql}")
             self.conn.execute(
-                f"""
-                CREATE OR REPLACE TABLE {result_table_sql} AS
-                SELECT *
-                FROM {singleton_work_sql}
-                """
+                f"ALTER TABLE {singleton_work_sql} RENAME TO {result_table_sql}"
             )
         finally:
             self._drop_tables_if_exist(["_singleton_work", "_singleton_next"])
@@ -841,25 +840,22 @@ class IterativeDemeanTransformer(FETransformer):
 
     def _build_convergence_sql(self, resid_cols: List[str], source_relation: str) -> str:
         """Build SQL for the maximum absolute remaining FE-group mean."""
-        dim_parts = []
-        for spec in self._fe_code_map:
-            code_sql = self.qident(spec["code_col"])
-            avg_aliases = [f"_avg_{idx}" for idx, _ in enumerate(resid_cols)]
-            dim_parts.append(
-                "SELECT UNNEST(["
-                + ", ".join(self.qident(alias) for alias in avg_aliases)
-                + "]) AS avg_val "
-                "FROM (SELECT "
-                + ", ".join(
-                    f"AVG({self.qident(resid_col)}) AS {self.qident(avg_aliases[idx])}"
-                    for idx, resid_col in enumerate(resid_cols)
-                )
-                + f" FROM {source_relation} GROUP BY {code_sql}) _agg"
-            )
-
+        avg_aliases = [f"_avg_{idx}" for idx, _ in enumerate(resid_cols)]
+        averages = ", ".join(
+            f"AVG({self.qident(resid_col)}) AS {self.qident(avg_aliases[idx])}"
+            for idx, resid_col in enumerate(resid_cols)
+        )
+        grouping_sets = ", ".join(
+            f"({self.qident(spec['code_col'])})" for spec in self._fe_code_map
+        )
         return (
-            "SELECT MAX(ABS(avg_val)) AS max_group_mean "
-            f"FROM ({' UNION ALL '.join(dim_parts)}) t"
+            "SELECT MAX(ABS(avg_val)) AS max_group_mean FROM ("
+            "SELECT UNNEST(["
+            + ", ".join(self.qident(alias) for alias in avg_aliases)
+            + "]) AS avg_val FROM (SELECT "
+            + averages
+            + f" FROM {source_relation} GROUP BY GROUPING SETS ({grouping_sets})) _agg"
+            ") _means"
         )
 
     def _build_group_sampled_convergence_sql(

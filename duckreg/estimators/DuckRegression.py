@@ -149,7 +149,7 @@ class DuckRegression(DuckLinearModel):
             [f"sum_{v.sql_name}_sq" for v in self.formula.outcomes]
         )
 
-    def _ensure_data_fetched(self):
+    def _ensure_data_fetched(self, force: bool = False):
         """Override to handle column renaming after fetch"""
         if self._data_fetched:
             return

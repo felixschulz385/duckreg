@@ -58,7 +58,7 @@ class DuckLinearModel(DuckEstimator):
         table_name: str,
         seed: int,
         formula=None,
-        compression: int = None,
+        compression: Any = "auto",
         duckdb_kwargs: dict = None,
         subset: str = None,
         fitter: str = "numpy",
@@ -144,6 +144,11 @@ class DuckLinearModel(DuckEstimator):
     @property
     def df_compressed(self) -> Optional[pd.DataFrame]:
         """Compressed data, fetched lazily for DuckDB-backed workflows."""
+        if self._closed and self._df_compressed is None:
+            raise RuntimeError(
+                "Compressed data were released when fitting completed. "
+                "Refit with retain_compressed=True to preserve df_compressed."
+            )
         if not self._data_fetched and self.agg_query is not None and self.conn is not None:
             self._ensure_data_fetched(force=True)
         return self._df_compressed
@@ -346,6 +351,8 @@ class DuckLinearModel(DuckEstimator):
         
         y, X, n = self.collect_data(data=self.df_compressed)
         cluster_ids = self._get_cluster_ids_from_df()
+        self._numpy_y, self._numpy_X = y, X
+        self._numpy_weights, self._numpy_cluster_ids = n, cluster_ids
         
         numpy_fitter = NumpyFitter(alpha=1e-8, se_type="stata")
         self._fitter_result = numpy_fitter.fit(
@@ -453,10 +460,13 @@ class DuckLinearModel(DuckEstimator):
     
     def _fit_vcov_numpy(self):
         """Compute vcov using numpy (in-memory) backend via NumpyFitter"""
-        self._ensure_data_fetched()
-        
-        y, X, n = self.collect_data(data=self.df_compressed)
-        cluster_ids = self._get_cluster_ids_from_df()
+        if getattr(self, "_numpy_X", None) is None:
+            self._ensure_data_fetched()
+            y, X, n = self.collect_data(data=self.df_compressed)
+            cluster_ids = self._get_cluster_ids_from_df()
+        else:
+            y, X, n = self._numpy_y, self._numpy_X, self._numpy_weights
+            cluster_ids = self._numpy_cluster_ids
         k_fe, n_fe, k_fe_nested, n_fe_fully_nested = self._get_vcov_fe_params()
         
         # Resolve vcov_spec: use stored spec or default to HC1
@@ -477,6 +487,7 @@ class DuckLinearModel(DuckEstimator):
             n_fe=n_fe,
             k_fe_nested=k_fe_nested,
             n_fe_fully_nested=n_fe_fully_nested,
+            existing_result=self._fitter_result,
         )
 
         self.vcov = vcov
@@ -485,6 +496,7 @@ class DuckLinearModel(DuckEstimator):
         self.vcov_meta = vcov_meta
         self._se_type = vcov_meta.get('vcov_type_detail', vcov_spec.vcov_detail)
         self._results = None
+        self._release_numpy_state()
 
     def _fit_vcov_duckdb(self):
         """Compute vcov using DuckDB (out-of-core) backend"""

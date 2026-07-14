@@ -40,12 +40,17 @@ def duckreg(
     cache_dir: str = None,
     db_name: str = None,
     # ── Engine settings ──────────────────────────────────────────────────────
-    fitter: str = "numpy",
-    compression: Optional[int] = None,
+    fitter: str = "auto",
+    compression: Union[str, int, None] = "auto",
+    demean_backend: str = "auto",
+    retain_compressed: bool = False,
+    threads: Optional[int] = None,
+    memory_limit: Optional[str] = None,
+    max_temp_directory_size: Optional[str] = None,
     seed: int = 42,
     max_iterations: int = 1000,
     tolerance: float = 1e-8,
-    check_interval: int = 10,
+    check_interval: int = 2,
     convergence_sample: float = 1.0,
     min_iterations_before_check: int = 5,
     check_interval_growth: bool = True,
@@ -57,7 +62,6 @@ def duckreg(
     # ── FE classification settings ────────────────────────────────────────────
     fe_types: Optional[Dict] = None,
     max_fixed_fe_levels: Optional[int] = None,
-    # ── DuckDB resource kwargs: threads, memory_limit, max_temp_directory_size
     **kwargs,
 ) -> object:
     """High-level API for DuckReg regression with lfe/fixest-style formula.
@@ -156,6 +160,11 @@ def duckreg(
     """
     logger.debug("=== duckreg START ===")
 
+    if fitter not in {"auto", "numpy", "duckdb"}:
+        raise ValueError("fitter must be 'auto', 'numpy', or 'duckdb'")
+    if demean_backend not in {"auto", "numpy", "duckdb"}:
+        raise ValueError("demean_backend must be 'auto', 'numpy', or 'duckdb'")
+
     if isinstance(se_method, str) and se_method == "BS":
         raise ValueError(
             "Bootstrap standard errors are no longer supported. "
@@ -165,9 +174,7 @@ def duckreg(
     # ------------------------------------------------------------------
     # 1. Extract and validate DuckDB / resource kwargs
     # ------------------------------------------------------------------
-    threads = int(kwargs.pop("threads", 1))
-    memory_limit = kwargs.pop("memory_limit", None)
-    max_temp_dir_size = kwargs.pop("max_temp_directory_size", None)
+    max_temp_dir_size = max_temp_directory_size
 
     removed_kwargs = []
     for name in ("bootstrap", "round_strata", "n_jobs", "duckdb_kwargs", "n_bootstraps"):
@@ -188,7 +195,9 @@ def duckreg(
 
     # Build DuckDB config dict from extracted resource kwargs
     duckdb_kwargs: Dict[str, Any] = {}
-    if threads != 1:
+    if threads is not None:
+        if not isinstance(threads, int) or isinstance(threads, bool) or threads < 1:
+            raise ValueError("threads must be a positive integer or None")
         duckdb_kwargs["threads"] = threads
     if memory_limit is not None:
         duckdb_kwargs["memory_limit"] = memory_limit
@@ -198,11 +207,11 @@ def duckreg(
     # ------------------------------------------------------------------
     # 2. Compression settings
     # ------------------------------------------------------------------
-    if compression is not None and not isinstance(compression, int):
+    if compression != "auto" and compression is not None and not isinstance(compression, int):
         raise TypeError(
-            f"compression must be an integer or None, got {type(compression)!r}"
+            f"compression must be 'auto', an integer, or None, got {type(compression)!r}"
         )
-    if compression is not None and compression < -1:
+    if isinstance(compression, int) and compression < -1:
         raise ValueError(
             f"compression must be >= -1 or None, got {compression!r}"
         )
@@ -247,10 +256,9 @@ def duckreg(
     # ------------------------------------------------------------------
     # 6. Build VcovSpec (once at the API boundary)
     # ------------------------------------------------------------------
-    vcov_spec = VcovSpec.build(
-        se_method=se_method if se_method not in (SEMethod.NONE, "none") else SEMethod.HC1,
-        has_fixef=bool(fe_cols),
-        is_iv=has_iv,
+    no_vcov = se_method in (SEMethod.NONE, "none")
+    vcov_spec = None if no_vcov else VcovSpec.build(
+        se_method=se_method, has_fixef=bool(fe_cols), is_iv=has_iv,
     )
 
     # ------------------------------------------------------------------
@@ -267,6 +275,8 @@ def duckreg(
         fitter=fitter,
         remove_singletons=remove_singletons,
         vcov_spec=vcov_spec,
+        retain_compressed=retain_compressed,
+        demean_backend=demean_backend,
     )
 
     # ── Mediation model (via(...) syntax) ────────────────────────────
@@ -308,6 +318,8 @@ def duckreg(
             remove_singletons=remove_singletons,
             duckdb_kwargs=duckdb_kwargs or None,
             formula=parsed_formula,
+            retain_compressed=retain_compressed,
+            demean_backend=demean_backend,
         )
 
         if obj_to_register is not None:

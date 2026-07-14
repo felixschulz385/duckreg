@@ -36,7 +36,7 @@ import pandas as pd
 
 from .DuckLinearModel import DuckLinearModel
 from ..core.transformers import AutoFETransformer, IterativeDemeanTransformer, MundlakTransformer
-from ..utils.formula_parser import TransformType
+from ..utils.formula_parser import TransformType, quote_identifier
 from ..utils.api import MUNDLAK_DISABLED_MESSAGE
 
 logger = logging.getLogger(__name__)
@@ -111,7 +111,7 @@ class DuckFE(DuckLinearModel):
         method: str = "iterative_demean",
         max_iterations: int = 1000,
         tolerance: float = 1e-8,
-        check_interval: int = 10,
+        check_interval: int = 2,
         convergence_sample: float = 1.0,
         min_iterations_before_check: int = 5,
         check_interval_growth: bool = True,
@@ -234,6 +234,25 @@ class DuckFE(DuckLinearModel):
             merged_fe_component_map=self.formula.get_merged_fe_component_map(),
         )
         if self.method == "iterative_demean":
+            backend = self.demean_backend
+            if backend == "auto":
+                try:
+                    n_rows = int(self.conn.execute(f"SELECT COUNT(*) FROM {source_table}").fetchone()[0])
+                except Exception:
+                    n_rows = 0
+                projected = 3 * n_rows * 8 * max(1, len(fe_sql_names) + len(cov_sql_names) + len(self.outcome_vars))
+                backend = "numpy" if projected < min(2 * 1024**3, self._duckdb_memory_budget()) else "duckdb"
+                self.estimated_memory = projected
+            self.resolved_demean_backend = backend
+            if backend == "numpy":
+                from ..core.transformers.numpy_demean import NumpyDemeanTransformer
+                return NumpyDemeanTransformer(
+                    **common,
+                    max_iterations=self.max_iterations,
+                    tolerance=self.tolerance,
+                    singleton_pruning=self.singleton_pruning,
+                    residual_type=self.residual_type,
+                )
             return IterativeDemeanTransformer(
                 **common,
                 max_iterations=self.max_iterations,
@@ -833,13 +852,14 @@ class DuckFE(DuckLinearModel):
                     if i == j:
                         continue
                     # B is nested in A iff every B-level maps to exactly one A-level
+                    fe_b_sql, fe_a_sql = quote_identifier(fe_b), quote_identifier(fe_a)
                     row = self.conn.execute(f"""
                         SELECT MAX(cnt) AS max_a_per_b,
-                               COUNT(DISTINCT {fe_b}) AS n_levels_b
+                               COUNT(DISTINCT {fe_b_sql}) AS n_levels_b
                         FROM (
-                            SELECT {fe_b}, COUNT(DISTINCT {fe_a}) AS cnt
+                            SELECT {fe_b_sql}, COUNT(DISTINCT {fe_a_sql}) AS cnt
                             FROM {result_table}
-                            GROUP BY {fe_b}
+                            GROUP BY {fe_b_sql}
                         ) t
                     """).fetchone()
                     if row is not None and row[0] == 1:
@@ -862,13 +882,15 @@ class DuckFE(DuckLinearModel):
             for i, fe_b in enumerate(fe_cols):
                 if i in already_nested:
                     continue
+                fe_b_sql = quote_identifier(fe_b)
+                cluster_sql = quote_identifier(cluster_col)
                 row = self.conn.execute(f"""
                     SELECT MAX(cnt) AS max_c_per_b,
-                           COUNT(DISTINCT {fe_b}) AS n_levels_b
+                           COUNT(DISTINCT {fe_b_sql}) AS n_levels_b
                     FROM (
-                        SELECT {fe_b}, COUNT(DISTINCT {cluster_col}) AS cnt
+                        SELECT {fe_b_sql}, COUNT(DISTINCT {cluster_sql}) AS cnt
                         FROM {result_table}
-                        GROUP BY {fe_b}
+                        GROUP BY {fe_b_sql}
                     ) t
                 """).fetchone()
                 if row is not None and row[0] == 1:

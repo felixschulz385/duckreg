@@ -55,12 +55,14 @@ class DuckEstimator(ABC):
         table_name: str,
         seed: int,
         n_bootstraps: int = 0,
-        fitter: str = "numpy",
+        fitter: str = "auto",
         keep_connection_open: bool = False,
-        compression: int = None,
+        compression: Any = "auto",
         round_strata: int = None,
         duckdb_kwargs: dict = None,
         remove_singletons: bool = True,
+        retain_compressed: Optional[bool] = None,
+        demean_backend: str = "auto",
     ):
         logger.debug(f"DuckEstimator.__init__: db={db_name}, table={table_name}")
         
@@ -75,16 +77,29 @@ class DuckEstimator(ABC):
                 "compression and round_strata specify different settings. "
                 "Use only one, or make them equal."
             )
-        resolved_compression = compression if compression is not None else round_strata
-        if resolved_compression is not None:
+        resolved_compression = compression if compression != "auto" else "auto"
+        if compression is None and round_strata is not None:
+            resolved_compression = round_strata
+        if resolved_compression not in (None, "auto"):
             if not isinstance(resolved_compression, int) or resolved_compression < -1:
                 raise ValueError(
                     f"compression must be an integer >= -1 or None, got {resolved_compression!r}"
                 )
         self.compression = resolved_compression
-        self.round_strata = None if resolved_compression == -1 else resolved_compression
+        self.round_strata = None if resolved_compression in (-1, "auto") else resolved_compression
         self.duckdb_kwargs = duckdb_kwargs
         self.remove_singletons = remove_singletons
+        self._legacy_lazy_compressed = retain_compressed is None
+        self.retain_compressed = bool(retain_compressed)
+        self.demean_backend = demean_backend
+        self.resolved_fitter = None if fitter == "auto" else fitter
+        self.resolved_compression = None if resolved_compression == "auto" else resolved_compression
+        self.resolved_demean_backend = None if demean_backend == "auto" else demean_backend
+        self.estimated_memory = None
+        self.compression_ratio = None
+        self.map_iterations = None
+        self.metadata: Dict[str, Any] = {}
+        self._closed = False
         
         # State
         self.conn: Optional[duckdb.DuckDBPyConnection] = None
@@ -105,6 +120,49 @@ class DuckEstimator(ABC):
         """Whether row-level compression has been disabled entirely."""
         return self.compression == -1
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def close(self):
+        """Release DuckDB resources. Safe to call more than once."""
+        if self._closed:
+            return
+        conn = self.conn
+        if conn is not None:
+            try:
+                self._cleanup_internal_objects()
+            finally:
+                try:
+                    conn.close()
+                finally:
+                    self.conn = None
+                    self._closed = True
+
+    def _cleanup_internal_objects(self):
+        """Drop scratch objects created by an estimator before closing."""
+        if self.conn is None:
+            return
+        names = {
+            getattr(self, "_COMPRESSED_VIEW", None),
+            getattr(self, "_STAGING_TABLE", None),
+            getattr(self, "_DEMEANED_STAGING", None),
+            "_fs_view", "_fs_demean_view", "_fs_first_stage_norm",
+            "demeaned_data", "design_matrix", "_numpy_demeaned_data",
+            "_iv_staging", "_duckfe_staging", "_demeaned_staging",
+            "iv_compressed", "_resid_store", "_singleton_work",
+            "_singleton_next", "_numpy_iv_demeaned",
+        }
+        for name in filter(None, names):
+            for kind in ("VIEW", "TABLE"):
+                try:
+                    self.conn.execute(f'DROP {kind} IF EXISTS "{name}"')
+                except Exception:
+                    pass
+
     def _init_connection(self):
         """Initialize DuckDB connection and RNG"""
         self.conn = duckdb.connect(self.db_name)
@@ -124,6 +182,7 @@ class DuckEstimator(ABC):
         """
         logger.debug(f"fit() START with se_method={se_method}")
 
+        self._no_vcov = se_method in (SEMethod.NONE, "none")
         # If se_method is a dict (e.g. {"CRV1": "firm_id"}), build/update
         # vcov_spec from it BEFORE prepare_data() runs so the staging table
         # includes the cluster column via _effective_cluster_col.
@@ -137,26 +196,84 @@ class DuckEstimator(ABC):
                 is_iv=is_iv,
             )
 
-        # Step 1: Prepare data (create tables, run first stages for IV, etc.)
-        self.prepare_data()
-        
-        # Step 2: Compress data for efficient estimation
-        self.compress_data()
-        
-        # Step 3: Estimate coefficients
-        self.point_estimate = self.estimate()
-        
-        # Step 4: Compute standard errors
-        self._compute_standard_errors(se_method)
-        
-        # Cleanup
-        should_keep_open_for_lazy_fetch = (
-            self.fitter == "duckdb"
-            and hasattr(self, "_data_fetched")
-            and not getattr(self, "_data_fetched")
-        )
-        if not self.keep_connection_open and not should_keep_open_for_lazy_fetch:
-            self.conn.close()
+        try:
+            try:
+                self.prepare_data()
+            except MemoryError:
+                if self.demean_backend != "auto" or self.resolved_demean_backend != "numpy":
+                    raise
+                self.demean_backend = self.resolved_demean_backend = "duckdb"
+                self.metadata["numpy_demean_memory_fallback"] = True
+                self.prepare_data()
+            self._resolve_compression_if_needed()
+            # IV and mediation staging know their analytic row count before
+            # building equation data, so resolve early enough to choose the
+            # correct setup path. Pooled/FE models resolve after compression.
+            if self.fitter == "auto" and getattr(self, "n_obs", None) is not None:
+                self._resolve_fitter_if_needed()
+            try:
+                self.compress_data()
+            except MemoryError:
+                if not getattr(self, "_fitter_was_auto", False) or self.resolved_fitter != "numpy":
+                    raise
+                self._release_numpy_state()
+                self.fitter = self.resolved_fitter = "duckdb"
+                self.metadata["numpy_memory_fallback"] = True
+                self.compress_data()
+            self._resolve_fitter_if_needed()
+            try:
+                self.point_estimate = self.estimate()
+            except MemoryError:
+                if self.fitter != "numpy" or self.resolved_fitter != "numpy" or not getattr(self, "_fitter_was_auto", False):
+                    raise
+                self._release_numpy_state()
+                self.fitter = self.resolved_fitter = "duckdb"
+                self.metadata["numpy_memory_fallback"] = True
+                self.point_estimate = self.estimate()
+            self._compute_standard_errors(se_method)
+            transformer = getattr(self, "_transformer", None) or getattr(self, "_demean_transformer", None)
+            self.map_iterations = getattr(transformer, "n_iterations", None)
+            if self.n_obs:
+                compressed_rows = getattr(self, "n_compressed_rows", None) or self.n_obs
+                self.compression_ratio = compressed_rows / self.n_obs
+            self.metadata.update({
+                "resolved_fitter": self.resolved_fitter,
+                "resolved_compression": self.resolved_compression,
+                "resolved_demean_backend": self.resolved_demean_backend,
+                "estimated_memory": self.estimated_memory,
+                "compression_ratio": self.compression_ratio,
+                "map_iterations": self.map_iterations,
+            })
+            for setting in ("threads", "memory_limit", "max_temp_directory_size"):
+                try:
+                    self.metadata[setting] = self.conn.execute(
+                        f"SELECT current_setting('{setting}')"
+                    ).fetchone()[0]
+                except Exception:
+                    pass
+            if self.retain_compressed:
+                try:
+                    if hasattr(self, "_ensure_data_fetched"):
+                        try:
+                            self._ensure_data_fetched(force=True)
+                        except TypeError:
+                            self._ensure_data_fetched()
+                    elif hasattr(type(self), "df_compressed"):
+                        _ = self.df_compressed
+                except Exception as exc:
+                    logger.debug("No materialized compressed relation to retain: %s", exc)
+            elif not self._legacy_lazy_compressed and hasattr(self, "_df_compressed"):
+                self._df_compressed = None
+                self._data_fetched = False
+            # IV and mediation keep observation-sized working arrays only until
+            # all requested covariance calculations have finished.
+            for name in ("_y", "_X_fitted", "_X_actual", "_Z", "_weights", "_cluster_ids"):
+                if hasattr(self, name):
+                    setattr(self, name, None)
+        finally:
+            keep_legacy_lazy = self._legacy_lazy_compressed and self.fitter == "duckdb"
+            if not self.keep_connection_open and not keep_legacy_lazy:
+                self.close()
         
         logger.debug(f"fit() END")
 
@@ -164,6 +281,10 @@ class DuckEstimator(ABC):
         """Dispatch standard error computation based on method"""
         # When vcov_spec is set (via duckreg API), derive the effective method from it.
         # This ensures the parsed VcovSpec is used rather than the string fallback.
+        if getattr(self, "_no_vcov", False):
+            self.vcov = None
+            self._se_type = SEMethod.NONE
+            return
         vcov_spec = getattr(self, 'vcov_spec', None)
         effective = vcov_spec.vcov_detail if vcov_spec is not None else se_method
 
@@ -189,6 +310,85 @@ class DuckEstimator(ABC):
             self.fit_vcov(effective)
         else:
             logger.warning(f"Unknown se_method '{effective}'")
+
+    def _resolve_fitter_if_needed(self):
+        if self.fitter != "auto":
+            self.resolved_fitter = self.fitter
+            return
+        self._fitter_was_auto = True
+        rows = int(getattr(self, "n_compressed_rows", None) or getattr(self, "n_obs", 0) or 0)
+        k = max(1, int(getattr(self, "_get_n_coefs", lambda: 1)()))
+        cluster_cols = len(getattr(getattr(self, "vcov_spec", None), "cluster_vars", []) or [])
+        self.estimated_memory = 3 * rows * (8 * (k + 2) + 8 * cluster_cols)
+        budget = min(2 * 1024**3, self._duckdb_memory_budget())
+        self.fitter = self.resolved_fitter = "numpy" if self.estimated_memory < budget else "duckdb"
+
+    def _resolve_compression_if_needed(self):
+        """Resolve automatic compression from a bounded deterministic sample."""
+        if self.compression != "auto":
+            self.resolved_compression = self.compression
+            return
+        formula = getattr(self, "formula", None) or getattr(self, "_formula", None)
+        keys = []
+        if formula is not None:
+            keys.extend(
+                v.sql_name for v in formula.covariates if not v.is_intercept()
+            )
+        cluster = getattr(self, "_effective_cluster_col", None)
+        if cluster:
+            keys.append(cluster)
+        # Intercept-only specifications have a single exact stratum.
+        if not keys:
+            resolved = None
+            ratio = 0.0
+        else:
+            aliases = [f"__k{i}" for i in range(len(keys))]
+            projection = ", ".join(
+                f"{key} AS {alias}" for key, alias in zip(keys, aliases)
+            )
+            distinct = ", ".join(aliases)
+            where = self._build_where_clause(getattr(self, "subset", None))
+            query = f"""
+                WITH sampled AS (
+                    SELECT {projection} FROM {self.table_name}
+                    {where}
+                    USING SAMPLE reservoir(100000 ROWS) REPEATABLE ({int(self.seed)})
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM (SELECT DISTINCT {distinct} FROM sampled)),
+                    (SELECT COUNT(*) FROM sampled)
+            """
+            try:
+                distinct_n, sample_n = self.conn.execute(query).fetchone()
+                ratio = float(distinct_n) / sample_n if sample_n else 0.0
+            except Exception:
+                # Expression-heavy formulas are resolved against transformed
+                # columns later; disabling grouping remains exact and safe.
+                ratio = 1.0
+            resolved = None if ratio <= 0.75 else -1
+        self.compression = self.resolved_compression = resolved
+        self.round_strata = None
+        self.metadata["compression_sample_ratio"] = ratio
+
+    def _duckdb_memory_budget(self) -> int:
+        """Return forty percent of DuckDB's effective memory limit."""
+        try:
+            raw = self.conn.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+            units = {"B": 1, "KB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4,
+                     "KIB": 1024, "MIB": 1024**2, "GIB": 1024**3, "TIB": 1024**4}
+            parts = str(raw).upper().replace(" ", "").rstrip("B")
+            import re
+            match = re.fullmatch(r"([0-9.]+)([KMGT]?I?)", parts)
+            if match:
+                suffix = (match.group(2) + "B") if match.group(2) else "B"
+                return int(float(match.group(1)) * units[suffix] * 0.4)
+        except Exception:
+            pass
+        return 2 * 1024**3
+
+    def _release_numpy_state(self):
+        for name in ("_numpy_X", "_numpy_y", "_numpy_weights", "_numpy_cluster_ids"):
+            setattr(self, name, None)
 
     # -------------------------------------------------------------------------
     # Abstract methods - must be implemented by subclasses

@@ -166,19 +166,14 @@ class DuckRidge(DuckEstimator):
             y_train, X_train, n_train = self.collect_data(train_data)
             y_test, X_test, n_test = self.collect_data(test_data)
 
-            # Fit for each lambda and compute test error
-            for i, lam in enumerate(self.lambda_grid):
-                # Fit on training data
-                beta_hat = ridge_closed_form(X_train, y_train, n_train, lam)
-
-                # Predict on test data
-                y_pred = X_test @ beta_hat
-
-                # Weighted MSE
-                mse = np.sum(
-                    n_test * (y_test.flatten() - y_pred.flatten()) ** 2
-                ) / np.sum(n_test)
-                cv_errors[i, fold] = mse
+            path = ridge_closed_form_batch(
+                X_train, y_train.reshape(-1, 1), n_train, self.lambda_grid
+            )
+            predictions = X_test @ path.T
+            errors = y_test.reshape(-1, 1) - predictions
+            cv_errors[:, fold] = (
+                (n_test.reshape(-1, 1) * errors ** 2).sum(axis=0) / n_test.sum()
+            )
 
         # Average CV errors across folds
         self.cv_scores = np.mean(cv_errors, axis=1)

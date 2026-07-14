@@ -48,6 +48,7 @@ import pandas as pd
 from .base import DuckEstimator
 from ..core.transformers import MundlakTransformer, IterativeDemeanTransformer, AutoFETransformer
 from ..core.fitters.numpy_fitter import NumpyFitter
+from ..core.fitters.base import FitterResult
 from ..core.fitters.duckdb_fitter import DuckDBFitter
 from ..core.vcov import VcovSpec
 from ..core.results import RegressionResults, FirstStageResults
@@ -202,6 +203,9 @@ class Duck2SLS(DuckEstimator):
             f"instruments={self.instrument_vars}, method={self.method}"
         )
 
+    def _get_n_coefs(self) -> int:
+        return len(self.exogenous_vars) + len(self.endogenous_vars) + (0 if self.fe_cols else 1)
+
     # =========================================================================
     # Properties
     # =========================================================================
@@ -209,6 +213,11 @@ class Duck2SLS(DuckEstimator):
     @property
     def df_compressed(self) -> Optional[pd.DataFrame]:
         """Compressed IV data, fetched lazily for DuckDB-backed workflows."""
+        if self._closed and self._df_compressed is None:
+            raise RuntimeError(
+                "Compressed data were released when fitting completed. "
+                "Refit with retain_compressed=True to preserve df_compressed."
+            )
         if (
             not self._data_fetched
             and self.n_compressed_rows is not None
@@ -558,7 +567,7 @@ class Duck2SLS(DuckEstimator):
             coef_names=coef_names,
             vcov=vcov,
             n_obs=n,
-            se_type=vcov_meta.get("vcov_type_detail", "HC1"),
+            se_type=vcov_meta.get("vcov_type_detail", "none"),
         )
         return FirstStageResults(
             endog_var=endog_var,
@@ -591,23 +600,42 @@ class Duck2SLS(DuckEstimator):
         actual_endog_sql = [v.sql_name for v in self.formula.endogenous]
         outcome_sql      = [v.sql_name for v in self.formula.outcomes]
         inst_sql         = self._get_inst_sql()
-        cluster_col      = self._CLUSTER_ALIAS if self._effective_cluster_col else None
+        cluster_col      = self._cluster_staging_col
 
         variables = outcome_sql + exog_sql + actual_endog_sql + inst_sql
 
-        transformer = IterativeDemeanTransformer(
-            conn=self.conn,
-            table_name=self._STAGING_TABLE,
+        backend = self.demean_backend
+        if backend == "auto":
+            projected = 3 * int(self.n_obs or 0) * 8 * max(1, len(variables) + len(self.fe_cols))
+            backend = "numpy" if projected < min(2 * 1024**3, self._duckdb_memory_budget()) else "duckdb"
+            self.estimated_memory = projected
+        self.resolved_demean_backend = backend
+        transformer_cls = IterativeDemeanTransformer
+        if backend == "numpy":
+            from ..core.transformers.numpy_demean import NumpyDemeanTransformer
+            transformer_cls = NumpyDemeanTransformer
+        transformer = transformer_cls(
+            conn=self.conn, table_name=self._STAGING_TABLE,
             fe_cols=self._resolve_fe_sql_names() if self.fe_cols else [],
-            cluster_col=cluster_col,
-            remove_singletons=False,   # singletons already handled in prepare_data
+            cluster_col=cluster_col, remove_singletons=False,
             fe_nesting=self.formula.get_fe_nesting(),
             carry_cols=self._get_transformer_carry_cols(),
             merged_fe_component_map=self.formula.get_merged_fe_component_map(),
-            max_iterations=self.max_iterations,
-            tolerance=self.tolerance,
+            max_iterations=self.max_iterations, tolerance=self.tolerance,
         )
         self._demean_result_table = transformer.fit_transform(variables, where_clause="")
+        if backend == "numpy":
+            materialized = "_numpy_iv_demeaned"
+            self.conn.execute(
+                f"CREATE OR REPLACE TEMP TABLE {materialized} AS "
+                f"SELECT * FROM {self._demean_result_table}"
+            )
+            try:
+                self.conn.unregister(self._demean_result_table)
+            except Exception:
+                pass
+            self._demean_result_table = materialized
+            transformer._frame = None
         self._demean_transformer  = transformer
         self._df_correction       = transformer.df_correction
 
@@ -617,7 +645,7 @@ class Duck2SLS(DuckEstimator):
         select_parts    = []
         if fe_sql_names:
             select_parts.append(", ".join(fe_sql_names))
-        if cluster_col:
+        if cluster_col and cluster_col not in fe_sql_names:
             select_parts.append(cluster_col)
         select_parts.append(rename_fragment)
 
@@ -647,12 +675,20 @@ class Duck2SLS(DuckEstimator):
         cluster_col = self._cluster_staging_col
         x_sql       = exog_sql + inst_sql
         demeaned_df = None
+        batch_X = batch_coefs = batch_XtX = None
+        batch_endog_sql = []
         if self.fitter != "duckdb":
             endog_sql = [v.sql_name for v in self.formula.endogenous]
+            batch_endog_sql = endog_sql
             demeaned_df = self._fetch_projected_df(
                 self._DEMEANED_STAGING,
                 x_sql + endog_sql + [cluster_col],
             )
+            batch_X = demeaned_df[x_sql].to_numpy() if x_sql else np.empty((len(demeaned_df), 0))
+            batch_Y = demeaned_df[endog_sql].to_numpy()
+            batch_XtX = batch_X.T @ batch_X + 1e-8 * np.eye(batch_X.shape[1])
+            batch_coefs = np.linalg.solve(batch_XtX, batch_X.T @ batch_Y)
+            self.metadata["batched_first_stages"] = len(endog_sql)
 
         for endog_var in self.endogenous_vars:
             endog_var_obj = next(
@@ -670,17 +706,25 @@ class Duck2SLS(DuckEstimator):
                     if cluster_col and cluster_col in df.columns
                     else None
                 )
-                X = df[x_sql].values if x_sql else np.empty((n, 0))
+                X = batch_X
                 y = df[endog_var_obj.sql_name].values.reshape(-1, 1)
                 w = np.ones(n)
                 np_fitter = NumpyFitter(alpha=1e-8, se_type="stata")
-                fit    = np_fitter.fit(X=X, y=y, weights=w, coef_names=x_sql)
-                vcov, meta, _ = np_fitter.fit_vcov(
-                    X=X, y=y, weights=w,
-                    coefficients=fit.coefficients,
-                    cluster_ids=ids,
-                    existing_result=fit,
+                batch_idx = batch_endog_sql.index(endog_var_obj.sql_name)
+                coefs = batch_coefs[:, batch_idx]
+                fit = FitterResult(
+                    coefficients=coefs, coef_names=x_sql, n_obs=n,
+                    XtX=batch_XtX, Xty=X.T @ y,
                 )
+                if getattr(self, "_no_vcov", False):
+                    vcov, meta = None, {}
+                else:
+                    vcov, meta, _ = np_fitter.fit_vcov(
+                        X=X, y=y, weights=w,
+                        coefficients=fit.coefficients,
+                        cluster_ids=ids,
+                        existing_result=fit,
+                    )
                 coefs = fit.coefficients.flatten()
 
             self._add_fitted_column_demean(
@@ -694,7 +738,7 @@ class Duck2SLS(DuckEstimator):
                 coef_names=x_sql,
                 vcov=vcov,
                 n_obs=n,
-                se_type=meta.get("vcov_type_detail", "HC1"),
+                se_type=meta.get("vcov_type_detail", "none"),
             )
             self._first_stage_results[endog_var] = FirstStageResults(
                 endog_var=endog_var,
@@ -976,16 +1020,15 @@ class Duck2SLS(DuckEstimator):
             add_intercept=False,
             cluster_col=cluster_col,
         )
-        vcov, meta, _ = fitter.fit_vcov(
-            table_name="_fs_demean_view",
-            x_cols=x_sql,
-            y_col=y_sql,
-            weight_col="count",
-            add_intercept=False,
-            cluster_col=cluster_col,
-            coefficients=fit.coefficients,
-            existing_result=fit,
-        )
+        if getattr(self, "_no_vcov", False):
+            vcov, meta = None, {}
+        else:
+            vcov, meta, _ = fitter.fit_vcov(
+                table_name="_fs_demean_view", x_cols=x_sql, y_col=y_sql,
+                weight_col="count", add_intercept=False,
+                cluster_col=cluster_col, coefficients=fit.coefficients,
+                existing_result=fit,
+            )
         return fit.coefficients.flatten(), vcov, meta, fit.n_obs
 
     def _add_fitted_column_demean(
@@ -1334,16 +1377,15 @@ class Duck2SLS(DuckEstimator):
             add_intercept=True,
             cluster_col=cluster_col,
         )
-        vcov, meta, _ = fitter.fit_vcov(
-            table_name="_fs_view",
-            x_cols=x_sql,
-            y_col=y_sql,
-            weight_col="count",
-            add_intercept=True,
-            cluster_col=cluster_col,
-            coefficients=fit.coefficients,
-            existing_result=fit,
-        )
+        if getattr(self, "_no_vcov", False):
+            vcov, meta = None, {}
+        else:
+            vcov, meta, _ = fitter.fit_vcov(
+                table_name="_fs_view", x_cols=x_sql, y_col=y_sql,
+                weight_col="count", add_intercept=True,
+                cluster_col=cluster_col, coefficients=fit.coefficients,
+                existing_result=fit,
+            )
         return fit.coefficients.flatten(), vcov, meta, fit.n_obs
 
     def _ols_numpy(
@@ -1366,12 +1408,13 @@ class Duck2SLS(DuckEstimator):
         )
         fitter = NumpyFitter(alpha=1e-8, se_type="stata")
         fit    = fitter.fit(X=X, y=y, weights=w, coef_names=["Intercept"] + x_sql)
-        vcov, meta, _ = fitter.fit_vcov(
-            X=X, y=y, weights=w,
-            coefficients=fit.coefficients,
-            cluster_ids=ids,
-            existing_result=fit,
-        )
+        if getattr(self, "_no_vcov", False):
+            vcov, meta = None, {}
+        else:
+            vcov, meta, _ = fitter.fit_vcov(
+                X=X, y=y, weights=w, coefficients=fit.coefficients,
+                cluster_ids=ids, existing_result=fit,
+            )
         return fit.coefficients.flatten(), vcov, meta, n
 
     # =========================================================================

@@ -152,7 +152,7 @@ The `duckreg()` API includes the following commonly used parameters:
 - `subset`: SQL `WHERE` filter applied before estimation.
 - `cache_dir`: location for DuckDB cache files for file-backed inputs.
 - `db_name`: explicit DuckDB database path.
-- `fitter`: `"numpy"` or `"duckdb"`.
+- `fitter`: `"auto"` (default), `"numpy"`, or `"duckdb"`.
 - `compression`: controls row compression before fitting.
 - `seed`: random seed.
 - `threads`: DuckDB thread count.
@@ -174,6 +174,7 @@ For fixed-effects estimation, the API also exposes demeaning controls such as:
 
 Compression is one of the core ideas in the project.
 
+- `compression="auto"` (default) samples at most 100,000 rows and chooses between exact grouping and no grouping; it never rounds values.
 - `compression=None` keeps exact compression and still groups rows when the strata match exactly.
 - `compression=5` rounds continuous strata-defining values to 5 decimals before grouping.
 - `compression=-1` disables grouping entirely and leaves the compressed table at one row per observation.
@@ -184,6 +185,7 @@ Rounding can materially reduce the number of unique strata in continuous-data se
 
 Two fitting paths are exposed:
 
+- `fitter="auto"` selects NumPy only when its conservative peak-memory estimate fits the configured budget, and safely retries with DuckDB after a `MemoryError`.
 - `fitter="numpy"` performs the final weighted least squares step in memory.
 - `fitter="duckdb"` keeps more of the workflow inside DuckDB and is the more relevant option for out-of-core use cases.
 

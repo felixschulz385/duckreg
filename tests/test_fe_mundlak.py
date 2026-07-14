@@ -452,7 +452,7 @@ class TestMundlakCompressionStructure:
         """Asymptotic FE (pixel_id, 1000 levels) must produce avg_*_feN columns."""
         m = duckreg("modis_median ~ ntl_harm + exog_control | pixel_id",
                     data=balanced_path, fe_method="mundlak",
-                    compression=3, se_method="none")
+                    compression=3, se_method="none", retain_compressed=True)
         assert "avg_ntl_harm_fe0" in m.df_compressed.columns
         assert "avg_exog_control_fe0" in m.df_compressed.columns
 
@@ -460,7 +460,7 @@ class TestMundlakCompressionStructure:
         """_rhs_cols must list both raw covariates and their Mundlak means."""
         m = duckreg("modis_median ~ ntl_harm + exog_control | pixel_id",
                     data=balanced_path, fe_method="mundlak",
-                    compression=3, se_method="none", fitter="numpy")
+                    compression=3, se_method="none", fitter="numpy", retain_compressed=True)
         assert hasattr(m, "_rhs_cols")
         assert "ntl_harm" in m._rhs_cols
         assert "avg_ntl_harm_fe0" in m._rhs_cols
@@ -469,7 +469,7 @@ class TestMundlakCompressionStructure:
         """pixel_id (asymptotic) + year (fixed dummies): count must still sum to N."""
         m = duckreg("modis_median ~ ntl_harm | pixel_id + year",
                     data=balanced_path, fe_method="mundlak",
-                    compression=3, se_method="none", fitter="numpy")
+                    compression=3, se_method="none", fitter="numpy", retain_compressed=True)
         assert m.df_compressed["count"].sum() == len(balanced_df)
         # Mundlak means for pixel_id and dummies for year must both be present
         assert any("avg_ntl_harm" in c for c in m.df_compressed.columns)
@@ -479,10 +479,10 @@ class TestMundlakCompressionStructure:
         """compression=5 must yield at least as many Mundlak strata as compression=3."""
         m3 = duckreg("modis_median ~ ntl_harm | pixel_id",
                      data=balanced_path, fe_method="mundlak",
-                     compression=3, se_method="none")
+                     compression=3, se_method="none", retain_compressed=True)
         m5 = duckreg("modis_median ~ ntl_harm | pixel_id",
                      data=balanced_path, fe_method="mundlak",
-                     compression=5, se_method="none")
+                     compression=5, se_method="none", retain_compressed=True)
         assert len(m5.df_compressed) >= len(m3.df_compressed)
 
 

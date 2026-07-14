@@ -308,16 +308,17 @@ def ridge_closed_form_batch(
     X: np.ndarray, y: np.ndarray, n: np.ndarray, lambda_grid: np.ndarray,
 ) -> np.ndarray:
     """Optimized ridge regression for multiple lambda values."""
-    k = X.shape[1]
-    N = np.sqrt(n).reshape(-1, 1)
-    Xn, yn = X * N, y * N
-    I_k, zeros_k = np.eye(k), np.zeros((k, 1))
-    coefs = np.zeros((len(lambda_grid), k))
-    for i, lam in enumerate(lambda_grid):
-        Xtilde = np.vstack([Xn, np.sqrt(lam) * I_k])
-        ytilde = np.vstack([yn, zeros_k])
-        coefs[i, :] = np.linalg.lstsq(Xtilde, ytilde, rcond=None)[0].flatten()
-    return coefs
+    y = y.reshape(-1, 1) if y.ndim == 1 else y
+    XtX = X.T @ (X * n.reshape(-1, 1))
+    Xty = X.T @ (y * n.reshape(-1, 1))
+    eigenvalues, eigenvectors = np.linalg.eigh(XtX)
+    projected = eigenvectors.T @ Xty
+    lambdas = np.asarray(lambda_grid, dtype=float).reshape(-1, 1, 1)
+    denom = eigenvalues.reshape(1, -1, 1) + lambdas
+    # This is algebraically identical to the existing augmented least-squares
+    # convention: every coefficient, including an intercept column, is penalized.
+    path = np.einsum("ij,ljm->lim", eigenvectors, projected[None, :, :] / denom)
+    return path[:, :, 0] if path.shape[2] == 1 else path
 
 
 def wls_duckdb(

@@ -32,6 +32,7 @@ import pandas as pd
 
 from .base import DuckEstimator, SEMethod
 from ..core.fitters.numpy_fitter import NumpyFitter
+from ..core.fitters.base import FitterResult
 from ..core.transformers import IterativeDemeanTransformer, MundlakTransformer
 from ..core.vcov import VcovSpec
 from ..core.results import RegressionResults, MediationEffects, MediationResults
@@ -237,6 +238,8 @@ class DuckMediation(DuckEstimator):
             fitter=fitter,
             remove_singletons=remove_singletons,
             duckdb_kwargs=duckdb_kwargs,
+            retain_compressed=kwargs.pop("retain_compressed", False),
+            demean_backend=kwargs.pop("demean_backend", "auto"),
         )
 
         # ── variable blocks ─────────────────────────────────────────────
@@ -283,6 +286,7 @@ class DuckMediation(DuckEstimator):
         #  demean transformer (set after compress_data on demean path)
         self._demean_transformer: Optional[IterativeDemeanTransformer] = None
         self._df_correction: int = 0
+
         #  Mundlak extra regressors list
         self._extra_regressors: List[str] = []
 
@@ -294,6 +298,13 @@ class DuckMediation(DuckEstimator):
             f"exposures={self.exposures_sql}, "
             f"mediators={self.mediators_sql}, "
             f"fe={self.fe_cols}, fe_method={self.fe_method}"
+        )
+
+    def _get_n_coefs(self) -> int:
+        return max(
+            1,
+            len(self.exposures_sql) + len(self.mediators_sql) + len(self.controls_sql)
+            + (0 if self.fe_cols else 1),
         )
 
     # ------------------------------------------------------------------
@@ -435,12 +446,29 @@ class DuckMediation(DuckEstimator):
 
     def estimate(self) -> np.ndarray:
         """Run OLS for each equation; return outcome-equation coefficients."""
-        fitter = NumpyFitter(alpha=1e-8, se_type="stata")
+        mediator_names = [name for name in self._eq_data if name != "__outcome__"]
+        if mediator_names:
+            first = self._eq_data[mediator_names[0]]
+            X = first["X"]
+            Y = np.column_stack([self._eq_data[name]["y"].reshape(-1) for name in mediator_names])
+            XtX = X.T @ X + 1e-8 * np.eye(X.shape[1])
+            coefficients = np.linalg.solve(XtX, X.T @ Y)
+            for j, name in enumerate(mediator_names):
+                eq = self._eq_data[name]
+                fitter = NumpyFitter(alpha=1e-8, se_type="stata")
+                raw = FitterResult(
+                    coefficients=coefficients[:, j],
+                    coef_names=eq["eq_spec"].coef_names,
+                    n_obs=len(eq["y"]), XtX=XtX, Xty=X.T @ eq["y"],
+                )
+                self._eq_raw[name] = (fitter, raw, eq)
+            self.metadata["batched_mediator_equations"] = len(mediator_names)
 
-        for eq_name, eq in self._eq_data.items():
-            X, y = eq["X"], eq["y"]
-            raw = fitter.fit(X=X, y=y, weights=np.ones(len(y)))
-            self._eq_raw[eq_name] = (fitter, raw, eq)
+        if "__outcome__" in self._eq_data:
+            eq = self._eq_data["__outcome__"]
+            fitter = NumpyFitter(alpha=1e-8, se_type="stata")
+            raw = fitter.fit(X=eq["X"], y=eq["y"], weights=np.ones(len(eq["y"])))
+            self._eq_raw["__outcome__"] = (fitter, raw, eq)
 
         if "__outcome__" in self._eq_data:
             out_eq = self._eq_data["__outcome__"]
@@ -592,7 +620,17 @@ class DuckMediation(DuckEstimator):
         )
         cluster_col  = self._cluster_staging_col
 
-        transformer  = IterativeDemeanTransformer(
+        backend = self.demean_backend
+        if backend == "auto":
+            projected = 3 * int(self.n_obs or 0) * 8 * max(1, len(all_vars) + len(self.fe_cols))
+            backend = "numpy" if projected < min(2 * 1024**3, self._duckdb_memory_budget()) else "duckdb"
+            self.estimated_memory = projected
+        self.resolved_demean_backend = backend
+        transformer_cls = IterativeDemeanTransformer
+        if backend == "numpy":
+            from ..core.transformers.numpy_demean import NumpyDemeanTransformer
+            transformer_cls = NumpyDemeanTransformer
+        transformer = transformer_cls(
             conn=self.conn,
             table_name=self._STAGING_TABLE,
             fe_cols=self.fe_cols,

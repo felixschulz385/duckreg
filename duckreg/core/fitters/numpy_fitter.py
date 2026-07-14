@@ -79,13 +79,21 @@ class NumpyFitter(BaseFitter):
         if coef_names is None:
             coef_names = coef_names_ss
 
-        theta = (coefficients.flatten() if coefficients is not None
-                 else safe_solve(XtX, Xty.flatten(), self.alpha))
+        theta = (np.asarray(coefficients) if coefficients is not None
+                 else safe_solve(XtX, Xty, self.alpha))
+        if np.asarray(theta).ndim == 2 and np.asarray(theta).shape[1] == 1:
+            theta = np.asarray(theta).flatten()
 
-        rss = sum_y_sq - theta @ Xty
+        if np.asarray(theta).ndim == 1:
+            rss = sum_y_sq - theta @ np.asarray(Xty).flatten()
+        else:
+            rss = np.asarray(sum_y_sq) - np.sum(theta * np.asarray(Xty), axis=0)
         mean_y = sum_y / n_obs
         tss = sum_y_sq - n_obs * (mean_y ** 2)
-        r_squared = max(0.0, 1.0 - rss / tss) if tss > 0 else 0.0
+        r_squared_values = np.where(
+            np.asarray(tss) > 0, np.maximum(0.0, 1.0 - np.asarray(rss) / np.asarray(tss)), 0.0
+        )
+        r_squared = float(r_squared_values) if np.ndim(r_squared_values) == 0 else r_squared_values
 
         result = FitterResult(
             coefficients=theta,
@@ -96,7 +104,7 @@ class NumpyFitter(BaseFitter):
             r_squared=r_squared,
             rss=rss,
             XtX=XtX,
-            Xty=Xty.flatten(),
+            Xty=np.asarray(Xty),
             n_clusters=None,
             vcov_meta={},
         )

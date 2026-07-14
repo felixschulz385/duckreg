@@ -557,7 +557,8 @@ class TestCompressionCorrectness:
     def test_df_compressed_structure(self, panel_data):
         """After fitting, df_compressed must contain the standard aggregation columns."""
         m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
-                    se_method="iid", fe_method="demean", fitter="numpy")
+                    se_method="iid", fe_method="demean", fitter="numpy",
+                    retain_compressed=True)
         for col in ("count", "sum_y", "sum_y_sq"):
             assert col in m.df_compressed.columns, f"Missing column: {col!r}"
         assert m.df_compressed["count"].sum() == len(panel_data)
@@ -595,7 +596,8 @@ class TestDuckDBMemoryBehavior:
 
     def test_df_compressed_property_fetches_on_demand(self, panel_data):
         m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
-                    se_method="iid", fe_method="demean", fitter="duckdb")
+                    se_method="iid", fe_method="demean", fitter="duckdb",
+                    retain_compressed=True)
         df = m.df_compressed
         assert df is not None
         for col in ("count", "sum_y", "sum_y_sq"):
@@ -612,6 +614,7 @@ class TestDuckDBMemoryBehavior:
     def test_fe_tuning_knobs_reach_transformer(self, panel_data):
         m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
                     se_method="none", fe_method="demean", fitter="duckdb",
+                    demean_backend="duckdb",
                     max_iterations=123,
                     tolerance=1e-5,
                     check_interval=7,
@@ -638,7 +641,7 @@ class TestDuckDBMemoryBehavior:
     def test_compression_minus_one_disables_grouping(self, panel_data):
         m = duckreg("y ~ x1 + x2 | unit + year", data=panel_data,
                     se_method="none", fe_method="demean", fitter="duckdb",
-                    compression=-1)
+                    compression=-1, retain_compressed=True)
         df = m.df_compressed
         assert m.n_compressed_rows == len(panel_data)
         assert len(df) == len(panel_data)

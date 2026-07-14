@@ -135,8 +135,8 @@ def compute_sufficient_stats_numpy(
     X = X.reshape(-1, 1) if X.ndim == 1 else X
     weights = weights.flatten()
     # Ensure numeric float64 (guards against Decimal inputs from DuckDB)
-    X = X.astype(np.float64)
-    y = y.astype(np.float64)
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
 
     n_rows, k = X.shape
     n_obs = int(weights.sum())
@@ -147,11 +147,14 @@ def compute_sufficient_stats_numpy(
     yw = y * sqrt_w
 
     XtX = Xw.T @ Xw + alpha * np.eye(k)
-    Xty = (Xw.T @ yw).flatten()
+    Xty_matrix = Xw.T @ yw
+    Xty = Xty_matrix.flatten() if Xty_matrix.shape[1] == 1 else Xty_matrix
 
     # Summary statistics
-    sum_y = float((y.flatten() * weights).sum())
-    sum_y_sq = float(((y.flatten() ** 2) * weights).sum())
+    sum_y_values = (y * weights.reshape(-1, 1)).sum(axis=0)
+    sum_y_sq_values = ((y ** 2) * weights.reshape(-1, 1)).sum(axis=0)
+    sum_y = float(sum_y_values[0]) if len(sum_y_values) == 1 else sum_y_values
+    sum_y_sq = float(sum_y_sq_values[0]) if len(sum_y_sq_values) == 1 else sum_y_sq_values
 
     # Coefficient names
     if coef_names is None:

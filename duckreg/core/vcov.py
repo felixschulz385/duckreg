@@ -933,19 +933,8 @@ def vcov_crv1(
     np.ndarray
         Unscaled vcov matrix (k, k) - multiply by SSC for final result
     """
-    k = scores.shape[1]
-    
-    if clustid is None:
-        clustid = np.unique(cluster_col)
-    
-    # Compute cluster-aggregated scores (meat matrix)
-    # meat = sum_g (score_g @ score_g.T) where score_g = sum_{i in g} score_i
-    meat = np.zeros((k, k))
-    
-    for g in clustid:
-        mask = cluster_col == g
-        cluster_score = scores[mask].sum(axis=0)
-        meat += np.outer(cluster_score, cluster_score)
+    cluster_scores, _ = compute_cluster_scores(scores, cluster_col)
+    meat = cluster_scores.T @ cluster_scores
     
     if is_iv:
         meat = tXZ @ tZZinv @ meat @ tZZinv @ tZX
@@ -1146,14 +1135,18 @@ def compute_cluster_scores(
     Tuple[np.ndarray, int]
         (cluster_scores (G, k), G)
     """
-    unique_clusters = np.unique(cluster_ids)
-    G = len(unique_clusters)
-    k = scores.shape[1]
-    
-    cluster_scores = np.zeros((G, k))
-    for g, cluster in enumerate(unique_clusters):
-        mask = cluster_ids == cluster
-        cluster_scores[g] = scores[mask].sum(axis=0)
+    ids = np.asarray(cluster_ids).reshape(-1)
+    if len(ids) != len(scores):
+        raise ValueError("cluster_ids and scores must have the same number of rows")
+    # np.unique handles numeric, string, datetime, and object identifiers and
+    # returns compact integer codes in one pass through the score matrix.
+    _, codes = np.unique(ids, return_inverse=True)
+    G = int(codes.max()) + 1 if len(codes) else 0
+    dtype = np.result_type(scores, float)
+    cluster_scores = np.column_stack([
+        np.bincount(codes, weights=np.asarray(scores[:, j], dtype=dtype), minlength=G)
+        for j in range(scores.shape[1])
+    ]).astype(dtype, copy=False)
     
     return cluster_scores, G
 

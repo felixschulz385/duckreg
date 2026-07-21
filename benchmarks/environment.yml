@@ -12,4 +12,4 @@ dependencies:
   - pip
   - pip:
       - pyfixest==0.50.1
-      - -e .
+      - -e ..

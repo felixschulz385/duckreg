@@ -311,6 +311,33 @@ def test_nested_formula_matches_plain_absorption(balanced_df, balanced_path):
     )
 
 
+@pytest.mark.parametrize("demean_backend", ["numpy", "duckdb"])
+@pytest.mark.parametrize("has_iv", [False, True])
+def test_crv1_cluster_not_a_fe_col_with_nested_formula(balanced_path, has_iv, demean_backend):
+    """CRV1 on a column that is neither an FE nor a nesting/merged-FE component
+    must survive the demean path regardless of backend (regression test: the
+    numpy demean backend used to silently drop the cluster column, causing a
+    downstream DuckDB binder error on the internal ``__cluster__`` alias).
+    """
+    fe_part = "pixel_id %in% country + country^year"
+    formula = (
+        f"modis_median ~ exog_control | {fe_part} | (ntl_harm ~ rainfall)"
+        if has_iv
+        else f"modis_median ~ ntl_harm + exog_control | {fe_part}"
+    )
+    m = duckreg(
+        formula,
+        data=balanced_path,
+        se_method={"CRV1": "soil_type"},
+        fe_method="demean",
+        fitter="numpy",
+        demean_backend=demean_backend,
+    )
+    se = m.tidy()["std_error"].to_numpy()
+    assert np.all(np.isfinite(se))
+    assert np.all(se > 0)
+
+
 def test_fe_demean_raises_clear_error_when_singleton_pruning_removes_all_rows():
     df = pd.DataFrame(
         {

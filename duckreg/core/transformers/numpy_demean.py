@@ -38,9 +38,16 @@ class NumpyDemeanTransformer(FETransformer):
         self._fe_total_levels = 0
         self._frame = None
 
+    def _non_resid_columns(self) -> List[str]:
+        cols = list(self.fe_cols)
+        if self.cluster_col:
+            cols.append(self.cluster_col)
+        cols.extend(self.carry_cols)
+        return list(dict.fromkeys(cols))
+
     def fit_transform(self, variables: List[str], where_clause: str = "") -> str:
         self._resid_name_map = {v: f"_resid_{i}" for i, v in enumerate(variables)}
-        selected = list(dict.fromkeys(self.fe_cols + self.carry_cols + variables))
+        selected = list(dict.fromkeys(self._non_resid_columns() + variables))
         projection = ", ".join(_q(c) for c in selected)
         frame = self.conn.execute(
             f"SELECT {projection} FROM {self.table_name} {where_clause}"
@@ -88,7 +95,7 @@ class NumpyDemeanTransformer(FETransformer):
 
         for j, variable in enumerate(variables):
             frame[self._resid_name_map[variable]] = values[:, j]
-        keep_cols = list(dict.fromkeys(self.fe_cols + self.carry_cols))
+        keep_cols = self._non_resid_columns()
         result = frame[keep_cols + list(self._resid_name_map.values())]
         self._frame = result
         try:
